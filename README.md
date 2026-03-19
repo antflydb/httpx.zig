@@ -26,27 +26,28 @@
 
 </div>
 
-> [!NOTE]
-> **This project aims to be production-ready and is actively maintained.**  
-> It is still a new project and not yet widely adopted. Feel free to use it in your projects.
 
 `httpx.zig` is a comprehensive, high-performance HTTP library for building robust networked applications in Zig, with modern client and server primitives, support for major HTTP versions, connection pooling, and pattern-based routing. You can build your own APIs and website servers directly on top of these components; see the runnable examples in the repository: [examples/](https://github.com/muhammad-fiaz/httpx.zig/tree/main/examples), [examples/static_files.zig](https://github.com/muhammad-fiaz/httpx.zig/blob/main/examples/static_files.zig), and [examples/multi_page_website.zig](https://github.com/muhammad-fiaz/httpx.zig/blob/main/examples/multi_page_website.zig).
 
-Related Zig projects:
+**Related Zig projects:**
 
-- For API framework support, check out [api.zig](https://github.com/muhammad-fiaz/api.zig).
-- For web framework support, check out [zix](https://github.com/muhammad-fiaz/zix).
+- For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
+- For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
+- For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
+- For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
 
 ⭐ If you build with httpx.zig, make sure to give it a star. ⭐
 
+
 > [!NOTE]
-> **Custom HTTP/2 & HTTP/3 Implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
+> **Project maturity:** This project aims to be production-ready and is actively maintained. It is still a new project and not yet widely adopted. Feel free to use it in your projects.
+>
+> **Custom HTTP/2 & HTTP/3 implementation:** Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support.
 > httpx.zig implements these protocols **entirely from scratch**, including:
 > - **HPACK** header compression (RFC 7541) for HTTP/2
 > - **HTTP/2** stream multiplexing and flow control (RFC 7540)
 > - **QPACK** header compression (RFC 9204) for HTTP/3
 > - **QUIC** transport framing (RFC 9000) for HTTP/3
-
 
 ---
 

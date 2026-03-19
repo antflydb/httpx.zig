@@ -65,10 +65,12 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 httpx.zig is built with production-readiness as a core goal. It is still a relatively new project, so adoption is growing. You can use it in real projects while tracking changelogs between releases.
 :::
 
-## Related Zig Projects
-
-- For API framework support, check out [api.zig](https://github.com/muhammad-fiaz/api.zig).
-- For web framework support, check out [zix](https://github.com/muhammad-fiaz/zix).
+::: tip Related Zig Projects
+- For **API framework** support, check out **[api.zig](https://github.com/muhammad-fiaz/api.zig)**.
+- For **web framework** support, check out **[zix](https://github.com/muhammad-fiaz/zix)**.
+- For **logging** support, check out **[logly.zig](https://github.com/muhammad-fiaz/logly.zig)**.
+- For **data validation and serialization** support, check out **[zigantic](https://github.com/muhammad-fiaz/zigantic)**.
+:::
 
 For full setup details, including local path dependencies and `build.zig` wiring, see `/guide/installation`.
 
