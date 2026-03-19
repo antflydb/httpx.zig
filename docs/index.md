@@ -36,13 +36,32 @@ features:
 
 ## Install
 
-Automatic installation (Zig 0.15+):
+Choose one of these installation methods:
+
+1. Stable release (recommended)
+
+```bash
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.2.tar.gz
+```
+
+2. Nightly/main branch
 
 ```bash
 zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```
 
-Then wire the module in your `build.zig` (see the full guide at `/guide/installation`).
+3. Manual dependency entry in `build.zig.zon`
+
+```zig
+.dependencies = .{
+  .httpx = .{
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.2.tar.gz",
+    .hash = "...",
+  },
+},
+```
+
+For full setup details, including local path dependencies and `build.zig` wiring, see `/guide/installation`.
 
 ::: warning Custom HTTP/2 & HTTP/3 Implementation
 Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx.zig implements these protocols entirely from scratch**, including:
@@ -77,12 +96,13 @@ httpx.zig is fully cross-platform:
 All examples are runnable from the repo root:
 
 ```bash
-zig build run-example -- simple_get
+zig build run-simple_get
 ```
 
 Available examples (see the `/examples` folder):
 
 - `simple_get.zig`: minimal GET
+- `simple_get_deserialize.zig`: GET request with typed JSON deserialization
 - `post_json.zig`: JSON POST
 - `custom_headers.zig`: request headers
 - `middleware_example.zig`: middleware chain

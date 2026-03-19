@@ -76,9 +76,10 @@ pub const SocketIoReader = struct {
 
     fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
         var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
 
-        while (total < limit.toInt(usize)) {
-            const max_to_read = @min(r.buffer.len, limit.toInt(usize) - total);
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
             var iov = [_][]u8{r.buffer[0..max_to_read]};
             const n = readVec(r, &iov) catch |err| switch (err) {
                 error.EndOfStream => break,
@@ -93,11 +94,12 @@ pub const SocketIoReader = struct {
         return total;
     }
 
-    fn discard(r: *Io.Reader, limit: Io.Limit) Io.Reader.StreamRemainingError!usize {
+    fn discard(r: *Io.Reader, limit: Io.Limit) error{ EndOfStream, ReadFailed }!usize {
         var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
 
-        while (total < limit.toInt(usize)) {
-            const max_to_read = @min(r.buffer.len, limit.toInt(usize) - total);
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
             var iov = [_][]u8{r.buffer[0..max_to_read]};
             const n = readVec(r, &iov) catch |err| switch (err) {
                 error.EndOfStream => break,
@@ -167,12 +169,13 @@ pub const SocketIoWriter = struct {
         const p = parent(w);
 
         var total: usize = 0;
-        while (total < limit.toInt(usize)) {
-            const remaining = limit.toInt(usize) - total;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+        while (total < max_limit) {
+            const remaining = max_limit - total;
             const chunk_len = @min(w.buffer.len, remaining);
             if (chunk_len == 0) break;
 
-            const n_read = file_reader.read(w.buffer[0..chunk_len]) catch return error.ReadFailed;
+            const n_read = file_reader.file.read(w.buffer[0..chunk_len]) catch return error.ReadFailed;
             if (n_read == 0) break;
 
             p.socket.sendAll(w.buffer[0..n_read]) catch return error.WriteFailed;
@@ -204,6 +207,10 @@ pub const Socket = struct {
     connected: bool = false,
 
     const Self = @This();
+    pub const AcceptResult = struct {
+        socket: Socket,
+        addr: net.Address,
+    };
 
     /// Creates a new TCP socket.
     pub fn create() !Self {
@@ -324,10 +331,14 @@ pub const Socket = struct {
     }
 
     /// Accepts an incoming connection.
-    pub fn accept(self: *Self) !struct { socket: Socket, addr: net.Address } {
+    pub fn accept(self: *Self) !AcceptResult {
         var addr: posix.sockaddr = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        const handle = try posix.accept(self.handle, &addr, &addr_len);
+        const accept_params_len = comptime @typeInfo(@TypeOf(posix.accept)).@"fn".params.len;
+        const handle = if (accept_params_len == 4)
+            try posix.accept(self.handle, &addr, &addr_len, 0)
+        else
+            try posix.accept(self.handle, &addr, &addr_len);
         return .{
             .socket = Socket.fromHandle(handle),
             .addr = net.Address{ .any = addr },
@@ -388,7 +399,7 @@ pub const TcpListener = struct {
     }
 
     /// Accepts an incoming connection.
-    pub fn accept(self: *Self) !struct { socket: Socket, addr: net.Address } {
+    pub fn accept(self: *Self) !Socket.AcceptResult {
         return self.socket.accept();
     }
 

@@ -9,6 +9,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+fn stringifyJsonAlloc(allocator: Allocator, value: anytype, options: std.json.StringifyOptions) ![]u8 {
+    var list = std.ArrayList(u8).init(allocator);
+    errdefer list.deinit();
+
+    try std.json.stringify(value, options, list.writer());
+    return list.toOwnedSlice();
+}
+
 /// JSON utility functions.
 pub const Json = struct {
     /// Parses a JSON string into the specified type.
@@ -18,12 +26,12 @@ pub const Json = struct {
 
     /// Serializes a value to a JSON string.
     pub fn stringify(allocator: Allocator, value: anytype) ![]u8 {
-        return std.json.stringifyAlloc(allocator, value, .{});
+        return stringifyJsonAlloc(allocator, value, .{});
     }
 
     /// Serializes a value to a JSON string with pretty formatting.
     pub fn stringifyPretty(allocator: Allocator, value: anytype) ![]u8 {
-        return std.json.stringifyAlloc(allocator, value, .{ .whitespace = .indent_2 });
+        return stringifyJsonAlloc(allocator, value, .{ .whitespace = .indent_2 });
     }
 
     /// Validates that a string is valid JSON.

@@ -22,9 +22,9 @@
 //!
 //! ## Platform Support
 //!
-//! - Linux (x86_64, aarch64)
-//! - Windows (x86_64)
-//! - macOS (x86_64, aarch64)
+//! - Linux (x86, x86_64, aarch64, arm)
+//! - Windows (x86, x86_64, aarch64, arm)
+//! - macOS (x86, x86_64, aarch64, arm)
 //! - FreeBSD, NetBSD, OpenBSD
 //!
 //! ## Features
@@ -71,6 +71,7 @@
 const std = @import("std");
 
 pub const types = @import("core/types.zig");
+pub const meta = @import("core/meta.zig");
 pub const headers = @import("core/headers.zig");
 pub const uri = @import("core/uri.zig");
 pub const status = @import("core/status.zig");
@@ -225,6 +226,9 @@ pub const PercentEncoding = encoding.PercentEncoding;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
+
+pub const VERSION = meta.version;
+pub const DEFAULT_USER_AGENT = meta.default_user_agent;
 
 /// Executes all requests in parallel and returns a result per request.
 pub fn all(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {

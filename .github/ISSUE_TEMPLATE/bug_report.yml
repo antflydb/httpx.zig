@@ -6,9 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to fill out this bug report!
+        Thank you for reporting an issue.
 
-        Please check the [documentation](https://muhammad-fiaz.github.io/httpx.zig/) to ensure the issue is not intended behavior.
+        Please confirm this is reproducible on the latest `main` branch and with Zig `0.15.2`.
+        Relevant docs: https://muhammad-fiaz.github.io/httpx.zig/
 
   - type: textarea
     id: description
@@ -31,6 +32,15 @@ body:
     validations:
       required: true
 
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What should have happened instead?
+      placeholder: "The request should succeed and return status 200..."
+    validations:
+      required: true
+
   - type: input
     id: zig-version
     attributes:
@@ -44,10 +54,19 @@ body:
     id: httpx-version
     attributes:
       label: httpx.zig Version
-      description: What version of httpx.zig are you using? (e.g. 0.0.1, main branch commit)
-      placeholder: 0.0.1
+      description: What version of httpx.zig are you using? (e.g. 0.0.2, main branch commit)
+      placeholder: 0.0.2
     validations:
       required: true
+
+  - type: input
+    id: target
+    attributes:
+      label: Build Target
+      description: Target triple used in build/test (if any).
+      placeholder: x86_64-linux
+    validations:
+      required: false
 
   - type: dropdown
     id: os
@@ -62,8 +81,27 @@ body:
       required: true
 
   - type: textarea
+    id: minimal-code
+    attributes:
+      label: Minimal Reproduction Code
+      description: Paste the smallest code sample that reproduces the issue.
+      render: zig
+    validations:
+      required: false
+
+  - type: textarea
     id: logs
     attributes:
       label: Logs or Screenshots
       description: Paste any relevant logs or attach screenshots.
       render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I tested with Zig 0.15.2.
+          required: true
+        - label: I searched existing issues before creating this report.
+          required: true

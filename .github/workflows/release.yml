@@ -14,31 +14,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2.1.0
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
       - name: Run Tests
         run: zig build test
-
-  bench:
-    name: Run Benchmarks
-    needs: test
-    runs-on: ubuntu-latest
-    outputs:
-      bench_output: ${{ steps.run_bench.outputs.bench_output }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2.1.0
-        with:
-          version: 0.15.2
-      - name: Run Benchmarks
-        id: run_bench
-        run: |
-          zig build bench || true
-          echo "bench_output<<EOF" >> $GITHUB_OUTPUT
-          echo "Benchmark results would go here" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
   build-library:
     name: Build Library (${{ matrix.target }})
@@ -54,9 +35,14 @@ jobs:
           - aarch64-linux
           - x86_64-macos
           - aarch64-macos
+          - x86_64-freestanding
+          - x86-freestanding
+          - aarch64-freestanding
+          - riscv64-freestanding
+          - arm-freestanding
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2.1.0
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
       
@@ -76,21 +62,96 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" release/* --clobber || true
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
 
   update-release:
     name: Update Release Description
-    needs: [test, bench]
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
+      - name: Get Release URL
+        id: get_url
+        run: echo "url=https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz" >> $GITHUB_OUTPUT
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Calculate Hash
+        id: calc_hash
+        run: |
+          HASH=$(zig fetch ${{ steps.get_url.outputs.url }})
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
       - name: Update Release Body
         uses: softprops/action-gh-release@v1
         with:
           body: |
             ${{ github.event.release.body }}
 
-            ## ⬇️ Downloads
+            ## Documentation
 
-            See assets below.
+            Full documentation is available at https://muhammad-fiaz.github.io/httpx.zig/
+
+            ## Installation
+
+            ### Option A - Automatic (Recommended)
+
+            Run this to install the dependency and automatically save the hash:
+
+            ```bash
+            zig fetch --save https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz
+            ```
+
+            After running, Zig updates your `build.zig.zon` with the correct hash automatically.
+
+            ```zig
+            .dependencies = .{
+                .httpx = .{
+                    .url = "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz",
+                    .hash = "${{ steps.calc_hash.outputs.hash }}",
+                },
+            },
+            ```
+
+            ### Option B - Manual
+
+            ```bash
+            zig fetch --hash https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz
+            ```
+
+            Copy that hash into your `build.zig.zon`:
+
+            ```zig
+            .hash = "${{ steps.calc_hash.outputs.hash }}"
+            ```
+
+            ## Downloads (Prebuilt Library)
+
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Windows | x86_64 | [httpx-x86_64-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/httpx-x86_64-windows.lib) |
+            | Windows | x86 | [httpx-x86-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/httpx-x86-windows.lib) |
+            | Linux | x86_64 | [libhttpx-x86_64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-linux.a) |
+            | Linux | x86 | [libhttpx-x86-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86-linux.a) |
+            | Linux | aarch64 | [libhttpx-aarch64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-linux.a) |
+            | macOS | x86_64 | [libhttpx-x86_64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-macos.a) |
+            | macOS | aarch64 | [libhttpx-aarch64-macos.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-macos.a) |
+            | Bare Metal | x86_64 | [libhttpx-x86_64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86_64-freestanding.a) |
+            | Bare Metal | x86 | [libhttpx-x86-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-x86-freestanding.a) |
+            | Bare Metal | aarch64 | [libhttpx-aarch64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-aarch64-freestanding.a) |
+            | Bare Metal | RISC-V 64 | [libhttpx-riscv64-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-riscv64-freestanding.a) |
+            | Bare Metal | ARM | [libhttpx-arm-freestanding.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libhttpx-arm-freestanding.a) |
+
+            ### Using Prebuilt Libraries
+
+            1. Download the library for your platform.
+            2. Place it in your project (for example, in a `libs/` folder).
+            3. Update your `build.zig`:
+
+            ```zig
+            exe.addLibraryPath(b.path("libs"));
+            exe.linkSystemLibrary("httpx");
+            ```

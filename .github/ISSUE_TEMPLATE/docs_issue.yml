@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve our documentation!
+        Thanks for helping improve the docs.
 
         Docs are available at: https://muhammad-fiaz.github.io/httpx.zig/
 
@@ -33,3 +33,23 @@ body:
       label: Page URL
       description: Link to the page with the issue.
       placeholder: https://muhammad-fiaz.github.io/httpx.zig/guide/...
+
+  - type: input
+    id: section
+    attributes:
+      label: Section / Heading
+      description: Which heading or section is affected?
+      placeholder: "Guide > Getting Started > Installation"
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: How severe is this docs problem?
+      options:
+        - Typo / minor wording
+        - Missing detail
+        - Incorrect code example
+        - Incorrect technical guidance
+    validations:
+      required: true

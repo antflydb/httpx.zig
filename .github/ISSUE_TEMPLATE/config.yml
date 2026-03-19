@@ -2,7 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: Documentation
     url: https://muhammad-fiaz.github.io/httpx.zig/
-    about: Read the official documentation and guides.
-  - name: GitHub Discussions
+    about: Read the official docs, API reference, and guides.
+  - name: Discussions / Q&A
     url: https://github.com/muhammad-fiaz/httpx.zig/discussions
-    about: Ask questions and discuss with the community.
+    about: Ask questions, share ideas, and get community support.

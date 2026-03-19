@@ -12,6 +12,7 @@ const Allocator = mem.Allocator;
 const net = std.net;
 
 const types = @import("../core/types.zig");
+const meta = @import("../core/meta.zig");
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const Uri = @import("../core/uri.zig").Uri;
@@ -35,7 +36,7 @@ pub const ClientConfig = struct {
     retry_policy: types.RetryPolicy = .{},
     redirect_policy: types.RedirectPolicy = .{},
     default_headers: ?[]const [2][]const u8 = null,
-    user_agent: []const u8 = "httpx.zig/0.0.1",
+    user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = 100 * 1024 * 1024,
     follow_redirects: bool = true,
     verify_ssl: bool = true,
@@ -197,7 +198,7 @@ pub const Client = struct {
                 if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries) {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) std.time.sleep(delay_ms * std.time.ns_per_ms);
+                    if (delay_ms > 0) std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                     continue;
                 }
                 return err;
@@ -207,7 +208,7 @@ pub const Client = struct {
                 res.deinit();
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
-                if (delay_ms > 0) std.time.sleep(delay_ms * std.time.ns_per_ms);
+                if (delay_ms > 0) std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             }
 
@@ -439,7 +440,7 @@ test "Client initialization" {
     var client = Client.init(allocator);
     defer client.deinit();
 
-    try std.testing.expectEqualStrings("httpx.zig/0.0.1", client.config.user_agent);
+    try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
 }
 
 test "Client with config" {

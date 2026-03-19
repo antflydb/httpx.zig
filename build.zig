@@ -1,4 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+fn linkPlatformLibs(compile: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag == .windows) {
+        // Winsock symbols are provided by these system libraries on Windows.
+        compile.linkSystemLibrary("ws2_32");
+        compile.linkSystemLibrary("mswsock");
+        compile.linkLibC();
+    }
+}
 
 /// Build configuration for httpx.zig - Production-ready HTTP library for Zig
 /// Supports HTTP/1.1, HTTP/2, HTTP/3 with TLS, connection pooling, and more.
@@ -16,6 +26,7 @@ pub fn build(b: *std.Build) void {
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
+        .{ .name = "simple_get_deserialize", .path = "examples/simple_get_deserialize.zig", .skip_run_all = true },
         .{ .name = "post_json", .path = "examples/post_json.zig" },
         .{ .name = "concurrent_requests", .path = "examples/concurrent_requests.zig" },
         .{ .name = "custom_headers", .path = "examples/custom_headers.zig" },
@@ -41,11 +52,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         exe.root_module.addImport("httpx", httpx_module);
-
-        if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ws2_32");
-            exe.linkSystemLibrary("mswsock");
-        }
+        linkPlatformLibs(exe, target);
 
         const install_exe = b.addInstallArtifact(exe, .{});
         const example_step = b.step("example-" ++ example.name, "Build " ++ example.name ++ " example");
@@ -71,11 +78,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         exe.root_module.addImport("httpx", httpx_module);
-
-        if (target.result.os.tag == .windows) {
-            exe.linkSystemLibrary("ws2_32");
-            exe.linkSystemLibrary("mswsock");
-        }
+        linkPlatformLibs(exe, target);
 
         const install_exe = b.addInstallArtifact(exe, .{});
         const run_exe = b.addRunArtifact(exe);
@@ -98,18 +101,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
-    if (target.result.os.tag == .windows) {
-        tests.linkSystemLibrary("ws2_32");
-        tests.linkSystemLibrary("mswsock");
-    }
+    linkPlatformLibs(tests, target);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
 
-    const test_all_step = b.step("test-all", "Run all module tests (alias for test)");
-    test_all_step.dependOn(&run_tests.step);
+    // Only run tests when target matches host; otherwise build test artifact only.
+    if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
+        test_step.dependOn(&run_tests.step);
+    } else {
+        const install_tests = b.addInstallArtifact(tests, .{});
+        test_step.dependOn(&install_tests.step);
+    }
 
     const bench_exe = b.addExecutable(.{
         .name = "benchmark",
@@ -120,11 +123,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bench_exe.root_module.addImport("httpx", httpx_module);
-
-    if (target.result.os.tag == .windows) {
-        bench_exe.linkSystemLibrary("ws2_32");
-        bench_exe.linkSystemLibrary("mswsock");
-    }
+    linkPlatformLibs(bench_exe, target);
 
     const install_bench = b.addInstallArtifact(bench_exe, .{});
     const run_bench = b.addRunArtifact(bench_exe);
@@ -158,11 +157,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-
-        if (t.os_tag == .windows) {
-            lib_cross.linkSystemLibrary("ws2_32");
-            lib_cross.linkSystemLibrary("mswsock");
-        }
+        linkPlatformLibs(lib_cross, target_cross);
 
         // Just build the artifact to verify it compiles
         build_all_step.dependOn(&lib_cross.step);
@@ -177,11 +172,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
-    if (target.result.os.tag == .windows) {
-        lib.linkSystemLibrary("ws2_32");
-        lib.linkSystemLibrary("mswsock");
-    }
+    linkPlatformLibs(lib, target);
 
     b.installArtifact(lib);
 
@@ -192,4 +183,9 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     docs_step.dependOn(&install_docs.step);
+
+    const test_all_step = b.step("test-all", "Run tests, benchmarks, and all runnable examples");
+    test_all_step.dependOn(test_step);
+    test_all_step.dependOn(bench_step);
+    test_all_step.dependOn(run_all_examples);
 }

@@ -1,23 +1,45 @@
 name: Help Wanted
-description: Ask a question or request assistance
+description: Ask a question or request implementation guidance
 title: "[Help]: "
 labels: ["question", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Need help? Please check the [documentation](https://muhammad-fiaz.github.io/httpx.zig/) first.
+        Need help? Please check docs first: https://muhammad-fiaz.github.io/httpx.zig/
 
   - type: textarea
     id: question
     attributes:
       label: Question
       description: What do you need help with?
+      placeholder: "How do I configure the client pool for concurrent requests?"
     validations:
       required: true
 
   - type: textarea
     id: context
     attributes:
-      label: Context
-      description: provide any code snippets or context that might help us answer your question.
+      label: Context / What You Tried
+      description: Include code snippets and attempts so far.
+      render: zig
+
+  - type: input
+    id: zig-version
+    attributes:
+      label: Zig Version
+      placeholder: 0.15.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true

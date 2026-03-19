@@ -1,6 +1,6 @@
 # Installation
 
-To use `httpx.zig` in your project, you need to add it as a dependency in your `build.zig.zon` file.
+This guide covers all supported installation methods for `httpx.zig`.
 
 ## Requirements
 
@@ -15,19 +15,19 @@ httpx.zig supports all major platforms and architectures:
 
 | OS | Status | Notes |
 |----|--------|-------|
-| Linux | ✅ Full | All major distributions |
-| Windows | ✅ Full | Windows 10/11, Server 2019+ |
-| macOS | ✅ Full | macOS 11+ (Big Sur and later) |
-| FreeBSD | ✅ Full | FreeBSD 13+ |
+| Linux | Full support | All major distributions |
+| Windows | Full support | Windows 10/11, Server 2019+ |
+| macOS | Full support | macOS 11+ (Big Sur and later) |
+| FreeBSD | Full support | FreeBSD 13+ |
 
 ### Architectures
 
 | Architecture | Linux | Windows | macOS |
 |--------------|-------|---------|-------|
-| x86_64 (64-bit) | ✅ | ✅ | ✅ |
-| aarch64 (ARM64) | ✅ | ✅ | ✅ |
-| i386 (32-bit) | ✅ | ✅ | ✅ |
-| arm (32-bit) | ✅ | ✅ | ✅ |
+| x86_64 (64-bit) | Yes | Yes | Yes |
+| aarch64 (ARM64) | Yes | Yes | Yes |
+| i386 (32-bit) | Yes | Yes | Yes |
+| arm (32-bit) | Yes | Yes | Yes |
 
 ::: tip Cross-Compilation
 Zig makes cross-compilation easy. You can build for any supported target from any host:
@@ -43,34 +43,34 @@ zig build -Dtarget=aarch64-macos
 ```
 :::
 
-## 1. Add Dependency
+## Method 1: Zig Fetch (Recommended Stable Release)
 
-### Automatic installation (recommended)
-
-Run the following command in your terminal:
+Use the latest tagged release for reproducible builds:
 
 ```bash
-zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.2.tar.gz
 ```
 
-### Alternative: fetch from tarball
+## Method 2: Zig Fetch (Nightly/Main)
 
-Run the following command in your terminal to fetch the library:
+Use the Git URL if you want the latest commits from main:
 
 ```bash
-zig fetch --save "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/heads/main.tar.gz"
+zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig.git
 ```
 
-Or manually add it to your `build.zig.zon`:
+## Method 3: Manual `build.zig.zon` Configuration
+
+You can also add the dependency manually:
 
 ```zig
 .{
     .name = "my-project",
-    .version = "0.0.1",
+    .version = "0.1.0",
     .dependencies = .{
         .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/heads/main.tar.gz",
-            // .hash = "...", // Zig will suggest the hash
+            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.2.tar.gz",
+            .hash = "...", // Run zig fetch --save <url> to auto-fill this.
         },
     },
     .paths = .{
@@ -79,25 +79,40 @@ Or manually add it to your `build.zig.zon`:
 }
 ```
 
-## 2. Configure `build.zig`
+## Method 4: Local Source Checkout
 
-Add the module to your `build.zig` file to expose it to your executable or library:
+Clone and build directly:
+
+```bash
+git clone https://github.com/muhammad-fiaz/httpx.zig.git
+cd httpx.zig
+zig build
+```
+
+To use a local checkout from another project:
+
+```zig
+.dependencies = .{
+    .httpx = .{
+        .path = "../httpx.zig",
+    },
+},
+```
+
+## Configure `build.zig`
+
+After adding the dependency, expose the module in your build script:
 
 ```zig
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 1. Get the dependency
     const httpx_dep = b.dependency("httpx", .{
         .target = target,
         .optimize = optimize,
     });
 
-    // 2. Get the module
-    const httpx_mod = httpx_dep.module("httpx");
-
-    // 3. Add to your executable
     const exe = b.addExecutable(.{
         .name = "my-app",
         .root_source_file = b.path("src/main.zig"),
@@ -105,15 +120,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.root_module.addImport("httpx", httpx_mod);
-
+    exe.root_module.addImport("httpx", httpx_dep.module("httpx"));
     b.installArtifact(exe);
 }
 ```
 
-## 3. Import in your code
-
-You can now import the library in your Zig code:
+## Import in your code
 
 ```zig
 const std = @import("std");
@@ -124,10 +136,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Use the client
     var client = httpx.Client.init(allocator);
     defer client.deinit();
-    
-    // ...
+
+    _ = try client.get("https://httpbin.org/get", .{});
 }
 ```

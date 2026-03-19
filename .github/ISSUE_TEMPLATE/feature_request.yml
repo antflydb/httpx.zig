@@ -6,12 +6,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for your interest in improving httpx.zig!
+        Thanks for helping improve httpx.zig.
+
+        Please describe your use case and why this feature matters.
 
   - type: textarea
     id: pitch
     attributes:
-      label: Pitch
+      label: Problem / Use Case
       description: A clear and concise description of the feature you want.
       placeholder: "I would like to support protocol X..."
     validations:
@@ -22,6 +24,16 @@ body:
     attributes:
       label: Proposed Solution
       description: Describe the solution you'd like.
+      placeholder: "Add a new API that allows ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-design
+    attributes:
+      label: Suggested API (Optional)
+      description: If possible, share a rough API sketch.
+      render: zig
     validations:
       required: false
 
@@ -30,3 +42,14 @@ body:
     attributes:
       label: Alternatives Considered
       description: Describe any alternative solutions or features you've considered.
+
+  - type: dropdown
+    id: breaking-change
+    attributes:
+      label: Does this require a breaking API change?
+      options:
+        - No
+        - Yes
+        - Not sure
+    validations:
+      required: true
