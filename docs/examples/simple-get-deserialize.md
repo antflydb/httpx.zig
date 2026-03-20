@@ -1,10 +1,32 @@
 # Simple Get Deserialize
 
-GET request that deserializes JSON into a Zig type.
+Parse JSON responses into typed Zig structs.
 
 ## Demo Program
 
-- Run with: `zig build run-simple_get_deserialize`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+const Echo = struct {
+    url: []const u8,
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = httpx.Client.init(allocator);
+    defer client.deinit();
+
+    var res = try client.get("https://httpbin.org/get", .{});
+    defer res.deinit();
+
+    const parsed = try res.json(Echo);
+    std.debug.print("url={s}\n", .{parsed.url});
+}
+```
 
 ## Run
 
@@ -12,6 +34,7 @@ GET request that deserializes JSON into a Zig type.
 zig build run-simple_get_deserialize
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- JSON parsing succeeds without runtime errors.
+- Parsed struct fields contain expected values.

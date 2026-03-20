@@ -1,10 +1,23 @@
 # HTTP/3 Example
 
-Show HTTP/3 and QUIC protocol utility usage.
+Use HTTP/3 and QUIC protocol helpers (QPACK and frame primitives).
 
 ## Demo Program
 
-- Run with: `zig build run-http3_example`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    const v: u64 = 1337;
+    var buf: [16]u8 = undefined;
+
+    const encoded = httpx.encodeVarInt(v, &buf);
+    const decoded = try httpx.decodeVarInt(encoded);
+
+    std.debug.print("h3 varint encoded={d} decoded={d}\n", .{ encoded.len, decoded.value });
+}
+```
 
 ## Run
 
@@ -12,6 +25,7 @@ Show HTTP/3 and QUIC protocol utility usage.
 zig build run-http3_example
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Varint round trip produces original numeric value.
+- Encoded size is consistent with QUIC varint rules.

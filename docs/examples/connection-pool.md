@@ -1,10 +1,31 @@
 # Connection Pool
 
-Reuse pooled connections for lower latency and overhead.
+Reuse connections across requests to improve latency and throughput.
 
 ## Demo Program
 
-- Run with: `zig build run-connection_pool`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = httpx.Client.initWithConfig(allocator, .{
+        .pool_max_connections = 32,
+        .pool_max_per_host = 8,
+    });
+    defer client.deinit();
+
+    inline for (0..5) |_| {
+        var res = try client.get("https://httpbin.org/get", .{});
+        defer res.deinit();
+        std.debug.print("status={d}, len={?d}\n", .{ res.status.code, res.contentLength() });
+    }
+}
+```
 
 ## Run
 
@@ -12,6 +33,7 @@ Reuse pooled connections for lower latency and overhead.
 zig build run-connection_pool
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Repeated calls succeed with stable performance.
+- Pool limits are respected for host and global connections.

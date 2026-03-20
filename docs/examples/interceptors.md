@@ -1,10 +1,38 @@
 # Interceptors
 
-Apply request/response interceptors for cross-cutting behavior.
+Apply request/response interceptors to inject shared behavior.
 
 ## Demo Program
 
-- Run with: `zig build run-interceptors`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn onRequest(req: *httpx.Request, _: ?*anyopaque) !void {
+    try req.setHeader("X-Intercepted", "true");
+}
+
+fn onResponse(res: *httpx.Response, _: ?*anyopaque) !void {
+    std.debug.print("intercepted status={d}\n", .{res.status.code});
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = httpx.Client.init(allocator);
+    defer client.deinit();
+
+    try client.addInterceptor(.{
+        .request_fn = onRequest,
+        .response_fn = onResponse,
+    });
+
+    var res = try client.get("https://httpbin.org/get", .{});
+    defer res.deinit();
+}
+```
 
 ## Run
 
@@ -12,6 +40,7 @@ Apply request/response interceptors for cross-cutting behavior.
 zig build run-interceptors
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Request interceptor injects the custom header.
+- Response interceptor executes for successful responses.

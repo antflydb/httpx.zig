@@ -1,10 +1,40 @@
 # Middleware Example
 
-Compose middleware for auth/logging/processing.
+Chain middleware for logging, CORS, and custom request checks.
 
 ## Demo Program
 
-- Run with: `zig build run-middleware_example`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn auth(ctx: *httpx.Context, next: httpx.Next) anyerror!httpx.Response {
+    if (ctx.header("Authorization") == null) {
+        return ctx.status(401).json(.{ .error = "missing auth" });
+    }
+    return next(ctx);
+}
+
+fn secure(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.json(.{ .message = "secure route" });
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    try server.use(httpx.logger());
+    try server.use(httpx.cors(.{}));
+    try server.use(.{ .name = "auth", .handler = auth });
+
+    try server.get("/secure", secure);
+    try server.listen();
+}
+```
 
 ## Run
 
@@ -12,6 +42,7 @@ Compose middleware for auth/logging/processing.
 zig build run-middleware_example
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Requests without auth header return 401.
+- Requests with auth header reach final handler.

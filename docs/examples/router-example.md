@@ -1,10 +1,35 @@
 # Router Example
 
-Define route groups, parameters, and handlers.
+Use path parameters and multiple methods with route handlers.
 
 ## Demo Program
 
-- Run with: `zig build run-router_example`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn getUser(ctx: *httpx.Context) anyerror!httpx.Response {
+    const id = ctx.param("id") orelse "unknown";
+    return ctx.json(.{ .id = id });
+}
+
+fn createUser(ctx: *httpx.Context) anyerror!httpx.Response {
+    return httpx.Response.fromText(ctx.allocator, "created", 201);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    try server.get("/users/:id", getUser);
+    try server.post("/users", createUser);
+    try server.listen();
+}
+```
 
 ## Run
 
@@ -12,6 +37,7 @@ Define route groups, parameters, and handlers.
 zig build run-router_example
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- `GET /users/42` returns `id=42`.
+- `POST /users` returns `201 created`.

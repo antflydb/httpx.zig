@@ -138,6 +138,20 @@ const timeout_response = try client.get("https://slow-api.com/data", .{
 defer timeout_response.deinit();
 ```
 
+### Client Usage Recipes
+
+For complete copy/paste demos, see these example pages:
+
+- [Simple Get](/examples/simple-get)
+- [Simple Get Deserialize](/examples/simple-get-deserialize)
+- [Post JSON](/examples/post-json)
+- [Custom Headers](/examples/custom-headers)
+- [Concurrent Requests](/examples/concurrent-requests)
+- [Connection Pool](/examples/connection-pool)
+- [Interceptors](/examples/interceptors)
+- [Cookies Demo](/examples/cookies-demo)
+- [Simplified API Aliases](/examples/simplified-api-aliases)
+
 ### Request Options (`RequestOptions`)
 
 Per-request overrides for configuration.

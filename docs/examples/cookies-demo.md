@@ -1,10 +1,31 @@
 # Cookies Demo
 
-Read and write HTTP cookies in client flows.
+Work with the built-in client cookie jar for session-style flows.
 
 ## Demo Program
 
-- Run with: `zig build run-cookies_demo`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = httpx.Client.init(allocator);
+    defer client.deinit();
+
+    try client.setCookie("session", "abc123");
+    std.debug.print("has session: {}\n", .{client.hasCookie("session")});
+
+    const value = client.getCookie("session") orelse "";
+    std.debug.print("session={s}\n", .{value});
+
+    client.removeCookie("session");
+    std.debug.print("cookie count={d}\n", .{client.cookieCount()});
+}
+```
 
 ## Run
 
@@ -12,6 +33,7 @@ Read and write HTTP cookies in client flows.
 zig build run-cookies_demo
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Cookie values are set/read/removed as expected.
+- Cookie count reflects jar state changes.

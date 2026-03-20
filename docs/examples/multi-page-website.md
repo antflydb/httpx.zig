@@ -1,10 +1,39 @@
 # Multi Page Website
 
-Serve a simple multi-page website structure.
+Serve a small website with multiple routes and shared assets.
 
 ## Demo Program
 
-- Run with: `zig build run-multi_page_website`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn index(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.file("examples/multi_page_site/index.html");
+}
+
+fn about(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.file("examples/multi_page_site/about.html");
+}
+
+fn contact(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.file("examples/multi_page_site/contact.html");
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    try server.get("/", index);
+    try server.get("/about", about);
+    try server.get("/contact", contact);
+    try server.listen();
+}
+```
 
 ## Run
 
@@ -12,6 +41,7 @@ Serve a simple multi-page website structure.
 zig build run-multi_page_website
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- Each route serves the matching HTML page.
+- Browser navigation across pages works correctly.

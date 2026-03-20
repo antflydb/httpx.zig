@@ -1,10 +1,25 @@
 # UDP Local
 
-Run local UDP transport demonstration flow.
+Run the local UDP transport helper flow.
 
 ## Demo Program
 
-- Run with: `zig build run-udp_local`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var transport = try httpx.QuicTransport.init(allocator);
+    defer transport.deinit();
+
+    try transport.bind("127.0.0.1", 4444);
+    std.debug.print("udp local transport bound on 127.0.0.1:4444\n", .{});
+}
+```
 
 ## Run
 
@@ -12,6 +27,7 @@ Run local UDP transport demonstration flow.
 zig build run-udp_local
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- UDP bind succeeds on local interface.
+- Transport deinitializes cleanly.

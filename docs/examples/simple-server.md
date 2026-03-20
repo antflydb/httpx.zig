@@ -1,10 +1,29 @@
 # Simple Server
 
-Start a minimal HTTP server with one route.
+Start a minimal server and return JSON from a single route.
 
 ## Demo Program
 
-- Run with: `zig build run-simple_server`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn health(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.json(.{ .ok = true, .service = "demo" });
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    try server.get("/health", health);
+    try server.listen();
+}
+```
 
 ## Run
 
@@ -12,6 +31,7 @@ Start a minimal HTTP server with one route.
 zig build run-simple_server
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- `GET /health` returns JSON response.
+- Server starts without route registration errors.

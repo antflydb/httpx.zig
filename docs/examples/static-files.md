@@ -1,10 +1,29 @@
 # Static Files
 
-Serve static files and content types from disk.
+Serve files with automatic MIME type resolution.
 
 ## Demo Program
 
-- Run with: `zig build run-static_files`
+```zig
+const std = @import("std");
+const httpx = @import("httpx");
+
+fn home(ctx: *httpx.Context) anyerror!httpx.Response {
+    return ctx.file("examples/multi_page_site/index.html");
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = httpx.Server.init(allocator);
+    defer server.deinit();
+
+    try server.get("/", home);
+    try server.listen();
+}
+```
 
 ## Run
 
@@ -12,6 +31,7 @@ Serve static files and content types from disk.
 zig build run-static_files
 ```
 
-## Notes
+## What to Verify
 
-Review the demo steps above and adapt the run command for your environment.
+- HTML file is served from disk.
+- `Content-Type` matches file extension.
