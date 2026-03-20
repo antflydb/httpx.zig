@@ -34,9 +34,21 @@ Handles Cross-Origin Resource Sharing (CORS) headers.
 const corsConfig = httpx.middleware.CorsConfig{
     .allowed_origins = &[_][]const u8{"https://example.com"},
     .allowed_methods = &[_]Method{.GET, .POST},
+    .allowed_headers = &[_][]const u8{"Content-Type", "Authorization"},
+    .exposed_headers = &[_][]const u8{"X-Request-ID"},
+    .allow_credentials = true,
+    .max_age = 86400,
 };
 server.use(httpx.middleware.cors(corsConfig));
 ```
+
+The middleware automatically:
+
+- Applies `Access-Control-Allow-Origin` with origin-aware matching.
+- Sets `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` from config.
+- Sets `Access-Control-Expose-Headers` when configured.
+- Sets `Access-Control-Allow-Credentials: true` when enabled.
+- Handles preflight `OPTIONS` requests with `204 No Content`.
 
 ### `rateLimit`
 

@@ -1,6 +1,6 @@
 # Server API
 
-The `httpx.zig` server module provides a robust HTTP server with middleware support, routing, and proper context handling. Supports HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 protocols.
+The `httpx.zig` server module provides a robust HTTP server with middleware support, routing, and proper context handling. The high-level runtime supports HTTP/1.0 and HTTP/1.1. HTTP/2 and HTTP/3 primitives are available in the protocol module.
 
 ## Protocol Support
 
@@ -82,6 +82,9 @@ try server.use(httpx.middleware.logger());
 | `patch(path, handler)` | Register PATCH route |
 | `head(path, handler)` | Register HEAD route |
 | `options(path, handler)` | Register OPTIONS route |
+| `any(path, handler)` | Register all standard methods on the same path |
+| `preRoute(hook)` | Register a pre-route hook (runs before route matching) |
+| `global(handler)` | Register fallback handler for unmatched routes |
 | `route(method, path, handler)` | Register any method |
 
 ### Quick Example
@@ -170,6 +173,7 @@ The `Context` struct is passed to every route handler and middleware. It wraps t
 | `param(name)` | Get URL path parameter (`:id`, `:name`) |
 | `query(name)` | Get query string parameter |
 | `header(name)` | Get request header value |
+| `cookie(name)` | Get request cookie value by name |
 
 ### Response Helpers
 
@@ -179,10 +183,14 @@ These methods allow fluent response chaining.
 |--------|-------------|
 | `status(code)` | Set HTTP status code |
 | `setHeader(name, value)` | Set response header |
+| `setCookie(name, value, options)` | Append `Set-Cookie` with Path/Domain/SameSite/Max-Age/Secure/HttpOnly |
+| `removeCookie(name, options)` | Expire a cookie via `Max-Age=0` |
 | `json(value)` | Send JSON response |
 | `text(data)` | Send plain text |
 | `html(data)` | Send HTML response |
-| `file(path)` | Stream a file |
+| `file(path)` | Serve a file with extension-based content type |
+| `chunked(data, trailers)` | Send chunked transfer body with optional trailers |
+| `sse(events)` | Send Server-Sent Events payload |
 | `redirect(url, code)` | Send redirect |
 
 ### Example Context Usage

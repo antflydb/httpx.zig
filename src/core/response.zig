@@ -235,9 +235,11 @@ pub const ResponseBuilder = struct {
             response.body = try self.allocator.dupe(u8, b);
             response.body_owned = true;
 
-            var len_buf: [32]u8 = undefined;
-            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{b.len}) catch unreachable;
-            try response.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+            if (!response.headers.isChunked()) {
+                var len_buf: [32]u8 = undefined;
+                const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{b.len}) catch unreachable;
+                try response.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+            }
         }
 
         return response;

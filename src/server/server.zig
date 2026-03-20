@@ -28,6 +28,20 @@ const Router = @import("router.zig").Router;
 const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../util/common.zig");
 
+pub const CookieOptions = common.CookieOptions;
+pub const SameSite = common.SameSite;
+
+/// SSE event payload used by `Context.sse`.
+pub const SseEvent = struct {
+    data: []const u8,
+    event: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    retry_ms: ?u32 = null,
+};
+
+/// Pre-route hook called after parsing the request and before route matching.
+pub const PreRouteHook = *const fn (*Context) anyerror!void;
+
 /// Server configuration.
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -84,6 +98,12 @@ pub const Context = struct {
         return self.request.headers.get(name);
     }
 
+    /// Returns a parsed cookie value by name from the request Cookie header.
+    pub fn cookie(self: *const Self, name: []const u8) ?[]const u8 {
+        const cookie_header = self.request.headers.get(HeaderName.COOKIE) orelse return null;
+        return common.cookieValue(cookie_header, name);
+    }
+
     /// Sets the response status code.
     pub fn status(self: *Self, code: u16) *Self {
         _ = self.response.status(code);
@@ -93,6 +113,22 @@ pub const Context = struct {
     /// Sets a response header.
     pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
         _ = try self.response.header(name, value);
+    }
+
+    /// Appends a Set-Cookie header with common cookie attributes.
+    pub fn setCookie(self: *Self, name: []const u8, value: []const u8, options: CookieOptions) !void {
+        const set_cookie = try common.buildSetCookieHeader(self.allocator, name, value, options);
+        defer self.allocator.free(set_cookie);
+        try self.response.headers.append(HeaderName.SET_COOKIE, set_cookie);
+    }
+
+    /// Appends a Set-Cookie header that removes a cookie via Max-Age=0.
+    pub fn removeCookie(self: *Self, name: []const u8, options: CookieOptions) !void {
+        var remove_options = options;
+        remove_options.max_age = 0;
+        const remove_value = try common.buildSetCookieHeader(self.allocator, name, "", remove_options);
+        defer self.allocator.free(remove_value);
+        try self.response.headers.append(HeaderName.SET_COOKIE, remove_value);
     }
 
     /// Sends a plain text response.
@@ -118,9 +154,48 @@ pub const Context = struct {
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
         _ = try f.readAll(content);
 
-        // In a real app, detect MIME type from extension
-        _ = try self.response.header(HeaderName.CONTENT_TYPE, "application/octet-stream");
+        _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
         _ = self.response.body(content);
+        return self.response.build();
+    }
+
+    /// Sends chunked transfer-encoded payload with optional trailers.
+    pub fn chunked(self: *Self, data: []const u8, trailers: ?*const Headers) !Response {
+        const encoded = try http.encodeChunkedBody(data, trailers, self.allocator);
+        defer self.allocator.free(encoded);
+
+        _ = try self.response.header(HeaderName.TRANSFER_ENCODING, "chunked");
+        if (trailers) |trailer_headers| {
+            const trailer_names = try trailerHeaderNames(self.allocator, trailer_headers);
+            defer self.allocator.free(trailer_names);
+            _ = try self.response.header("Trailer", trailer_names);
+        }
+        _ = self.response.body(encoded);
+        return self.response.build();
+    }
+
+    /// Sends one-shot Server-Sent Events payload.
+    pub fn sse(self: *Self, events: []const SseEvent) !Response {
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+        const writer = payload.writer(self.allocator);
+
+        for (events) |evt| {
+            if (evt.id) |id| try writer.print("id: {s}\n", .{id});
+            if (evt.event) |name| try writer.print("event: {s}\n", .{name});
+            if (evt.retry_ms) |retry_ms| try writer.print("retry: {d}\n", .{retry_ms});
+
+            var lines = mem.splitScalar(u8, evt.data, '\n');
+            while (lines.next()) |line| {
+                try writer.print("data: {s}\n", .{line});
+            }
+            try writer.writeAll("\n");
+        }
+
+        _ = try self.response.header(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        _ = try self.response.header(HeaderName.CACHE_CONTROL, "no-cache");
+        _ = try self.response.header(HeaderName.CONNECTION, "keep-alive");
+        _ = self.response.body(payload.items);
         return self.response.build();
     }
 
@@ -147,6 +222,8 @@ pub const Server = struct {
     config: ServerConfig,
     router: Router,
     middleware: std.ArrayListUnmanaged(Middleware) = .empty,
+    pre_route_hooks: std.ArrayListUnmanaged(PreRouteHook) = .empty,
+    global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     running: bool = false,
 
@@ -170,12 +247,23 @@ pub const Server = struct {
     pub fn deinit(self: *Self) void {
         self.router.deinit();
         self.middleware.deinit(self.allocator);
+        self.pre_route_hooks.deinit(self.allocator);
         if (self.listener) |*l| l.deinit();
     }
 
     /// Adds middleware to the server.
     pub fn use(self: *Self, mw: Middleware) !void {
         try self.middleware.append(self.allocator, mw);
+    }
+
+    /// Adds a pre-route hook executed before route matching.
+    pub fn preRoute(self: *Self, hook: PreRouteHook) !void {
+        try self.pre_route_hooks.append(self.allocator, hook);
+    }
+
+    /// Registers a global fallback handler for unmatched routes.
+    pub fn global(self: *Self, handler: Handler) void {
+        self.global_handler = handler;
     }
 
     /// Registers a route handler.
@@ -216,6 +304,19 @@ pub const Server = struct {
     /// Registers an OPTIONS route.
     pub fn options(self: *Self, path: []const u8, handler: Handler) !void {
         try self.route(.OPTIONS, path, handler);
+    }
+
+    /// Registers a handler for all standard HTTP methods on a path.
+    pub fn any(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.route(.GET, path, handler);
+        try self.route(.POST, path, handler);
+        try self.route(.PUT, path, handler);
+        try self.route(.DELETE, path, handler);
+        try self.route(.PATCH, path, handler);
+        try self.route(.HEAD, path, handler);
+        try self.route(.OPTIONS, path, handler);
+        try self.route(.TRACE, path, handler);
+        try self.route(.CONNECT, path, handler);
     }
 
     /// Starts the server and begins accepting connections.
@@ -292,6 +393,13 @@ pub const Server = struct {
             var ctx = Context.init(self.allocator, &req);
             defer ctx.deinit();
 
+            for (self.pre_route_hooks.items) |hook| {
+                hook(&ctx) catch |err| {
+                    std.debug.print("Pre-route hook error: {}\n", .{err});
+                    return self.sendError(&sock, 500);
+                };
+            }
+
             var suppress_body = false;
             var route_result = self.router.find(req.method, req.uri.path);
 
@@ -310,7 +418,7 @@ pub const Server = struct {
 
             var response: Response = undefined;
             if (route_result) |r| {
-                response = r.handler(&ctx) catch |err| {
+                response = self.executeMiddleware(&ctx, r.handler) catch |err| {
                     std.debug.print("Handler error: {}\n", .{err});
                     return self.sendError(&sock, 500);
                 };
@@ -324,6 +432,11 @@ pub const Server = struct {
                 } else if (allow_count > 0) {
                     response = Response.init(self.allocator, 405);
                     try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+                } else if (self.global_handler) |global_handler| {
+                    response = self.executeMiddleware(&ctx, global_handler) catch |err| {
+                        std.debug.print("Global handler error: {}\n", .{err});
+                        return self.sendError(&sock, 500);
+                    };
                 } else {
                     return self.sendError(&sock, 404);
                 }
@@ -404,7 +517,52 @@ pub const Server = struct {
 
         try headers.set("Allow", allow.items);
     }
+
+    const MiddlewareExecState = struct {
+        server: *Self,
+        route_handler: Handler,
+        index: usize = 0,
+    };
+
+    fn executeMiddleware(self: *Self, ctx: *Context, route_handler: Handler) !Response {
+        var state = MiddlewareExecState{
+            .server = self,
+            .route_handler = route_handler,
+        };
+        try ctx.data.put("__mw_exec_state", @ptrCast(&state));
+        defer _ = ctx.data.remove("__mw_exec_state");
+
+        return middlewareNext(ctx);
+    }
+
+    fn middlewareNext(ctx: *Context) anyerror!Response {
+        const raw = ctx.data.get("__mw_exec_state") orelse return error.MissingMiddlewareState;
+        const state: *MiddlewareExecState = @ptrCast(@alignCast(raw));
+
+        if (state.index < state.server.middleware.items.len) {
+            const mw = state.server.middleware.items[state.index];
+            state.index += 1;
+            return mw.handler(ctx, middlewareNext);
+        }
+
+        return state.route_handler(ctx);
+    }
 };
+
+fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    var first = true;
+    for (headers.entries.items) |h| {
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        try writer.writeAll(h.name);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 test "Server initialization" {
     const allocator = std.testing.allocator;
@@ -451,6 +609,29 @@ test "Context query parsing" {
     try std.testing.expect(ctx.query("missing") == null);
 }
 
+test "Context cookie helpers" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+    try req.headers.set(HeaderName.COOKIE, "session=abc123; theme=dark");
+
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+
+    try std.testing.expectEqualStrings("abc123", ctx.cookie("session").?);
+    try std.testing.expectEqualStrings("dark", ctx.cookie("theme").?);
+    try std.testing.expect(ctx.cookie("missing") == null);
+
+    try ctx.setCookie("session", "next", .{ .path = "/", .http_only = true, .same_site = .lax });
+    const set_cookie = ctx.response.headers.get(HeaderName.SET_COOKIE).?;
+    try std.testing.expect(mem.indexOf(u8, set_cookie, "session=next") != null);
+
+    try ctx.removeCookie("session", .{ .path = "/" });
+    const all_set_cookies = try ctx.response.headers.getAll(HeaderName.SET_COOKIE, allocator);
+    defer allocator.free(all_set_cookies);
+    try std.testing.expect(all_set_cookies.len >= 2);
+}
+
 test "Router allowed methods for path" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator);
@@ -483,4 +664,23 @@ test "Router allowed methods for path" {
     try std.testing.expect(has_get);
     try std.testing.expect(has_put);
     try std.testing.expect(has_delete);
+}
+
+test "Server any() registers all methods" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    const handler = struct {
+        fn h(_: *Context) anyerror!Response {
+            return error.TestUnexpectedResult;
+        }
+    }.h;
+
+    try server.any("/wild", handler);
+
+    try std.testing.expect(server.router.find(.GET, "/wild") != null);
+    try std.testing.expect(server.router.find(.POST, "/wild") != null);
+    try std.testing.expect(server.router.find(.TRACE, "/wild") != null);
+    try std.testing.expect(server.router.find(.CONNECT, "/wild") != null);
 }

@@ -1,6 +1,6 @@
 # Client API
 
-The `httpx.zig` client provides a high-level HTTP client for making requests with support for HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 protocols. HTTPS is supported via Zig's standard library TLS (`std.crypto.tls`).
+The `httpx.zig` client provides a high-level HTTP client for making requests over HTTP/1.0 and HTTP/1.1. HTTPS is supported via Zig's standard library TLS (`std.crypto.tls`). HTTP/2 and HTTP/3 primitives are available in the protocol module.
 
 ## Protocol Support
 
@@ -43,7 +43,7 @@ defer client.deinit();
 | `retry_policy` | `RetryPolicy` | `{}` | Configuration for automatic retries. |
 | `redirect_policy` | `RedirectPolicy` | `{}` | Configuration for handling redirects. |
 | `default_headers` | `?[]const [2][]const u8` | `null` | Headers added to every request. |
-| `user_agent` | `[]const u8` | `"httpx.zig/0.0.3"` | User-Agent header value. |
+| `user_agent` | `[]const u8` | `"httpx.zig/0.0.4"` | User-Agent header value. |
 | `max_response_size` | `usize` | `100MB` | Maximum allowed response body size. |
 | `follow_redirects` | `bool` | `true` | Whether to automatically follow redirects. |
 | `verify_ssl` | `bool` | `true` | Whether to verify SSL certificates. |

@@ -4,7 +4,7 @@ layout: home
 hero:
   name: httpx.zig
   text: Production-Ready HTTP Library for Zig
-  tagline: Full HTTP/1.1, HTTP/2 with HPACK, HTTP/3 with QPACK/QUIC support
+  tagline: Production-ready HTTP/1.x runtime plus HTTP/2/HTTP/3 protocol primitives
   image:
     src: /logo.png
     alt: httpx.zig
@@ -21,7 +21,7 @@ hero:
 
 features:
   - title: All HTTP Versions
-    details: Full HTTP/1.1 client/server, HTTP/2 with HPACK compression and streams, HTTP/3 with QPACK and QUIC framing.
+    details: Full HTTP/1.0 and HTTP/1.1 runtime support, plus HTTP/2 (HPACK/framing) and HTTP/3 (QPACK/QUIC) primitives.
   - title: Robust Client
     details: Connection pooling, automatic retries, interceptors, and typed API.
   - title: Powerful Server
@@ -41,7 +41,7 @@ Choose one of these installation methods:
 1. Stable release (recommended)
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.3.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz
 ```
 
 2. Nightly/main branch
@@ -55,7 +55,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.3.tar.gz",
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz",
     .hash = "...",
   },
 },
@@ -84,12 +84,12 @@ Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx
 
 ## Protocol Support
 
-| Protocol | Status | Features |
-|----------|--------|----------|
-| HTTP/1.0 | ✅ Full | Basic request/response |
-| HTTP/1.1 | ✅ Full | Keep-alive, chunked transfer, pipelining |
-| HTTP/2 | ✅ Full | HPACK compression, stream multiplexing, flow control |
-| HTTP/3 | ✅ Full | QPACK compression, QUIC transport framing |
+| Protocol | Status | Transport | Notes |
+|----------|--------|-----------|-------|
+| HTTP/1.0 | ✅ Full | TCP | Legacy support |
+| HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
+| HTTP/2 | ⚠️ Partial | TCP/TLS | Protocol primitives available; high-level client/server currently use HTTP/1.1 |
+| HTTP/3 | ⚠️ Partial | QUIC/UDP | Protocol primitives available; high-level client/server currently use HTTP/1.1 |
 
 ## Platform Support
 

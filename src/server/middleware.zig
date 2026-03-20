@@ -34,17 +34,22 @@ pub const MiddlewareChain = struct {
 
     /// Executes the middleware chain.
     pub fn execute(self: *Self, ctx: *Context) anyerror!Response {
-        if (self.current < self.middlewares.len) {
-            const mw = self.middlewares[self.current];
-            self.current += 1;
-            return mw.handler(ctx, struct {
-                fn next(c: *Context) anyerror!Response {
-                    _ = c;
-                    unreachable;
-                }
-            }.next);
+        try ctx.data.put("__middleware_chain_state", @ptrCast(self));
+        defer _ = ctx.data.remove("__middleware_chain_state");
+        return next(ctx);
+    }
+
+    fn next(ctx: *Context) anyerror!Response {
+        const raw = ctx.data.get("__middleware_chain_state") orelse return error.MissingMiddlewareChainState;
+        const chain: *Self = @ptrCast(@alignCast(raw));
+
+        if (chain.current < chain.middlewares.len) {
+            const mw = chain.middlewares[chain.current];
+            chain.current += 1;
+            return mw.handler(ctx, next);
         }
-        return self.final_handler(ctx);
+
+        return chain.final_handler(ctx);
     }
 };
 
@@ -60,14 +65,69 @@ pub const CorsConfig = struct {
 
 /// Creates CORS middleware.
 pub fn cors(config: CorsConfig) Middleware {
-    _ = config;
     return .{
         .name = "cors",
         .handler = struct {
+            fn methodList(allocator: std.mem.Allocator, methods: []const types.Method) ![]u8 {
+                var out = std.ArrayListUnmanaged(u8){};
+                errdefer out.deinit(allocator);
+                const writer = out.writer(allocator);
+
+                for (methods, 0..) |m, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.writeAll(m.toString());
+                }
+                return out.toOwnedSlice(allocator);
+            }
+
+            fn headerList(allocator: std.mem.Allocator, headers_in: []const []const u8) ![]u8 {
+                var out = std.ArrayListUnmanaged(u8){};
+                errdefer out.deinit(allocator);
+                const writer = out.writer(allocator);
+
+                for (headers_in, 0..) |h, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.writeAll(h);
+                }
+                return out.toOwnedSlice(allocator);
+            }
+
+            fn allowedOrigin(ctx: *Context, cfg: CorsConfig) []const u8 {
+                const req_origin = ctx.header("Origin") orelse return cfg.allowed_origins[0];
+                for (cfg.allowed_origins) |o| {
+                    if (std.mem.eql(u8, o, "*") or std.mem.eql(u8, o, req_origin)) {
+                        return if (std.mem.eql(u8, o, "*")) "*" else req_origin;
+                    }
+                }
+                return cfg.allowed_origins[0];
+            }
+
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                try ctx.setHeader("Access-Control-Allow-Origin", "*");
-                try ctx.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-                try ctx.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                const origin = allowedOrigin(ctx, config);
+                try ctx.setHeader("Access-Control-Allow-Origin", origin);
+                try ctx.setHeader("Vary", "Origin");
+
+                const methods = try methodList(ctx.allocator, config.allowed_methods);
+                defer ctx.allocator.free(methods);
+                try ctx.setHeader("Access-Control-Allow-Methods", methods);
+
+                const allowed_headers = try headerList(ctx.allocator, config.allowed_headers);
+                defer ctx.allocator.free(allowed_headers);
+                try ctx.setHeader("Access-Control-Allow-Headers", allowed_headers);
+
+                if (config.exposed_headers.len > 0) {
+                    const exposed = try headerList(ctx.allocator, config.exposed_headers);
+                    defer ctx.allocator.free(exposed);
+                    try ctx.setHeader("Access-Control-Expose-Headers", exposed);
+                }
+
+                if (config.allow_credentials) {
+                    try ctx.setHeader("Access-Control-Allow-Credentials", "true");
+                }
+
+                var max_age_buf: [32]u8 = undefined;
+                const max_age = std.fmt.bufPrint(&max_age_buf, "{d}", .{config.max_age}) catch unreachable;
+                try ctx.setHeader("Access-Control-Max-Age", max_age);
 
                 if (ctx.request.method == .OPTIONS) {
                     return ctx.status(204).text("");

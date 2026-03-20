@@ -8,11 +8,18 @@ Common utilities for buffer management and encoding.
 
 - `queryValue(query, key)`: Get a query parameter value from a raw query string.
 - `parseSetCookiePair(set_cookie)`: Parse the first `name=value` pair from a `Set-Cookie` header value.
+- `cookieValue(cookie_header, name)`: Read a cookie value from a request `Cookie` header.
+- `buildSetCookieHeader(allocator, name, value, options)`: Build a `Set-Cookie` header value with RFC 6265 style attributes.
+- `mimeTypeFromPath(path)`: Resolve a best-effort MIME type from file extension for static/file responses.
+- `CookieOptions`: Cookie attributes (`Path`, `Domain`, `Max-Age`, `SameSite`, `Secure`, `HttpOnly`).
+- `SameSite`: Enum values `lax`, `strict`, `none`.
 
 Root-level aliases are also available:
 
 - `httpx.queryValue(...)`
 - `httpx.parseSetCookiePair(...)`
+- `httpx.CookieOptions`
+- `httpx.SameSite`
 
 Compatibility note:
 

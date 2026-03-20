@@ -1,7 +1,7 @@
 //! httpx.zig - Production-Ready HTTP Library for Zig
 //!
-//! A comprehensive HTTP client and server library with support for all
-//! HTTP protocol versions and modern features.
+//! A comprehensive HTTP client and server library with production-ready HTTP/1.x
+//! runtime support and HTTP/2/HTTP/3 protocol primitives.
 //!
 //! ## Important Note
 //!
@@ -17,8 +17,8 @@
 //!
 //! - **HTTP/1.0**: Basic request-response semantics
 //! - **HTTP/1.1**: Persistent connections, chunked transfer, pipelining
-//! - **HTTP/2**: Full implementation with HPACK compression, stream multiplexing, flow control
-//! - **HTTP/3**: QPACK compression, QUIC transport framing support
+//! - **HTTP/2**: HPACK compression and framing primitives for advanced integrations
+//! - **HTTP/3**: QPACK compression and QUIC framing primitives for advanced integrations
 //!
 //! ## Platform Support
 //!
@@ -187,6 +187,8 @@ pub const QuicTransportParameters = quic.TransportParameters;
 
 pub const formatRequest = http.formatRequest;
 pub const formatResponse = http.formatResponse;
+pub const encodeChunkedBody = http.encodeChunkedBody;
+pub const isH2cUpgradeRequest = http.isH2cUpgradeRequest;
 pub const negotiateVersion = http.negotiateVersion;
 
 pub const Client = client_mod.Client;
@@ -207,6 +209,10 @@ pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
+pub const CookieOptions = server_mod.CookieOptions;
+pub const SameSite = server_mod.SameSite;
+pub const SseEvent = server_mod.SseEvent;
+pub const PreRouteHook = server_mod.PreRouteHook;
 pub const HttpServer = Server;
 pub const Ctx = Context;
 

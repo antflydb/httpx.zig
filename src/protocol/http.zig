@@ -635,6 +635,47 @@ pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
+/// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.
+pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator: Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    const chunk_size: usize = 4096;
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const len = @min(chunk_size, body.len - offset);
+        try writer.print("{x}\r\n", .{len});
+        try writer.writeAll(body[offset .. offset + len]);
+        try writer.writeAll("\r\n");
+        offset += len;
+    }
+
+    try writer.writeAll("0\r\n");
+
+    if (trailers) |trailer_headers| {
+        for (trailer_headers.entries.items) |h| {
+            try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
+        }
+    }
+
+    try writer.writeAll("\r\n");
+    return out.toOwnedSlice(allocator);
+}
+
+/// Returns true if request headers represent an HTTP/1.1 h2c upgrade attempt.
+pub fn isH2cUpgradeRequest(headers: *const Headers) bool {
+    const upgrade = headers.get(HeaderName.UPGRADE) orelse return false;
+    if (!std.ascii.eqlIgnoreCase(upgrade, "h2c")) return false;
+
+    const connection = headers.get(HeaderName.CONNECTION) orelse return false;
+    if (mem.indexOf(u8, connection, "Upgrade") == null and mem.indexOf(u8, connection, "upgrade") == null) {
+        return false;
+    }
+
+    return headers.get("HTTP2-Settings") != null;
+}
+
 /// Determines the highest supported HTTP version based on ALPN negotiation string.
 pub fn negotiateVersion(alpn: ?[]const u8) NegotiatedProtocol {
     if (alpn) |protocol| {
@@ -754,4 +795,30 @@ test "HTTP/3 frame header encode/decode" {
     const decoded = try Http3FrameHeader.decode(buf[0..n]);
     try std.testing.expectEqual(hdr.frame_type, decoded.header.frame_type);
     try std.testing.expectEqual(hdr.length, decoded.header.length);
+}
+
+test "encodeChunkedBody includes final chunk and trailers" {
+    const allocator = std.testing.allocator;
+
+    var trailers = Headers.init(allocator);
+    defer trailers.deinit();
+    try trailers.set("X-Checksum", "abc123");
+
+    const chunked = try encodeChunkedBody("hello", &trailers, allocator);
+    defer allocator.free(chunked);
+
+    try std.testing.expect(mem.indexOf(u8, chunked, "5\r\nhello\r\n") != null);
+    try std.testing.expect(mem.endsWith(u8, chunked, "0\r\nX-Checksum: abc123\r\n\r\n"));
+}
+
+test "isH2cUpgradeRequest detects valid h2c headers" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.set(HeaderName.UPGRADE, "h2c");
+    try headers.set(HeaderName.CONNECTION, "Upgrade, HTTP2-Settings");
+    try headers.set("HTTP2-Settings", "AAMAAABkAAQCAAAAAAIAAAAA");
+
+    try std.testing.expect(isH2cUpgradeRequest(&headers));
 }

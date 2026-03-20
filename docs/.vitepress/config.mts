@@ -207,7 +207,7 @@ gtag('config', '${GA_ID}');`,
           "priceCurrency": "USD"
         },
         "downloadUrl": "https://github.com/muhammad-fiaz/httpx.zig",
-        "softwareVersion": "0.0.3",
+        "softwareVersion": "0.0.4",
         "license": "https://opensource.org/licenses/MIT"
       });
     } else {
@@ -281,7 +281,7 @@ gtag('config', '${GA_ID}');`,
       { text: "Home", link: "/" },
       { text: "Guide", link: "/guide/getting-started" },
       { text: "API", link: "/api/client" },
-      { text: "Examples", link: "/#examples" },
+      { text: "Examples", link: "/examples/" },
       {
         text: "Support",
         items: [
@@ -321,6 +321,30 @@ gtag('config', '${GA_ID}');`,
         items: [
           { text: "HTTP/2", link: "/guide/http2" },
           { text: "HTTP/3", link: "/guide/http3" },
+        ],
+      },
+      {
+        text: "Examples",
+        items: [
+          { text: "All Examples", link: "/examples/" },
+          { text: "Simple GET", link: "/examples/simple-get" },
+          { text: "Simple GET Deserialize", link: "/examples/simple-get-deserialize" },
+          { text: "POST JSON", link: "/examples/post-json" },
+          { text: "Custom Headers", link: "/examples/custom-headers" },
+          { text: "Concurrent Requests", link: "/examples/concurrent-requests" },
+          { text: "Connection Pool", link: "/examples/connection-pool" },
+          { text: "Interceptors", link: "/examples/interceptors" },
+          { text: "Cookies Demo", link: "/examples/cookies-demo" },
+          { text: "Simplified API Aliases", link: "/examples/simplified-api-aliases" },
+          { text: "Simple Server", link: "/examples/simple-server" },
+          { text: "Router Example", link: "/examples/router-example" },
+          { text: "Middleware Example", link: "/examples/middleware-example" },
+          { text: "Streaming", link: "/examples/streaming" },
+          { text: "Static Files", link: "/examples/static-files" },
+          { text: "Multi Page Website", link: "/examples/multi-page-website" },
+          { text: "HTTP/2 Example", link: "/examples/http2-example" },
+          { text: "HTTP/3 Example", link: "/examples/http3-example" },
+          { text: "UDP Local", link: "/examples/udp-local" },
         ],
       },
       {

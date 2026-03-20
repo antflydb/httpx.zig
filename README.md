@@ -56,7 +56,7 @@
 
 | Feature | Description | Documentation |
 |---------|-------------|---------------|
-| **Protocol Support** | Full support for **HTTP/1.0**, **HTTP/1.1**, **HTTP/2** (with HPACK), and **HTTP/3** (with QPACK/QUIC). | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
+| **Protocol Support** | Full runtime support for **HTTP/1.0** and **HTTP/1.1**; **HTTP/2** and **HTTP/3** protocol primitives are available for advanced integrations. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Header Compression** | HPACK (RFC 7541) for HTTP/2 and QPACK (RFC 9204) for HTTP/3. | https://muhammad-fiaz.github.io/httpx.zig/guide/http2 |
 | **Stream Multiplexing** | HTTP/2 stream state machine with flow control and priority handling. | https://muhammad-fiaz.github.io/httpx.zig/api/protocol |
 | **Connection Pooling** | Automatic reuse of TCP connections with keep-alive and health checking. | https://muhammad-fiaz.github.io/httpx.zig/guide/pooling |
@@ -132,7 +132,7 @@ zig build -Dtarget=i386-windows
 ### Method 1: Zig Fetch (Recommended Stable Release)
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.3.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz
 ```
 
 ### Method 2: Zig Fetch (Nightly/Main)
@@ -148,7 +148,7 @@ Add this dependency entry to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.3.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz",
         .hash = "...", // Run zig fetch --save <url> to auto-fill this.
     },
 },
@@ -305,17 +305,17 @@ Latest benchmark snapshot (`x86_64-windows`, `ReleaseFast`):
 
 | Benchmark | Avg (ns/op) | Throughput (ops/sec) |
 |-----------|-------------|----------------------|
-| headers_parse | 44755.50 | 22343 |
-| uri_parse | 93.72 | 10669580 |
-| status_lookup | 2.05 | 487291439 |
-| method_lookup | 13.97 | 71576530 |
-| base64_encode | 13861.42 | 72142 |
-| base64_decode | 13912.25 | 71879 |
-| json_builder | 14178.73 | 70528 |
-| request_build | 35754.42 | 27968 |
-| response_builders | 51674.39 | 19351 |
-| h2_frame_header | 2.08 | 481398752 |
-| h3_varint_encode | 2.47 | 404809787 |
+| headers_parse | 34228.26 | 29215 |
+| uri_parse | 53.14 | 18818251 |
+| status_lookup | 2.28 | 439313265 |
+| method_lookup | 9.27 | 107889064 |
+| base64_encode | 4569.04 | 218864 |
+| base64_decode | 4859.87 | 205766 |
+| json_builder | 4687.50 | 213333 |
+| request_build | 26806.72 | 37304 |
+| response_builders | 35379.08 | 28265 |
+| h2_frame_header | 1.82 | 550533466 |
+| h3_varint_encode | 1.22 | 816790601 |
  
 ## Contributing
  

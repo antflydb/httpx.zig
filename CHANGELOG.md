@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.0.4] - 2026-03-20
+
+### Added
+
+- Server context cookie helpers:
+  - `Context.cookie(name)` to read request cookies from the `Cookie` header.
+  - `Context.setCookie(name, value, options)` for RFC 6265 style `Set-Cookie` generation.
+  - `Context.removeCookie(name, options)` for cookie invalidation (`Max-Age=0`).
+- New shared cookie utilities in `src/util/common.zig`:
+  - `cookieValue(...)` for parsing `Cookie` header values.
+  - `buildSetCookieHeader(...)` for generating `Set-Cookie` strings.
+  - `CookieOptions` + `SameSite` enums for cookie attributes.
+- Top-level exports for cookie types in `src/httpx.zig`:
+  - `httpx.CookieOptions`
+  - `httpx.SameSite`
+- Server runtime enhancements:
+  - Middleware stack is now executed in the request path.
+  - `Server.preRoute(...)` hook support before route matching.
+  - `Server.global(...)` fallback handler for unmatched routes.
+  - `Server.any(path, handler)` convenience registration across standard methods.
+  - `Context.sse(events)` one-shot Server-Sent Events response helper.
+  - `Context.chunked(data, trailers)` chunked transfer response helper with optional trailers.
+- Protocol utility additions:
+  - `http.encodeChunkedBody(...)` helper for chunked transfer body encoding.
+  - `http.isH2cUpgradeRequest(...)` helper for h2c header detection.
+- Shared utility additions:
+  - `mimeTypeFromPath(...)` for centralized extension-to-content-type mapping.
+
+### Changed
+
+- Improved CORS middleware behavior:
+  - Uses `CorsConfig` values for allowed origins, methods, headers, credentials, exposed headers, and max-age.
+  - Adds origin-aware headers and proper preflight (`OPTIONS`) handling.
+- Updated docs protocol claims and support matrices to consistently distinguish HTTP/1.x runtime support from HTTP/2/HTTP/3 protocol primitive support.
+- Bumped project version to `0.0.4`.
+- Updated default User-Agent to `httpx.zig/0.0.4`.
+- Updated README and VitePress docs install/version references to `0.0.4`.
+
 ## [0.0.3] - 2026-03-20
 
 ### Added
