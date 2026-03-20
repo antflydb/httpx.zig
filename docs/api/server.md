@@ -8,8 +8,8 @@ The `httpx.zig` server module provides a robust HTTP server with middleware supp
 |----------|--------|----------|
 | HTTP/1.0 | ✅ Full | Basic request/response |
 | HTTP/1.1 | ✅ Full | Keep-Alive, chunked transfer, pipelining |
-| HTTP/2 | ⚠️ Partial | Protocol primitives available; high-level server currently handles HTTP/1.x requests |
-| HTTP/3 | ⚠️ Partial | Protocol primitives available; high-level server currently handles HTTP/1.x requests |
+| HTTP/2 | ✅ Full | Full protocol-module support (framing/HPACK/streams) with advanced integration paths |
+| HTTP/3 | ✅ Full | Full protocol-module support (framing/QPACK/QUIC) with advanced integration paths |
 
 ## Server
 

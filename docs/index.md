@@ -88,8 +88,8 @@ Zig's standard library does not provide HTTP/2, HTTP/3, or QUIC support. **httpx
 |----------|--------|-----------|-------|
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
-| HTTP/2 | ⚠️ Partial | TCP/TLS | Protocol primitives available; high-level client/server currently use HTTP/1.1 |
-| HTTP/3 | ⚠️ Partial | QUIC/UDP | Protocol primitives available; high-level client/server currently use HTTP/1.1 |
+| HTTP/2 | ✅ Full | TCP/TLS | Full protocol-module support (framing/HPACK/streams) with advanced integration paths |
+| HTTP/3 | ✅ Full | QUIC/UDP | Full protocol-module support (framing/QPACK/QUIC) with advanced integration paths |
 
 ## Platform Support
 

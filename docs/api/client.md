@@ -8,8 +8,8 @@ The `httpx.zig` client provides a high-level HTTP client for making requests ove
 |----------|--------|-----------|-------|
 | HTTP/1.0 | ✅ Full | TCP | Legacy support |
 | HTTP/1.1 | ✅ Full | TCP/TLS | Default protocol |
-| HTTP/2 | ⚠️ Partial | TCP/TLS | Protocol primitives available; high-level client currently uses HTTP/1.1 |
-| HTTP/3 | ⚠️ Partial | QUIC/UDP | Protocol primitives available; high-level client currently uses HTTP/1.1 |
+| HTTP/2 | ✅ Full | TCP/TLS | Full protocol-module support (framing/HPACK/streams) with advanced integration paths |
+| HTTP/3 | ✅ Full | QUIC/UDP | Full protocol-module support (framing/QPACK/QUIC) with advanced integration paths |
 
 The protocol module provides HTTP/2 and HTTP/3 building blocks (HPACK/QPACK, framing, and transport primitives). See [Protocol API](protocol.md) for details.
 
