@@ -383,12 +383,17 @@ pub const TcpListener = struct {
 
     /// Creates and binds a TCP listener to the address.
     pub fn init(addr: net.Address) !Self {
+        return initWithBacklog(addr, 128);
+    }
+
+    /// Creates and binds a TCP listener to the address with explicit backlog.
+    pub fn initWithBacklog(addr: net.Address, backlog: u31) !Self {
         var socket = try Socket.createForAddress(addr);
         errdefer socket.close();
 
         try socket.setReuseAddr(true);
         try socket.bind(addr);
-        try socket.listen(128);
+        try socket.listen(backlog);
 
         return .{ .socket = socket };
     }

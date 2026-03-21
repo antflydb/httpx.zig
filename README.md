@@ -136,7 +136,7 @@ zig build -Dtarget=i386-windows
 ### Method 1: Zig Fetch (Recommended Stable Release)
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz
 ```
 
 ### Method 2: Zig Fetch (Nightly/Main)
@@ -152,7 +152,7 @@ Add this dependency entry to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .httpx = .{
-        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz",
+        .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz",
         .hash = "...", // Run zig fetch --save <url> to auto-fill this.
     },
 },

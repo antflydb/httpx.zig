@@ -157,12 +157,13 @@ pub const TlsSession = struct {
     pub fn handshake(self: *Self, hostname: []const u8) !void {
         const tls = std.crypto.tls;
         const sock = self.socket orelse return error.MissingTransport;
+        const min_tls_buf = tls.Client.min_buffer_len;
+        const net_buf_len: usize = @max(16 * 1024, min_tls_buf);
 
         // Allocate buffers once per session.
-        if (self.net_read_buf == null) self.net_read_buf = try self.allocator.alloc(u8, 16 * 1024);
-        if (self.net_write_buf == null) self.net_write_buf = try self.allocator.alloc(u8, 16 * 1024);
+        if (self.net_read_buf == null) self.net_read_buf = try self.allocator.alloc(u8, net_buf_len);
+        if (self.net_write_buf == null) self.net_write_buf = try self.allocator.alloc(u8, net_buf_len);
 
-        const min_tls_buf = tls.Client.min_buffer_len;
         if (self.tls_read_buf == null) self.tls_read_buf = try self.allocator.alloc(u8, min_tls_buf);
         if (self.tls_write_buf == null) self.tls_write_buf = try self.allocator.alloc(u8, min_tls_buf);
 

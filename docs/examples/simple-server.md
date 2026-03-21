@@ -17,7 +17,12 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var server = httpx.Server.init(allocator);
+    var server = httpx.Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .max_connections = 1000,
+        .keep_alive = true,
+    });
     defer server.deinit();
 
     try server.get("/health", health);
@@ -35,3 +40,4 @@ zig build run-simple_server
 
 - `GET /health` returns JSON response.
 - Server starts without route registration errors.
+- Browser request to `http://127.0.0.1:8080/health` returns immediately.

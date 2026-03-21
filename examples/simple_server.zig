@@ -55,6 +55,8 @@ pub fn main() !void {
     std.debug.print("  GET  /users/:id    -> userHandler\n", .{});
     std.debug.print("  POST /users        -> helloHandler\n", .{});
 
-    std.debug.print("\nTo start the server, uncomment: try server.listen();\n", .{});
-    std.debug.print("Server would be available at http://127.0.0.1:8080\n", .{});
+    std.debug.print("\nServer is running at http://127.0.0.1:8080\n", .{});
+    std.debug.print("Try: /, /api/status, /users/123\n", .{});
+
+    try server.listen();
 }

@@ -41,7 +41,7 @@ Choose one of these installation methods:
 1. Stable release (recommended)
 
 ```bash
-zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz
+zig fetch --save https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz
 ```
 
 2. Nightly/main branch
@@ -55,7 +55,7 @@ zig fetch --save git+https://github.com/muhammad-fiaz/httpx.zig
 ```zig
 .dependencies = .{
   .httpx = .{
-    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.4.tar.gz",
+    .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.0.5.tar.gz",
     .hash = "...",
   },
 },

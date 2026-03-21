@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.0.5] - 2026-03-21
+
+### Fixed
+
+- Fixed HTTPS client panic on Zig 0.15.2 (`std.crypto.tls.Client` unreachable assertion) by ensuring TLS transport I/O buffers always satisfy `Client.min_buffer_len`.
+  - This resolves [Issue #9](https://github.com/muhammad-fiaz/httpx.zig/issues/9).
+- Fixed server listener initialization robustness by:
+  - honoring configured `max_connections` as socket backlog,
+  - clamping invalid `max_connections = 0` to a safe default,
+  - applying safe fallback defaults for request and keep-alive timeouts.
+  - This resolves [Issue #10](https://github.com/muhammad-fiaz/httpx.zig/issues/10).
+- Updated simple server runnable examples to use explicit server config and to actually start listening.
+
+### Changed
+
+- Bumped project version to `0.0.5`.
+- Updated default User-Agent version to `httpx.zig/0.0.5`.
+- Updated README and VitePress installation/version references to `0.0.5`.
+
 ## [0.0.4] - 2026-03-20
 
 ### Added

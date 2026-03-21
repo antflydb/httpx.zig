@@ -236,9 +236,14 @@ pub const Server = struct {
 
     /// Creates a server with custom configuration.
     pub fn initWithConfig(allocator: Allocator, config: ServerConfig) Self {
+        var cfg = config;
+        if (cfg.max_connections == 0) cfg.max_connections = 1000;
+        if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
+        if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
+
         return .{
             .allocator = allocator,
-            .config = config,
+            .config = cfg,
             .router = Router.init(allocator),
         };
     }
@@ -322,7 +327,9 @@ pub const Server = struct {
     /// Starts the server and begins accepting connections.
     pub fn listen(self: *Self) !void {
         const addr = try net.Address.parseIp(self.config.host, self.config.port);
-        self.listener = try TcpListener.init(addr);
+        const backlog_u32: u32 = @max(self.config.max_connections, 1);
+        const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
+        self.listener = try TcpListener.initWithBacklog(addr, backlog);
         self.running = true;
 
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
