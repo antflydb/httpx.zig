@@ -105,8 +105,8 @@ pub const Client = struct {
             .allocator = allocator,
             .io = io,
             .config = config,
-            .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg),
-            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, config.verify_ssl),
+            .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
+            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{ .verify_ssl = config.verify_ssl }),
         };
     }
 
