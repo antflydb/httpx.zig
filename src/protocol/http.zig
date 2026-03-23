@@ -607,51 +607,6 @@ pub const Http3FrameHeader = struct {
     }
 };
 
-/// Formats a request object into HTTP/1.x wire format.
-/// Deprecated: prefer `Request.serialize(writer)` to avoid heap allocation.
-pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8).empty;
-    const writer = arrayListWriter(&buffer, allocator);
-
-    const method_str = req.method.toString();
-    try writer.print("{s} {s}", .{ method_str, req.uri.path });
-    if (req.uri.query) |q| {
-        try writer.print("?{s}", .{q});
-    }
-    try writer.print(" {s}\r\n", .{req.version.toString()});
-
-    try req.headers.serialize(writer);
-    try writer.writeAll("\r\n");
-
-    if (req.body) |body| {
-        try writer.writeAll(body);
-    }
-
-    return buffer.toOwnedSlice(allocator);
-}
-
-/// Formats a response object into HTTP/1.x wire format.
-/// Deprecated: prefer `Response.serialize(writer)` to avoid heap allocation.
-pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8).empty;
-    const writer = arrayListWriter(&buffer, allocator);
-
-    try writer.print("{s} {d} {s}\r\n", .{
-        resp.version.toString(),
-        resp.status.code,
-        resp.status.phrase,
-    });
-
-    try resp.headers.serialize(writer);
-    try writer.writeAll("\r\n");
-
-    if (resp.body) |body| {
-        try writer.writeAll(body);
-    }
-
-    return buffer.toOwnedSlice(allocator);
-}
-
 /// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.
 pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator: Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -701,28 +656,6 @@ pub fn negotiateVersion(alpn: ?[]const u8) NegotiatedProtocol {
         if (mem.eql(u8, protocol, AlpnProtocol.HTTP_1_1)) return .http_1_1;
     }
     return .http_1_1;
-}
-
-test "HTTP/1.1 request formatting" {
-    const allocator = std.testing.allocator;
-    var request = try Request.init(allocator, .GET, "https://example.com/api/users");
-    defer request.deinit();
-
-    const formatted = try formatRequest(&request, allocator);
-    defer allocator.free(formatted);
-
-    try std.testing.expect(mem.startsWith(u8, formatted, "GET /api/users HTTP/1.1\r\n"));
-}
-
-test "HTTP/1.1 response formatting" {
-    const allocator = std.testing.allocator;
-    var response = Response.init(allocator, 200);
-    defer response.deinit();
-
-    const formatted = try formatResponse(&response, allocator);
-    defer allocator.free(formatted);
-
-    try std.testing.expect(mem.startsWith(u8, formatted, "HTTP/1.1 200 OK\r\n"));
 }
 
 test "HTTP/2 frame header serialization" {

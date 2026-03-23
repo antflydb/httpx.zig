@@ -185,8 +185,6 @@ pub const QuicCryptoFrame = quic.CryptoFrame;
 pub const QuicAckFrame = quic.AckFrame;
 pub const QuicTransportParameters = quic.TransportParameters;
 
-pub const formatRequest = http.formatRequest;
-pub const formatResponse = http.formatResponse;
 pub const encodeChunkedBody = http.encodeChunkedBody;
 pub const isH2cUpgradeRequest = http.isH2cUpgradeRequest;
 pub const negotiateVersion = http.negotiateVersion;
