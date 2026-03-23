@@ -145,8 +145,14 @@ pub const Uri = struct {
     }
 };
 
-/// Characters that don't need percent encoding in URIs.
-const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+/// Lookup table for characters that don't need percent encoding in URIs.
+const unreserved_set: [256]bool = blk: {
+    var set: [256]bool = .{false} ** 256;
+    for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") |c| {
+        set[c] = true;
+    }
+    break :blk set;
+};
 
 /// Percent-encodes a string for URI inclusion.
 pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
@@ -154,7 +160,7 @@ pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
     const writer = arrayListWriter(&result, allocator);
 
     for (input) |c| {
-        if (mem.indexOfScalar(u8, unreserved, c) != null) {
+        if (unreserved_set[c]) {
             try writer.writeByte(c);
         } else {
             try writer.print("%{X:0>2}", .{c});

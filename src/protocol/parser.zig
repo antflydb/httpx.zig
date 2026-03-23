@@ -56,8 +56,10 @@ pub const Parser = struct {
     line_buffer: std.ArrayListUnmanaged(u8) = .empty,
     max_header_size: usize = 8192,
     max_headers: usize = 100,
+    max_body_size: usize = 100 * 1024 * 1024, // 100 MB
     header_bytes: usize = 0,
     header_count: usize = 0,
+    total_body_bytes: usize = 0,
 
     const Self = @This();
 
@@ -161,6 +163,7 @@ pub const Parser = struct {
         self.chunk_crlf_read = 0;
         self.header_bytes = 0;
         self.header_count = 0;
+        self.total_body_bytes = 0;
     }
 
     fn checkLineBufferLimit(self: *Self) !void {
@@ -293,6 +296,15 @@ pub const Parser = struct {
             }
             const name = mem.trim(u8, line[0..sep], " \t");
             const value = mem.trim(u8, line[sep + 1 ..], " \t");
+
+            // Reject header injection via embedded CR/LF.
+            if (mem.indexOfAny(u8, name, "\r\n") != null or
+                mem.indexOfAny(u8, value, "\r\n") != null)
+            {
+                self.state = .err;
+                return error.InvalidHeader;
+            }
+
             try self.headers.append(name, value);
             self.header_count += 1;
 
@@ -310,9 +322,20 @@ pub const Parser = struct {
     }
 
     fn determineBodyState(self: *Self) void {
+        // RFC 7230 §3.3.3: reject messages with both Content-Length and
+        // Transfer-Encoding to prevent request smuggling.
+        if (self.chunked and self.content_length != null) {
+            self.state = .err;
+            return;
+        }
+
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {
+            if (len > self.max_body_size) {
+                self.state = .err;
+                return;
+            }
             if (len > 0) {
                 self.state = .body;
             } else {
@@ -338,6 +361,11 @@ pub const Parser = struct {
             return to_read;
         }
 
+        self.total_body_bytes += data.len;
+        if (self.total_body_bytes > self.max_body_size) {
+            self.state = .err;
+            return error.BodyTooLarge;
+        }
         try self.body_buffer.appendSlice(self.allocator, data);
         return data.len;
     }
@@ -364,6 +392,11 @@ pub const Parser = struct {
             return line_end + 2;
         };
 
+        if (self.current_chunk_size > self.max_body_size) {
+            self.state = .err;
+            return line_end + 2;
+        }
+
         self.line_buffer.clearRetainingCapacity();
         self.bytes_read = 0;
         self.chunk_crlf_read = 0;
@@ -380,6 +413,12 @@ pub const Parser = struct {
     fn parseChunkData(self: *Self, data: []const u8) !usize {
         const remaining = self.current_chunk_size - self.bytes_read;
         const to_read = @min(data.len, remaining);
+
+        self.total_body_bytes += to_read;
+        if (self.total_body_bytes > self.max_body_size) {
+            self.state = .err;
+            return error.BodyTooLarge;
+        }
 
         try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
         self.bytes_read += to_read;
@@ -532,4 +571,231 @@ test "Parser reset" {
     parser.reset();
     try std.testing.expect(!parser.isComplete());
     try std.testing.expect(parser.method == null);
+}
+
+test "multi-feed parsing" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Feed the message in several separate calls to exercise incremental parsing.
+    _ = try parser.feed("GET /index.html HTTP/1.1\r\n");
+    try std.testing.expect(!parser.isComplete());
+
+    _ = try parser.feed("Host: localhost\r\n");
+    _ = try parser.feed("Content-Length: 3\r\n");
+    _ = try parser.feed("\r\n");
+    try std.testing.expect(!parser.isComplete());
+
+    _ = try parser.feed("ab");
+    try std.testing.expect(!parser.isComplete());
+
+    _ = try parser.feed("c");
+    try std.testing.expect(parser.isComplete());
+
+    try std.testing.expectEqual(types.Method.GET, parser.method.?);
+    try std.testing.expectEqualStrings("/index.html", parser.path.?);
+    try std.testing.expectEqualStrings("localhost", parser.headers.get("Host").?);
+    try std.testing.expectEqualStrings("abc", parser.getBody());
+}
+
+test "header size limit returns HeaderTooLarge" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Build a request with a header value exceeding 8192 bytes.
+    const prefix = "GET / HTTP/1.1\r\nX-Big: ";
+    const suffix = "\r\n\r\n";
+    const value_len = 8200;
+    var buf: [prefix.len + value_len + suffix.len]u8 = undefined;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memset(buf[prefix.len..][0..value_len], 'A');
+    @memcpy(buf[prefix.len + value_len ..], suffix);
+
+    const result = parser.feed(&buf);
+    try std.testing.expectError(error.HeaderTooLarge, result);
+    try std.testing.expect(parser.isError());
+}
+
+test "too many headers returns TooManyHeaders" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Feed the request line first.
+    _ = try parser.feed("GET / HTTP/1.1\r\n");
+
+    // Feed 100 headers (the maximum allowed).
+    for (0..100) |i| {
+        var hdr_buf: [64]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf, "X-H-{d}: val\r\n", .{i}) catch unreachable;
+        _ = try parser.feed(hdr);
+    }
+
+    // The 101st header should trigger TooManyHeaders.
+    const result = parser.feed("X-Overflow: boom\r\n");
+    try std.testing.expectError(error.TooManyHeaders, result);
+    try std.testing.expect(parser.isError());
+}
+
+test "invalid chunk size puts parser in error state" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    // Feed a non-hex chunk size.
+    _ = try parser.feed("xyz\r\n");
+
+    try std.testing.expect(parser.isError());
+}
+
+test "missing CRLF after chunk data returns InvalidChunkEncoding" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    _ = try parser.feed("5\r\nHello");
+    // After 5 bytes of chunk data the parser expects \r\n but gets "XX".
+    const result = parser.feed("XX");
+    try std.testing.expectError(error.InvalidChunkEncoding, result);
+    try std.testing.expect(parser.isError());
+}
+
+test "empty request line parts puts parser in error state" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Request line with method only, missing path and version.
+    _ = try parser.feed("GET\r\n");
+
+    try std.testing.expect(parser.isError());
+}
+
+test "zero content-length completes with empty body" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("", parser.getBody());
+}
+
+test "multiple chunks of varying sizes" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    const data =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "3\r\nabc\r\n" ++
+        "A\r\n0123456789\r\n" ++
+        "1\r\nZ\r\n" ++
+        "0\r\n\r\n";
+    _ = try parser.feed(data);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("abc0123456789Z", parser.getBody());
+}
+
+test "split headers across feeds parses correctly" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Split in the middle of the header name "Content-Length".
+    _ = try parser.feed("GET / HTTP/1.1\r\nCont");
+    _ = try parser.feed("ent-Length: 4\r\n\r\ndata");
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("4", parser.headers.get("Content-Length").?);
+    try std.testing.expectEqualStrings("data", parser.getBody());
+}
+
+test "response with no body signals uses finishEof" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    // Response with neither Content-Length nor Transfer-Encoding.
+    _ = try parser.feed("HTTP/1.1 200 OK\r\n\r\n");
+    _ = try parser.feed("some body ");
+    _ = try parser.feed("content here");
+
+    try std.testing.expect(!parser.isComplete());
+    parser.finishEof();
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("some body content here", parser.getBody());
+}
+
+test "reject request smuggling: CL + TE both present" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n");
+
+    // Parser should be in error state due to CL+TE conflict.
+    try std.testing.expect(parser.isError());
+}
+
+test "reject body too large via Content-Length" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Set a small max for testing.
+    parser.max_body_size = 16;
+
+    _ = try parser.feed("POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n");
+
+    // Parser should reject because 100 > 16.
+    try std.testing.expect(parser.isError());
+}
+
+test "reject body too large during chunked transfer" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    parser.max_body_size = 8;
+
+    // Chunk size 0x10 = 16 exceeds max_body_size of 8.
+    _ = try parser.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabcdefghijklmnop\r\n0\r\n\r\n");
+    try std.testing.expect(parser.isError());
+}
+
+test "reject body too large accumulated across chunks" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    parser.max_body_size = 8;
+
+    // Two small chunks (4+5=9) that together exceed max_body_size of 8.
+    const result = parser.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n5\r\nefghi\r\n0\r\n\r\n");
+    try std.testing.expectError(error.BodyTooLarge, result);
+}
+
+test "reject header injection via CR in value" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const result = parser.feed("GET / HTTP/1.1\r\nX-Bad: val\rue\r\n\r\n");
+    try std.testing.expectError(error.InvalidHeader, result);
+}
+
+test "reject header injection via LF in name" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const result = parser.feed("GET / HTTP/1.1\r\nX-Ba\nd: value\r\n\r\n");
+    try std.testing.expectError(error.InvalidHeader, result);
 }

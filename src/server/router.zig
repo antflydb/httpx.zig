@@ -275,3 +275,218 @@ test "Router multiple parameters" {
     try std.testing.expectEqualStrings("postId", result.?.params[1].name);
     try std.testing.expectEqualStrings("99", result.?.params[1].value);
 }
+
+test "Router wildcard route" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/static/*", handler);
+
+    const result1 = router.find(.GET, "/static/css/style.css");
+    try std.testing.expect(result1 != null);
+
+    const result2 = router.find(.GET, "/static/js/app.js");
+    try std.testing.expect(result2 != null);
+
+    const result3 = router.find(.GET, "/other/path");
+    try std.testing.expect(result3 == null);
+}
+
+test "Router wildcard at root" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/*", handler);
+
+    const result1 = router.find(.GET, "/anything");
+    try std.testing.expect(result1 != null);
+
+    const result2 = router.find(.GET, "/deep/nested/path");
+    try std.testing.expect(result2 != null);
+}
+
+test "Router no match" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/users", handler);
+
+    const result1 = router.find(.GET, "/posts");
+    try std.testing.expect(result1 == null);
+
+    const result2 = router.find(.GET, "/users/extra/segments");
+    try std.testing.expect(result2 == null);
+}
+
+test "Router trailing slash" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/users", handler);
+
+    const result = router.find(.GET, "/users/");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.params.len);
+}
+
+test "Router method filtering" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/api", handler);
+    try router.add(.POST, "/api", handler);
+
+    const result1 = router.find(.GET, "/api");
+    try std.testing.expect(result1 != null);
+
+    const result2 = router.find(.POST, "/api");
+    try std.testing.expect(result2 != null);
+
+    const result3 = router.find(.DELETE, "/api");
+    try std.testing.expect(result3 == null);
+}
+
+test "Router allowed methods" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/items", handler);
+    try router.add(.POST, "/items", handler);
+    try router.add(.DELETE, "/items", handler);
+
+    var methods_buf: [16]types.Method = undefined;
+    const count = router.allowedMethods("/items", &methods_buf);
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "Router route priority" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const literal_handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    const param_handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/users/me", literal_handler);
+    try router.add(.GET, "/users/:id", param_handler);
+
+    const result1 = router.find(.GET, "/users/me");
+    try std.testing.expect(result1 != null);
+    try std.testing.expectEqual(literal_handler, result1.?.handler);
+    try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
+
+    const result2 = router.find(.GET, "/users/123");
+    try std.testing.expect(result2 != null);
+    try std.testing.expectEqual(param_handler, result2.?.handler);
+    try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
+    try std.testing.expectEqualStrings("id", result2.?.params[0].name);
+    try std.testing.expectEqualStrings("123", result2.?.params[0].value);
+}
+
+test "Router empty path segments" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/users", handler);
+
+    const result = router.find(.GET, "//users");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.params.len);
+}
+
+test "Router deep nesting" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/a/:b/c/:d/e/:f", handler);
+
+    const result = router.find(.GET, "/a/1/c/2/e/3");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 3), result.?.params.len);
+    try std.testing.expectEqualStrings("b", result.?.params[0].name);
+    try std.testing.expectEqualStrings("1", result.?.params[0].value);
+    try std.testing.expectEqualStrings("d", result.?.params[1].name);
+    try std.testing.expectEqualStrings("2", result.?.params[1].value);
+    try std.testing.expectEqualStrings("f", result.?.params[2].name);
+    try std.testing.expectEqualStrings("3", result.?.params[2].value);
+}
+
+test "Router no routes registered" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const result1 = router.find(.GET, "/anything");
+    try std.testing.expect(result1 == null);
+
+    const result2 = router.find(.POST, "/");
+    try std.testing.expect(result2 == null);
+
+    const result3 = router.find(.DELETE, "/some/deep/path");
+    try std.testing.expect(result3 == null);
+}

@@ -164,27 +164,27 @@ pub const DynamicTable = struct {
         const value_copy = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(value_copy);
 
-        // Insert at the beginning (index 0)
-        try self.entries.insert(self.allocator, 0, .{
+        try self.entries.append(self.allocator, .{
             .name = name_copy,
             .value = value_copy,
         });
         self.current_size += entry_size;
     }
 
-    /// Evicts the oldest entry (last in list).
+    /// Evicts the oldest entry (first in list, i.e. index 0).
     fn evictOne(self: *Self) void {
         if (self.entries.items.len == 0) return;
-        const entry = self.entries.pop().?;
+        const entry = self.entries.orderedRemove(0);
         self.current_size -= entry.name.len + entry.value.len + 32;
         self.allocator.free(entry.name);
         self.allocator.free(entry.value);
     }
 
     /// Gets an entry by index (0-based within dynamic table).
+    /// Index 0 = newest entry (last appended), higher indices = older entries.
     pub fn get(self: *const Self, index: usize) ?StaticTable.Entry {
         if (index >= self.entries.items.len) return null;
-        const entry = self.entries.items[index];
+        const entry = self.entries.items[self.entries.items.len - 1 - index];
         return .{ .name = entry.name, .value = entry.value };
     }
 
@@ -403,6 +403,61 @@ pub const HuffmanCodec = struct {
     const eos_code: u32 = 0x3fffffff;
     const eos_len: u5 = 30;
 
+    /// Entry in the 8-bit fast lookup table.
+    /// `len == 0` means no code of length ≤ 8 starts with this 8-bit pattern
+    /// (the actual code is longer than 8 bits).
+    /// `sym` is the decoded symbol (0–255); only valid when `len > 0`.
+    const LutEntry = struct { sym: u8, len: u5 };
+
+    /// Precomputed 256-entry lookup table: top-8-bits → (symbol, code_length).
+    /// Built at comptime: for each symbol with code length 5–8, every 8-bit
+    /// pattern whose high `len` bits equal that symbol's code is filled in.
+    /// Shorter codes take priority (they are filled first and slots are not
+    /// overwritten), which is correct because Huffman codes are prefix-free.
+    const lut: [256]LutEntry = blk: {
+        @setEvalBranchQuota(200_000);
+        var table = [_]LutEntry{.{ .sym = 0, .len = 0 }} ** 256;
+        var clen: u5 = 5;
+        while (clen <= 8) : (clen += 1) {
+            var sym: usize = 0;
+            while (sym < 256) : (sym += 1) {
+                if (lengths[sym] == clen) {
+                    // Shift the code to the top of an 8-bit window, then
+                    // enumerate all (8 - clen) low-bit completions.
+                    const shift = 8 - clen;
+                    const base: u8 = @intCast(codes[sym] << shift);
+                    const count: usize = @as(usize, 1) << shift;
+                    var k: usize = 0;
+                    while (k < count) : (k += 1) {
+                        const idx: u8 = base | @as(u8, @intCast(k));
+                        if (table[idx].len == 0) {
+                            table[idx] = .{ .sym = @intCast(sym), .len = clen };
+                        }
+                    }
+                }
+            }
+        }
+        break :blk table;
+    };
+
+    /// Sorted list of symbol indices whose Huffman code length exceeds 8 bits.
+    /// Used as the fallback when the fast LUT has no match.  There are roughly
+    /// 175 such symbols (mostly high-byte / control characters).
+    const long_syms: []const u8 = blk: {
+        @setEvalBranchQuota(10_000);
+        var buf: [256]u8 = undefined;
+        var count: usize = 0;
+        var sym: usize = 0;
+        while (sym < 256) : (sym += 1) {
+            if (lengths[sym] > 8) {
+                buf[count] = @intCast(sym);
+                count += 1;
+            }
+        }
+        const final = buf[0..count].*;
+        break :blk &final;
+    };
+
     /// Encodes data using Huffman coding.
     pub fn encode(data: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -434,7 +489,12 @@ pub const HuffmanCodec = struct {
         return result.toOwnedSlice(allocator);
     }
 
-    /// Decodes Huffman-encoded data.
+    /// Decodes Huffman-encoded data using a precomputed lookup table.
+    ///
+    /// Fast path: peek the top 8 bits of the bit buffer and consult `lut`.
+    /// If the entry has `len > 0` the symbol is decoded in O(1).
+    /// Slow path (codes longer than 8 bits): linear scan over `long_syms`,
+    /// which contains only the ~175 symbols with code length > 8.
     pub fn decode(data: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(allocator);
@@ -446,19 +506,39 @@ pub const HuffmanCodec = struct {
             bit_buffer = (bit_buffer << 8) | byte;
             bit_count += 8;
 
+            // Drain as many symbols as possible from the accumulated bits.
             while (bit_count >= 5) {
-                // Try to match a symbol
-                var matched = false;
-                for (0..256) |sym| {
-                    const code = codes[sym];
-                    const len = lengths[sym];
+                // Fast path: align the top bits into an 8-bit window and
+                // consult the LUT.  When bit_count >= 8 we take the top 8
+                // bits directly.  When bit_count is 5–7 we left-shift to
+                // fill the window (the low bits won't match any code of the
+                // wrong length because the LUT only stores exact prefix
+                // matches of the correct length).
+                const shift: u6 = if (bit_count >= 8) bit_count - 8 else 0;
+                const top8: u8 = if (bit_count >= 8)
+                    @intCast((bit_buffer >> shift) & 0xFF)
+                else
+                    @intCast((bit_buffer << (8 - bit_count)) & 0xFF);
+                const entry = lut[top8];
+                // Accept the LUT hit only when we actually have enough bits
+                // for the matched code length.
+                if (entry.len > 0 and bit_count >= entry.len) {
+                    try result.append(allocator, entry.sym);
+                    bit_count -= entry.len;
+                    continue;
+                }
 
-                    if (bit_count >= len) {
-                        const mask = (@as(u64, 1) << len) - 1;
-                        const candidate = (bit_buffer >> (bit_count - len)) & mask;
-                        if (candidate == code) {
-                            try result.append(allocator, @intCast(sym));
-                            bit_count -= len;
+                // Slow path: code is longer than 8 bits.
+                // Linear scan over the long-code symbol subset.
+                var matched = false;
+                for (long_syms) |sym| {
+                    const clen = lengths[sym];
+                    if (bit_count >= clen) {
+                        const mask = (@as(u64, 1) << clen) - 1;
+                        const candidate = (bit_buffer >> (bit_count - clen)) & mask;
+                        if (candidate == codes[sym]) {
+                            try result.append(allocator, sym);
+                            bit_count -= clen;
                             matched = true;
                             break;
                         }
@@ -468,7 +548,7 @@ pub const HuffmanCodec = struct {
             }
         }
 
-        // Remaining bits should be EOS padding (all 1s)
+        // Remaining bits must be EOS padding (all 1s, at most 7 bits).
         if (bit_count > 7) return error.InvalidHuffmanPadding;
         if (bit_count > 0) {
             const mask = (@as(u64, 1) << bit_count) - 1;
@@ -685,4 +765,400 @@ test "Huffman encode/decode roundtrip" {
     defer allocator.free(decoded);
 
     try std.testing.expectEqualStrings(original, decoded);
+}
+
+// =============================================================================
+// RFC 7541 Conformance Tests
+// =============================================================================
+
+// --- C.1 Integer Representation Examples ---
+
+test "RFC 7541 C.1.1 - encode integer 10 with 5-bit prefix" {
+    var buf: [10]u8 = undefined;
+    const n = try encodeInteger(10, 5, &buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 0x0a), buf[0]);
+
+    // Decode roundtrip
+    const result = try decodeInteger(buf[0..n], 5);
+    try std.testing.expectEqual(@as(u64, 10), result.value);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+}
+
+test "RFC 7541 C.1.2 - encode integer 1337 with 5-bit prefix" {
+    var buf: [10]u8 = undefined;
+    const n = try encodeInteger(1337, 5, &buf);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u8, 0x1f), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0x9a), buf[1]);
+    try std.testing.expectEqual(@as(u8, 0x0a), buf[2]);
+
+    // Decode roundtrip
+    const result = try decodeInteger(buf[0..n], 5);
+    try std.testing.expectEqual(@as(u64, 1337), result.value);
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+}
+
+test "RFC 7541 C.1.3 - encode integer 42 at octet boundary (8-bit prefix)" {
+    var buf: [10]u8 = undefined;
+    const n = try encodeInteger(42, 8, &buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 0x2a), buf[0]);
+
+    // Decode roundtrip
+    const result = try decodeInteger(buf[0..n], 8);
+    try std.testing.expectEqual(@as(u64, 42), result.value);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+}
+
+// --- C.2 Header Field Representation Examples ---
+
+test "RFC 7541 C.2.1 - Literal Header Field with Indexing" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Wire bytes from RFC 7541 C.2.1
+    const wire = [_]u8{
+        0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d,
+        0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73,
+        0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64,
+        0x65, 0x72,
+    };
+
+    const decoded = try decodeHeaders(&ctx, &wire, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("custom-key", decoded[0].name);
+    try std.testing.expectEqualStrings("custom-header", decoded[0].value);
+
+    // Verify it was added to the dynamic table
+    try std.testing.expectEqual(@as(usize, 1), ctx.dynamic_table.len());
+    const dt_entry = ctx.dynamic_table.get(0).?;
+    try std.testing.expectEqualStrings("custom-key", dt_entry.name);
+    try std.testing.expectEqualStrings("custom-header", dt_entry.value);
+}
+
+test "RFC 7541 C.2.2 - Literal Header Field without Indexing" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Wire bytes from RFC 7541 C.2.2
+    const wire = [_]u8{
+        0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c,
+        0x65, 0x2f, 0x70, 0x61, 0x74, 0x68,
+    };
+
+    const decoded = try decodeHeaders(&ctx, &wire, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings(":path", decoded[0].name);
+    try std.testing.expectEqualStrings("/sample/path", decoded[0].value);
+
+    // Verify NOT added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+}
+
+test "RFC 7541 C.2.3 - Literal Header Field Never Indexed" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Wire bytes from RFC 7541 C.2.3
+    const wire = [_]u8{
+        0x10, 0x08, 0x70, 0x61, 0x73, 0x73, 0x77, 0x6f,
+        0x72, 0x64, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65,
+        0x74,
+    };
+
+    const decoded = try decodeHeaders(&ctx, &wire, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings("password", decoded[0].name);
+    try std.testing.expectEqualStrings("secret", decoded[0].value);
+
+    // Verify NOT added to dynamic table
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+}
+
+// --- C.3 Request Examples without Huffman Coding ---
+
+test "RFC 7541 C.3 - Request examples without Huffman coding" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // --- C.3.1 First Request ---
+    {
+        const wire = [_]u8{
+            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77,
+            0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+            0x2e, 0x63, 0x6f, 0x6d,
+        };
+
+        const decoded = try decodeHeaders(&ctx, &wire, allocator);
+        defer {
+            for (decoded) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(decoded);
+        }
+
+        try std.testing.expectEqual(@as(usize, 4), decoded.len);
+        try std.testing.expectEqualStrings(":method", decoded[0].name);
+        try std.testing.expectEqualStrings("GET", decoded[0].value);
+        try std.testing.expectEqualStrings(":scheme", decoded[1].name);
+        try std.testing.expectEqualStrings("http", decoded[1].value);
+        try std.testing.expectEqualStrings(":path", decoded[2].name);
+        try std.testing.expectEqualStrings("/", decoded[2].value);
+        try std.testing.expectEqualStrings(":authority", decoded[3].name);
+        try std.testing.expectEqualStrings("www.example.com", decoded[3].value);
+
+        // Dynamic table should have 1 entry: :authority = www.example.com
+        try std.testing.expectEqual(@as(usize, 1), ctx.dynamic_table.len());
+        // Size = 15 ("www.example.com") + 10 (":authority") + 32 = 57
+        try std.testing.expectEqual(@as(usize, 57), ctx.dynamic_table.current_size);
+    }
+
+    // --- C.3.2 Second Request ---
+    {
+        const wire = [_]u8{
+            0x82, 0x86, 0x84, 0xbe, 0x58, 0x08, 0x6e, 0x6f,
+            0x2d, 0x63, 0x61, 0x63, 0x68, 0x65,
+        };
+
+        const decoded = try decodeHeaders(&ctx, &wire, allocator);
+        defer {
+            for (decoded) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(decoded);
+        }
+
+        try std.testing.expectEqual(@as(usize, 5), decoded.len);
+        try std.testing.expectEqualStrings(":method", decoded[0].name);
+        try std.testing.expectEqualStrings("GET", decoded[0].value);
+        try std.testing.expectEqualStrings(":scheme", decoded[1].name);
+        try std.testing.expectEqualStrings("http", decoded[1].value);
+        try std.testing.expectEqualStrings(":path", decoded[2].name);
+        try std.testing.expectEqualStrings("/", decoded[2].value);
+        try std.testing.expectEqualStrings(":authority", decoded[3].name);
+        try std.testing.expectEqualStrings("www.example.com", decoded[3].value);
+        try std.testing.expectEqualStrings("cache-control", decoded[4].name);
+        try std.testing.expectEqualStrings("no-cache", decoded[4].value);
+
+        // Dynamic table should have 2 entries:
+        // [0] cache-control: no-cache (13 + 8 + 32 = 53)
+        // [1] :authority: www.example.com (10 + 15 + 32 = 57)
+        try std.testing.expectEqual(@as(usize, 2), ctx.dynamic_table.len());
+        try std.testing.expectEqual(@as(usize, 110), ctx.dynamic_table.current_size);
+    }
+
+    // --- C.3.3 Third Request ---
+    {
+        const wire = [_]u8{
+            0x82, 0x87, 0x85, 0xbf, 0x40, 0x0a, 0x63, 0x75,
+            0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79,
+            0x0c, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d,
+            0x76, 0x61, 0x6c, 0x75, 0x65,
+        };
+
+        const decoded = try decodeHeaders(&ctx, &wire, allocator);
+        defer {
+            for (decoded) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(decoded);
+        }
+
+        try std.testing.expectEqual(@as(usize, 5), decoded.len);
+        try std.testing.expectEqualStrings(":method", decoded[0].name);
+        try std.testing.expectEqualStrings("GET", decoded[0].value);
+        try std.testing.expectEqualStrings(":scheme", decoded[1].name);
+        try std.testing.expectEqualStrings("https", decoded[1].value);
+        try std.testing.expectEqualStrings(":path", decoded[2].name);
+        try std.testing.expectEqualStrings("/index.html", decoded[2].value);
+        try std.testing.expectEqualStrings(":authority", decoded[3].name);
+        try std.testing.expectEqualStrings("www.example.com", decoded[3].value);
+        try std.testing.expectEqualStrings("custom-key", decoded[4].name);
+        try std.testing.expectEqualStrings("custom-value", decoded[4].value);
+
+        // Dynamic table should have 3 entries:
+        // [0] custom-key: custom-value (10 + 12 + 32 = 54)
+        // [1] cache-control: no-cache (53)
+        // [2] :authority: www.example.com (57)
+        try std.testing.expectEqual(@as(usize, 3), ctx.dynamic_table.len());
+        try std.testing.expectEqual(@as(usize, 164), ctx.dynamic_table.current_size);
+    }
+}
+
+// --- Dynamic Table Eviction ---
+
+test "RFC 7541 - Dynamic table eviction when exceeding max size" {
+    const allocator = std.testing.allocator;
+    // Use a small max size to trigger eviction easily
+    var table = DynamicTable.initWithSize(allocator, 128);
+    defer table.deinit();
+
+    // Each entry: name.len + value.len + 32
+    // "key-0" (5) + "value-0" (7) + 32 = 44 bytes
+    try table.add("key-0", "value-0"); // 44 bytes, total=44
+    try table.add("key-1", "value-1"); // 44 bytes, total=88
+    try table.add("key-2", "value-2"); // 44 bytes, total=132 > 128, evicts key-0
+
+    // key-0 should have been evicted
+    try std.testing.expectEqual(@as(usize, 2), table.len());
+
+    // Newest entry is at index 0
+    const e0 = table.get(0).?;
+    try std.testing.expectEqualStrings("key-2", e0.name);
+    try std.testing.expectEqualStrings("value-2", e0.value);
+
+    const e1 = table.get(1).?;
+    try std.testing.expectEqualStrings("key-1", e1.name);
+    try std.testing.expectEqualStrings("value-1", e1.value);
+
+    // key-0 is gone
+    try std.testing.expectEqual(@as(?StaticTable.Entry, null), table.get(2));
+}
+
+test "RFC 7541 - Dynamic table eviction fills to 4096 bytes" {
+    const allocator = std.testing.allocator;
+    var table = DynamicTable.init(allocator); // default 4096
+    defer table.deinit();
+
+    // Add entries until we exceed 4096 bytes
+    // Each entry: "header-NN" (9) + "x" * 80 (80) + 32 = 121 bytes
+    // 4096 / 121 ≈ 33 entries fit
+    const long_value = "x" ** 80;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "header-{d:0>2}", .{i}) catch unreachable;
+        try table.add(name, long_value);
+    }
+
+    // Table size should not exceed 4096
+    try std.testing.expect(table.current_size <= 4096);
+
+    // Oldest entries should have been evicted
+    try std.testing.expect(table.len() < 40);
+}
+
+// --- Dynamic Table Size Update ---
+
+test "RFC 7541 - Dynamic table size update to zero evicts all" {
+    const allocator = std.testing.allocator;
+    var table = DynamicTable.init(allocator);
+    defer table.deinit();
+
+    try table.add("key-1", "value-1");
+    try table.add("key-2", "value-2");
+    try table.add("key-3", "value-3");
+    try std.testing.expectEqual(@as(usize, 3), table.len());
+
+    // Set max size to 0 → all entries evicted
+    table.setMaxSize(0);
+    try std.testing.expectEqual(@as(usize, 0), table.len());
+    try std.testing.expectEqual(@as(usize, 0), table.current_size);
+}
+
+test "RFC 7541 - Dynamic table size update via wire format" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Add some entries
+    try ctx.dynamic_table.add("key-1", "value-1");
+    try ctx.dynamic_table.add("key-2", "value-2");
+    try std.testing.expectEqual(@as(usize, 2), ctx.dynamic_table.len());
+
+    // Dynamic table size update to 0: 001xxxxx with value 0 → 0x20
+    const wire = [_]u8{0x20};
+    const decoded = try decodeHeaders(&ctx, &wire, allocator);
+    defer allocator.free(decoded);
+
+    // No headers decoded, but table should be empty
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.len());
+    try std.testing.expectEqual(@as(usize, 0), ctx.dynamic_table.current_size);
+}
+
+// --- Huffman Roundtrip Tests ---
+
+test "RFC 7541 - Huffman roundtrip for various strings" {
+    const allocator = std.testing.allocator;
+
+    const test_strings = [_][]const u8{
+        "www.example.com",
+        "no-cache",
+        "custom-key",
+        "custom-value",
+        "",
+        "/",
+        "/index.html",
+        ":method",
+        "GET",
+        "POST",
+        ":scheme",
+        "http",
+        "https",
+        ":path",
+        ":authority",
+        "gzip, deflate",
+        "The quick brown fox jumps over the lazy dog",
+    };
+
+    for (test_strings) |original| {
+        const encoded = try HuffmanCodec.encode(original, allocator);
+        defer allocator.free(encoded);
+
+        const decoded = try HuffmanCodec.decode(encoded, allocator);
+        defer allocator.free(decoded);
+
+        try std.testing.expectEqualStrings(original, decoded);
+    }
+}
+
+// --- Integer Encode/Decode Roundtrip Tests ---
+
+test "RFC 7541 - Integer encode/decode roundtrip with various prefix bits" {
+    const test_values = [_]u64{ 0, 1, 30, 31, 127, 128, 255, 256, 4096, 65535, 1048576 };
+    const prefix_bits = [_]u4{ 4, 5, 6, 7 };
+
+    for (prefix_bits) |prefix| {
+        for (test_values) |value| {
+            var buf: [10]u8 = undefined;
+            const n = try encodeInteger(value, prefix, &buf);
+
+            const result = try decodeInteger(buf[0..n], prefix);
+            try std.testing.expectEqual(value, result.value);
+            try std.testing.expectEqual(n, result.len);
+        }
+    }
 }

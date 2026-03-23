@@ -420,8 +420,100 @@ test "RetryPolicy.calculateDelay" {
     try std.testing.expectEqual(@as(u64, 2000), policy.calculateDelay(2));
 }
 
+test "RetryPolicy calculateDelay exponential backoff" {
+    const policy = RetryPolicy{};
+    try std.testing.expectEqual(@as(u64, 0), policy.calculateDelay(0));
+    try std.testing.expectEqual(@as(u64, 1000), policy.calculateDelay(1));
+    try std.testing.expectEqual(@as(u64, 2000), policy.calculateDelay(2));
+    try std.testing.expectEqual(@as(u64, 4000), policy.calculateDelay(3));
+}
+
+test "RetryPolicy calculateDelay caps at max" {
+    const policy = RetryPolicy{};
+    const delay = policy.calculateDelay(10);
+    try std.testing.expect(delay <= 30000);
+    try std.testing.expectEqual(@as(u64, 30000), delay);
+}
+
+test "RetryPolicy shouldRetryStatus defaults" {
+    const policy = RetryPolicy{};
+    // These should trigger retry
+    try std.testing.expect(policy.shouldRetryStatus(429));
+    try std.testing.expect(policy.shouldRetryStatus(500));
+    try std.testing.expect(policy.shouldRetryStatus(502));
+    try std.testing.expect(policy.shouldRetryStatus(503));
+    try std.testing.expect(policy.shouldRetryStatus(504));
+    // These should not trigger retry
+    try std.testing.expect(!policy.shouldRetryStatus(200));
+    try std.testing.expect(!policy.shouldRetryStatus(301));
+    try std.testing.expect(!policy.shouldRetryStatus(400));
+    try std.testing.expect(!policy.shouldRetryStatus(401));
+    try std.testing.expect(!policy.shouldRetryStatus(403));
+    try std.testing.expect(!policy.shouldRetryStatus(404));
+}
+
+test "RetryPolicy noRetry" {
+    const policy = RetryPolicy.noRetry();
+    try std.testing.expectEqual(@as(u32, 0), policy.max_retries);
+}
+
+test "RetryPolicy aggressive" {
+    const policy = RetryPolicy.aggressive();
+    try std.testing.expectEqual(@as(u32, 5), policy.max_retries);
+    try std.testing.expectEqual(@as(u64, 500), policy.initial_delay_ms);
+}
+
+test "RetryPolicy custom status codes" {
+    const policy = RetryPolicy{ .retry_on_status = &[_]u16{ 418, 503 } };
+    try std.testing.expect(policy.shouldRetryStatus(418));
+    try std.testing.expect(policy.shouldRetryStatus(503));
+    try std.testing.expect(!policy.shouldRetryStatus(500));
+}
+
 test "RedirectPolicy.getRedirectMethod" {
     const policy = RedirectPolicy{};
     try std.testing.expectEqual(Method.GET, policy.getRedirectMethod(301, .POST));
     try std.testing.expectEqual(Method.POST, policy.getRedirectMethod(307, .POST));
+}
+
+test "RedirectPolicy 301 converts POST to GET" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(Method.GET, policy.getRedirectMethod(301, .POST));
+}
+
+test "RedirectPolicy 302 converts POST to GET" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(Method.GET, policy.getRedirectMethod(302, .POST));
+}
+
+test "RedirectPolicy 307 preserves method" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(Method.POST, policy.getRedirectMethod(307, .POST));
+}
+
+test "RedirectPolicy 308 preserves method" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(Method.PUT, policy.getRedirectMethod(308, .PUT));
+}
+
+test "RedirectPolicy 303 always GET" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(Method.GET, policy.getRedirectMethod(303, .DELETE));
+}
+
+test "RedirectPolicy strict preserves all" {
+    const policy = RedirectPolicy.strict();
+    try std.testing.expectEqual(Method.POST, policy.getRedirectMethod(301, .POST));
+}
+
+test "RedirectPolicy noFollow" {
+    const policy = RedirectPolicy.noFollow();
+    try std.testing.expectEqual(false, policy.follow_redirects);
+}
+
+test "RedirectPolicy defaults" {
+    const policy = RedirectPolicy{};
+    try std.testing.expectEqual(@as(u32, 10), policy.max_redirects);
+    try std.testing.expectEqual(true, policy.follow_redirects);
+    try std.testing.expectEqual(false, policy.preserve_method);
 }

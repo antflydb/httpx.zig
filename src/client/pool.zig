@@ -178,7 +178,7 @@ pub const ConnectionPool = struct {
             if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
                 self.freeHostString(conn.host);
                 conn.close();
-                _ = self.connections.orderedRemove(i);
+                _ = self.connections.swapRemove(i);
             } else {
                 i += 1;
             }
@@ -190,7 +190,7 @@ pub const ConnectionPool = struct {
         for (self.hosts_owned.items, 0..) |owned, j| {
             if (owned.ptr == host.ptr) {
                 self.allocator.free(owned);
-                _ = self.hosts_owned.orderedRemove(j);
+                _ = self.hosts_owned.swapRemove(j);
                 return;
             }
         }

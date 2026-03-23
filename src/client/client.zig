@@ -650,3 +650,54 @@ test "Client hasCookie and cookieCount" {
     try std.testing.expectEqual(@as(usize, 1), client.cookieCount());
     try std.testing.expect(client.hasCookie("session"));
 }
+
+test "Client response size limit" {
+    const config = ClientConfig{};
+    try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), config.max_response_size);
+}
+
+test "Client config retry policy defaults" {
+    const config = ClientConfig{};
+    try std.testing.expectEqual(@as(u32, 3), config.retry_policy.max_retries);
+}
+
+test "Client config redirect policy defaults" {
+    const config = ClientConfig{};
+    try std.testing.expectEqual(@as(u32, 10), config.redirect_policy.max_redirects);
+}
+
+test "Client config keep alive default" {
+    const config = ClientConfig{};
+    try std.testing.expect(config.keep_alive);
+}
+
+test "Client interceptor management" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    try client.addInterceptor(.{
+        .request_fn = null,
+        .response_fn = null,
+        .context = null,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), client.interceptors.items.len);
+}
+
+test "Client config base URL" {
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{
+        .base_url = "https://api.example.com",
+    });
+    defer client.deinit();
+
+    try std.testing.expect(client.config.base_url != null);
+    try std.testing.expectEqualStrings("https://api.example.com", client.config.base_url.?);
+}
+
+test "Client HTTP version default" {
+    const config = ClientConfig{};
+    try std.testing.expect(!config.http2_enabled);
+    try std.testing.expect(!config.http3_enabled);
+}

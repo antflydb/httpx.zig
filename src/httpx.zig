@@ -392,6 +392,10 @@ test "parser" {
     _ = parser;
 }
 
+test "fuzz" {
+    _ = @import("protocol/fuzz.zig");
+}
+
 test "buffer" {
     _ = buffer;
 }
