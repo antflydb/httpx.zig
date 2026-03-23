@@ -608,6 +608,7 @@ pub const Http3FrameHeader = struct {
 };
 
 /// Formats a request object into HTTP/1.x wire format.
+/// Deprecated: prefer `Request.serialize(writer)` to avoid heap allocation.
 pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
     var buffer = std.ArrayListUnmanaged(u8).empty;
     const writer = arrayListWriter(&buffer, allocator);
@@ -630,6 +631,7 @@ pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
 }
 
 /// Formats a response object into HTTP/1.x wire format.
+/// Deprecated: prefer `Response.serialize(writer)` to avoid heap allocation.
 pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
     var buffer = std.ArrayListUnmanaged(u8).empty;
     const writer = arrayListWriter(&buffer, allocator);

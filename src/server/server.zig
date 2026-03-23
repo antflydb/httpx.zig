@@ -544,10 +544,7 @@ pub const Server = struct {
 
             try self.ensureContentLengthHeader(&response);
 
-            const formatted = try http.formatResponse(&response, self.allocator);
-            defer self.allocator.free(formatted);
-
-            try sock.sendAll(formatted);
+            try response.serialize(sock.writer());
 
             if (!keep_alive) return;
             first_request = false;
@@ -561,10 +558,7 @@ pub const Server = struct {
 
         try self.ensureContentLengthHeader(&resp);
 
-        const formatted = try http.formatResponse(&resp, self.allocator);
-        defer self.allocator.free(formatted);
-
-        try socket.sendAll(formatted);
+        try resp.serialize(socket.writer());
     }
 
     fn ensureContentLengthHeader(self: *Self, response: *Response) !void {

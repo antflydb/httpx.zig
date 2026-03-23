@@ -24,7 +24,6 @@ const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
-const http = @import("../protocol/http.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
@@ -268,9 +267,6 @@ pub const Client = struct {
             break :blk self.config.timeouts.write_ms;
         };
 
-        const request_data = try http.formatRequest(req, self.allocator);
-        defer self.allocator.free(request_data);
-
         if (req.uri.isTls()) {
             if (self.config.keep_alive) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
@@ -291,7 +287,7 @@ pub const Client = struct {
                 }
 
                 const w = try tls_conn.session.getWriter();
-                try w.writeAll(request_data);
+                try req.serialize(w);
 
                 const r = try tls_conn.session.getReader();
                 var res = try self.readResponse(r);
@@ -317,7 +313,7 @@ pub const Client = struct {
                 try socket.setSendTimeout(write_timeout_ms);
             }
 
-            return self.executeTlsHttp(&socket, host, request_data);
+            return self.executeTlsHttp(&socket, host, req);
         }
 
         if (self.config.keep_alive) {
@@ -339,7 +335,7 @@ pub const Client = struct {
             }
             conn.socket.setKeepAlive(true) catch {};
 
-            try conn.socket.sendAll(request_data);
+            try req.serialize(conn.socket.writer());
             var res = try self.readResponse(&conn.socket);
             if (!res.headers.isKeepAlive(.HTTP_1_1)) {
                 // Non-keepalive response: evict the connection after this request.
@@ -362,11 +358,11 @@ pub const Client = struct {
             try socket.setSendTimeout(write_timeout_ms);
         }
 
-        try socket.sendAll(request_data);
+        try req.serialize(socket.writer());
         return self.readResponse(&socket);
     }
 
-    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
+    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
         const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
 
         var session = TlsSession.init(tls_cfg, self.io);
@@ -375,7 +371,7 @@ pub const Client = struct {
         try session.handshake(host);
 
         const w = try session.getWriter();
-        try w.writeAll(request_data);
+        try req.serialize(w);
 
         const r = try session.getReader();
         return self.readResponse(r);
