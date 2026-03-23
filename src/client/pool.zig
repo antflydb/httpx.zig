@@ -48,23 +48,23 @@ pub const Connection = struct {
     const Self = @This();
 
     /// Marks the connection as in use.
-    pub fn acquire(self: *Self) void {
+    pub fn acquire(self: *Self, now: i64) void {
         self.in_use = true;
-        self.last_used = milliTimestamp();
+        self.last_used = now;
     }
 
     /// Releases the connection back to the pool.
-    pub fn release(self: *Self) void {
+    pub fn release(self: *Self, now: i64) void {
         self.in_use = false;
-        self.last_used = milliTimestamp();
+        self.last_used = now;
         self.requests_made += 1;
     }
 
     /// Returns true if the connection is healthy and reusable.
-    pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
+    pub fn isHealthy(self: *const Self, max_idle_ms: i64, now: i64) bool {
         if (self.in_use) return false;
         if (self.broken) return false;
-        const idle_time = milliTimestamp() - self.last_used;
+        const idle_time = now - self.last_used;
         return idle_time < max_idle_ms;
     }
 
@@ -74,11 +74,11 @@ pub const Connection = struct {
     }
 
     /// Returns true if this connection should be evicted from the pool.
-    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
+    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32, now: i64) bool {
         if (self.in_use) return false;
         if (self.broken) return true;
         if (self.requests_made >= max_requests_per_connection) return true;
-        const idle_time = milliTimestamp() - self.last_used;
+        const idle_time = now - self.last_used;
         return idle_time >= idle_timeout_ms;
     }
 
@@ -150,14 +150,14 @@ pub const ConnectionPool = struct {
             // Periodic cleanup: evict stale/broken connections.
             const now = milliTimestamp();
             if (now - self.last_cleanup > self.config.health_check_interval_ms) {
-                self.cleanupLocked();
+                self.cleanupLocked(now);
                 self.last_cleanup = now;
             }
 
             for (self.connections.items) |conn| {
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
-                    if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
-                        conn.acquire();
+                    if (conn.isHealthy(self.config.idle_timeout_ms, now) and conn.requests_made < self.config.max_requests_per_connection) {
+                        conn.acquire(now);
                         return conn;
                     }
                 }
@@ -226,11 +226,11 @@ pub const ConnectionPool = struct {
     pub fn releaseConnection(self: *Self, conn: *Connection) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        conn.release();
-        // Opportunistic cleanup on release.
         const now = milliTimestamp();
+        conn.release(now);
+        // Opportunistic cleanup on release.
         if (now - self.last_cleanup > self.config.health_check_interval_ms) {
-            self.cleanupLocked();
+            self.cleanupLocked(now);
             self.last_cleanup = now;
         }
     }
@@ -257,14 +257,14 @@ pub const ConnectionPool = struct {
     pub fn cleanup(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.cleanupLocked();
+        self.cleanupLocked(milliTimestamp());
     }
 
-    fn cleanupLocked(self: *Self) void {
+    fn cleanupLocked(self: *Self, now: i64) void {
         var i: usize = 0;
         while (i < self.connections.items.len) {
             const conn = self.connections.items[i];
-            if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
+            if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
                 conn.close();
                 self.allocator.free(conn.host);
                 self.allocator.destroy(conn);
@@ -333,24 +333,24 @@ pub const TlsConnection = struct {
     const Self = @This();
 
     /// Marks the connection as in use.
-    pub fn acquire(self: *Self) void {
+    pub fn acquire(self: *Self, now: i64) void {
         self.in_use = true;
-        self.last_used = milliTimestamp();
+        self.last_used = now;
     }
 
     /// Releases the connection back to the pool.
-    pub fn release(self: *Self) void {
+    pub fn release(self: *Self, now: i64) void {
         self.in_use = false;
-        self.last_used = milliTimestamp();
+        self.last_used = now;
         self.requests_made += 1;
     }
 
     /// Returns true if the connection is healthy and reusable.
-    pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
+    pub fn isHealthy(self: *const Self, max_idle_ms: i64, now: i64) bool {
         if (self.in_use) return false;
         if (self.broken) return false;
         if (!self.session.connected) return false;
-        const idle_time = milliTimestamp() - self.last_used;
+        const idle_time = now - self.last_used;
         return idle_time < max_idle_ms;
     }
 
@@ -360,12 +360,12 @@ pub const TlsConnection = struct {
     }
 
     /// Returns true if this connection should be evicted from the pool.
-    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests: u32) bool {
+    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
         if (self.in_use) return false;
         if (self.broken) return true;
         if (!self.session.connected) return true;
         if (self.requests_made >= max_requests) return true;
-        const idle_time = milliTimestamp() - self.last_used;
+        const idle_time = now - self.last_used;
         return idle_time >= idle_timeout_ms;
     }
 
@@ -425,16 +425,16 @@ pub const TlsPool = struct {
             // Periodic cleanup of stale entries.
             const now = milliTimestamp();
             if (now - self.last_cleanup > self.config.health_check_interval_ms) {
-                self.cleanupLocked();
+                self.cleanupLocked(now);
                 self.last_cleanup = now;
             }
 
             for (self.connections.items) |entry| {
                 if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
-                    if (entry.isHealthy(self.config.idle_timeout_ms) and
+                    if (entry.isHealthy(self.config.idle_timeout_ms, now) and
                         entry.requests_made < self.config.max_requests_per_connection)
                     {
-                        entry.acquire();
+                        entry.acquire(now);
                         return entry;
                     }
                 }
@@ -509,10 +509,10 @@ pub const TlsPool = struct {
     pub fn releaseConnection(self: *Self, entry: *TlsConnection) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        entry.release();
         const now = milliTimestamp();
+        entry.release(now);
         if (now - self.last_cleanup > self.config.health_check_interval_ms) {
-            self.cleanupLocked();
+            self.cleanupLocked(now);
             self.last_cleanup = now;
         }
     }
@@ -538,14 +538,14 @@ pub const TlsPool = struct {
     pub fn cleanup(self: *Self) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.cleanupLocked();
+        self.cleanupLocked(milliTimestamp());
     }
 
-    fn cleanupLocked(self: *Self) void {
+    fn cleanupLocked(self: *Self, now: i64) void {
         var i: usize = 0;
         while (i < self.connections.items.len) {
             const entry = self.connections.items[i];
-            if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
+            if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
                 entry.close();
                 self.allocator.free(entry.host);
                 self.allocator.destroy(entry);
@@ -675,21 +675,21 @@ test "TlsConnection health check basics" {
     entry.created_at = now;
 
     // Healthy idle connection.
-    try std.testing.expect(entry.isHealthy(60_000));
+    try std.testing.expect(entry.isHealthy(60_000, now));
 
     // In-use connection is not considered healthy (for pool reuse).
     entry.in_use = true;
-    try std.testing.expect(!entry.isHealthy(60_000));
+    try std.testing.expect(!entry.isHealthy(60_000, now));
     entry.in_use = false;
 
     // Broken connection.
     entry.broken = true;
-    try std.testing.expect(!entry.isHealthy(60_000));
+    try std.testing.expect(!entry.isHealthy(60_000, now));
     entry.broken = false;
 
     // Disconnected TLS session.
     entry.session.connected = false;
-    try std.testing.expect(!entry.isHealthy(60_000));
+    try std.testing.expect(!entry.isHealthy(60_000, now));
 }
 
 test "TlsPool initialization and stats" {

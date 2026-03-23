@@ -86,6 +86,7 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
+    decompress_window: ?[]u8 = null,
 
     const Self = @This();
 
@@ -120,6 +121,7 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
+        if (self.decompress_window) |w| self.allocator.free(w);
     }
 
     /// Adds an interceptor to the client.
@@ -532,11 +534,12 @@ pub const Client = struct {
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Decompress buffer must be at least flate.max_window_len (65536).
-        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
-        defer self.allocator.free(decompress_buf);
+        // Reuse or lazily allocate the decompression window (flate.max_window_len = 65536).
+        if (self.decompress_window == null) {
+            self.decompress_window = try self.allocator.alloc(u8, flate.max_window_len);
+        }
 
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, self.decompress_window.?);
 
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;
