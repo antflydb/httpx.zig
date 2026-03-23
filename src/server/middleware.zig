@@ -35,14 +35,14 @@ pub const MiddlewareChain = struct {
 
     /// Executes the middleware chain.
     pub fn execute(self: *Self, ctx: *Context) anyerror!Response {
-        try ctx.data.put("__middleware_chain_state", @ptrCast(self));
+        try ctx.data.put("__middleware_chain_state", .{ .ptr = @ptrCast(self) });
         defer _ = ctx.data.remove("__middleware_chain_state");
         return next(ctx);
     }
 
     fn next(ctx: *Context) anyerror!Response {
-        const raw = ctx.data.get("__middleware_chain_state") orelse return error.MissingMiddlewareChainState;
-        const chain: *Self = @ptrCast(@alignCast(raw));
+        const entry = ctx.data.get("__middleware_chain_state") orelse return error.MissingMiddlewareChainState;
+        const chain: *Self = @ptrCast(@alignCast(entry.ptr));
 
         if (chain.current < chain.middlewares.len) {
             const mw = chain.middlewares[chain.current];

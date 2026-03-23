@@ -65,8 +65,14 @@ pub const Context = struct {
     request: *Request,
     response: ResponseBuilder,
     params: std.StringHashMap([]const u8),
-    data: std.StringHashMap(*anyopaque),
+    data: std.StringHashMap(DataEntry),
     max_file_size: usize = 100 * 1024 * 1024,
+
+    /// Entry in the context data map with an optional destructor for cleanup.
+    pub const DataEntry = struct {
+        ptr: *anyopaque,
+        dtor: ?*const fn (*anyopaque) void = null,
+    };
 
     const Self = @This();
 
@@ -77,15 +83,33 @@ pub const Context = struct {
             .request = req,
             .response = ResponseBuilder.init(allocator),
             .params = std.StringHashMap([]const u8).init(allocator),
-            .data = std.StringHashMap(*anyopaque).init(allocator),
+            .data = std.StringHashMap(DataEntry).init(allocator),
         };
     }
 
-    /// Releases context resources.
+    /// Releases context resources. Calls destructors for data entries that have them.
     pub fn deinit(self: *Self) void {
+        var it = self.data.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.dtor) |dtor| dtor(entry.value_ptr.ptr);
+        }
+        self.data.deinit();
         self.response.deinit();
         self.params.deinit();
-        self.data.deinit();
+    }
+
+    /// Stores a pointer in the context data map with an optional destructor.
+    /// If replacing an existing entry, its destructor is called first.
+    pub fn setData(self: *Self, key: []const u8, ptr: *anyopaque, dtor: ?*const fn (*anyopaque) void) !void {
+        if (self.data.get(key)) |existing| {
+            if (existing.dtor) |d| d(existing.ptr);
+        }
+        try self.data.put(key, .{ .ptr = ptr, .dtor = dtor });
+    }
+
+    /// Retrieves a stored pointer by key.
+    pub fn getData(self: *const Self, key: []const u8) ?*anyopaque {
+        return if (self.data.get(key)) |entry| entry.ptr else null;
     }
 
     /// Returns a URL parameter by name.
@@ -607,15 +631,15 @@ pub const Server = struct {
             .server = self,
             .route_handler = route_handler,
         };
-        try ctx.data.put("__mw_exec_state", @ptrCast(&state));
+        try ctx.data.put("__mw_exec_state", .{ .ptr = @ptrCast(&state) });
         defer _ = ctx.data.remove("__mw_exec_state");
 
         return middlewareNext(ctx);
     }
 
     fn middlewareNext(ctx: *Context) anyerror!Response {
-        const raw = ctx.data.get("__mw_exec_state") orelse return error.MissingMiddlewareState;
-        const state: *MiddlewareExecState = @ptrCast(@alignCast(raw));
+        const entry = ctx.data.get("__mw_exec_state") orelse return error.MissingMiddlewareState;
+        const state: *MiddlewareExecState = @ptrCast(@alignCast(entry.ptr));
 
         if (state.index < state.server.middleware.items.len) {
             const mw = state.server.middleware.items[state.index];
