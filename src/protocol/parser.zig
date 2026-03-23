@@ -388,6 +388,9 @@ pub const Parser = struct {
                 return;
             }
             if (len > 0) {
+                // Pre-allocate the body buffer to avoid repeated reallocs
+                // during incremental parsing of fixed-length bodies.
+                self.body_buffer.ensureTotalCapacity(self.allocator, @intCast(len)) catch {};
                 self.state = .body;
             } else {
                 self.state = .complete;

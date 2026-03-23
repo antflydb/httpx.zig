@@ -619,10 +619,7 @@ pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
     }
     try writer.print(" {s}\r\n", .{req.version.toString()});
 
-    for (req.headers.entries.items) |h| {
-        if (containsCrLf(h.name) or containsCrLf(h.value)) return error.HeaderContainsCrLf;
-        try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
-    }
+    try req.headers.serialize(writer);
     try writer.writeAll("\r\n");
 
     if (req.body) |body| {
@@ -643,10 +640,7 @@ pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
         resp.status.phrase,
     });
 
-    for (resp.headers.entries.items) |h| {
-        if (containsCrLf(h.name) or containsCrLf(h.value)) return error.HeaderContainsCrLf;
-        try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
-    }
+    try resp.headers.serialize(writer);
     try writer.writeAll("\r\n");
 
     if (resp.body) |body| {
@@ -654,11 +648,6 @@ pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
     }
 
     return buffer.toOwnedSlice(allocator);
-}
-
-/// Returns true if the string contains CR or LF characters.
-fn containsCrLf(s: []const u8) bool {
-    return mem.indexOfScalar(u8, s, '\r') != null or mem.indexOfScalar(u8, s, '\n') != null;
 }
 
 /// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.

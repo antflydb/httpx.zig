@@ -215,8 +215,10 @@ pub const Headers = struct {
     }
 
     /// Serializes headers to HTTP wire format.
+    /// Returns error.HeaderContainsCrLf if any name or value contains CR/LF.
     pub fn serialize(self: *const Self, writer: anytype) !void {
         for (self.entries.items) |entry| {
+            if (containsCrLf(entry.name) or containsCrLf(entry.value)) return error.HeaderContainsCrLf;
             try writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
         }
     }
@@ -248,6 +250,10 @@ fn containsToken(header_value: []const u8, token: []const u8) bool {
         if (eqlIgnoreCase(trimmed, token)) return true;
     }
     return false;
+}
+
+fn containsCrLf(s: []const u8) bool {
+    return mem.indexOfScalar(u8, s, '\r') != null or mem.indexOfScalar(u8, s, '\n') != null;
 }
 
 test "Headers basic operations" {

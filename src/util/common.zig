@@ -1,8 +1,21 @@
 //! Shared utility helpers used across client/server/core modules.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
+
+/// Monotonic millisecond timestamp for connection health and deadline tracking.
+pub fn milliTimestamp() i64 {
+    if (builtin.os.tag == .macos) {
+        // mach_absolute_time returns nanoseconds on Apple Silicon.
+        return @intCast(std.c.mach_absolute_time() / std.time.ns_per_ms);
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+    }
+}
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.
 pub const CookiePair = struct {

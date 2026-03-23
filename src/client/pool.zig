@@ -11,7 +11,6 @@
 //! instantiations of `GenericPool`, which handles all shared pool logic.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -19,18 +18,7 @@ const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
-
-/// Monotonic millisecond timestamp for connection health tracking.
-fn milliTimestamp() i64 {
-    if (builtin.os.tag == .macos) {
-        // mach_absolute_time returns nanoseconds on Apple Silicon.
-        return @intCast(std.c.mach_absolute_time() / std.time.ns_per_ms);
-    } else {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
-    }
-}
+const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 
 pub const PoolError = error{
     PoolExhausted,
@@ -298,7 +286,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     }
                 }
 
-                if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
+                if (self.totalCountLocked() >= self.config.max_connections) return PoolError.PoolExhausted;
 
                 var host_count: u32 = 0;
                 for (self.connections.items) |entry| {
@@ -395,8 +383,8 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             }
         }
 
-        /// Returns the number of in-use connections.
-        pub fn activeCount(self: *const Self) usize {
+        /// Returns the number of in-use connections (must hold mutex or be single-threaded).
+        fn activeCountLocked(self: *const Self) usize {
             var count: usize = 0;
             for (self.connections.items) |entry| {
                 if (entry.in_use) count += 1;
@@ -405,17 +393,36 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         }
 
         /// Returns the total number of connections (active + idle).
-        pub fn totalCount(self: *const Self) usize {
+        /// Must hold mutex or be called from a single-threaded context.
+        fn totalCountLocked(self: *const Self) usize {
             return self.connections.items.len;
         }
 
+        /// Returns the number of in-use connections.
+        pub fn activeCount(self: *Self) usize {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return self.activeCountLocked();
+        }
+
+        /// Returns the total number of connections (active + idle).
+        pub fn totalCount(self: *Self) usize {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return self.totalCountLocked();
+        }
+
         /// Returns the number of idle connections.
-        pub fn idleCount(self: *const Self) usize {
-            return self.totalCount() - self.activeCount();
+        pub fn idleCount(self: *Self) usize {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return self.totalCountLocked() - self.activeCountLocked();
         }
 
         /// Returns the number of connections for a specific host/port pair.
-        pub fn hostConnectionCount(self: *const Self, host: []const u8, port: u16) usize {
+        pub fn hostConnectionCount(self: *Self, host: []const u8, port: u16) usize {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             var count: usize = 0;
             for (self.connections.items) |entry| {
                 if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
@@ -426,9 +433,11 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         }
 
         /// Returns a snapshot of total/active/idle pool counts.
-        pub fn stats(self: *const Self) PoolStats {
-            const total = self.totalCount();
-            const active = self.activeCount();
+        pub fn stats(self: *Self) PoolStats {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const total = self.totalCountLocked();
+            const active = self.activeCountLocked();
             return .{ .total = total, .active = active, .idle = total - active };
         }
     };

@@ -229,6 +229,7 @@ pub const ResponseBuilder = struct {
     /// Sets an HTML body with appropriate Content-Type.
     pub fn html(self: *Self, content: []const u8) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "text/html; charset=utf-8");
+        self.freeOwnedBody();
         self.body_data = content;
         return self;
     }
@@ -236,6 +237,7 @@ pub const ResponseBuilder = struct {
     /// Sets a plain text body with appropriate Content-Type.
     pub fn text(self: *Self, content: []const u8) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "text/plain; charset=utf-8");
+        self.freeOwnedBody();
         self.body_data = content;
         return self;
     }

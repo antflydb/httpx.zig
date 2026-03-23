@@ -298,7 +298,7 @@ pub const Client = struct {
                 try w.writeAll(request_data);
 
                 const r = try tls_conn.session.getReader();
-                var res = try self.readResponseFromIo(r);
+                var res = try self.readResponse(r);
 
                 if (!res.headers.isKeepAlive(.HTTP_1_1)) {
                     ok = false;
@@ -344,7 +344,7 @@ pub const Client = struct {
             conn.socket.setKeepAlive(true) catch {};
 
             try conn.socket.sendAll(request_data);
-            var res = try self.readResponseFromTcp(&conn.socket);
+            var res = try self.readResponse(&conn.socket);
             if (!res.headers.isKeepAlive(.HTTP_1_1)) {
                 // Non-keepalive response: evict the connection after this request.
                 ok = false;
@@ -367,7 +367,7 @@ pub const Client = struct {
         }
 
         try socket.sendAll(request_data);
-        return self.readResponseFromTcp(&socket);
+        return self.readResponse(&socket);
     }
 
     fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
@@ -382,10 +382,12 @@ pub const Client = struct {
         try w.writeAll(request_data);
 
         const r = try session.getReader();
-        return self.readResponseFromIo(r);
+        return self.readResponse(r);
     }
 
-    fn readResponseFromTcp(self: *Self, socket: *Socket) !Response {
+    /// Unified response reader parameterized on the read source.
+    /// `ReadSource` is either `*Socket` (TCP) or `*std.Io.Reader` (TLS/Io).
+    fn readResponse(self: *Self, source: anytype) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_response_size;
@@ -393,25 +395,23 @@ pub const Client = struct {
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
-        // Leftover bytes from previous recv that were not consumed by the parser
-        // (can happen when a 1xx informational response and the real response
-        // arrive in the same TCP segment).
         var leftover: usize = 0;
 
         while (true) {
             while (!parser.isComplete()) {
-                // First consume any leftover bytes from the previous iteration.
+                // First consume any leftover bytes from the previous iteration
+                // (can happen when a 1xx response and the real response arrive
+                // in the same TCP segment).
                 if (leftover > 0) {
                     const consumed = try parser.feed(buf[0..leftover]);
                     if (consumed < leftover) {
-                        // Shift remaining bytes to front of buffer.
                         std.mem.copyForwards(u8, buf[0 .. leftover - consumed], buf[consumed..leftover]);
                     }
                     leftover -= consumed;
                     continue;
                 }
 
-                const n = try socket.recv(buf[leftover..]);
+                const n = recvFrom(source, buf[leftover..]) catch |err| return err;
                 if (n == 0) break;
                 total_read += n;
                 if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
@@ -435,53 +435,19 @@ pub const Client = struct {
         return self.responseFromParser(&parser);
     }
 
-    fn readResponseFromIo(self: *Self, r: *std.Io.Reader) !Response {
-        var parser = Parser.initResponse(self.allocator);
-        defer parser.deinit();
-        parser.max_body_size = self.config.max_response_size;
-        parser.max_headers = self.config.max_response_headers;
-
-        var buf: [16 * 1024]u8 = undefined;
-        var total_read: usize = 0;
-        var leftover: usize = 0;
-
-        while (true) {
-            while (!parser.isComplete()) {
-                if (leftover > 0) {
-                    const consumed = try parser.feed(buf[0..leftover]);
-                    if (consumed < leftover) {
-                        std.mem.copyForwards(u8, buf[0 .. leftover - consumed], buf[consumed..leftover]);
-                    }
-                    leftover -= consumed;
-                    continue;
-                }
-
-                var iov = [_][]u8{buf[leftover..]};
-                const n = r.readVec(&iov) catch |err| switch (err) {
-                    error.EndOfStream => 0,
-                    else => return err,
-                };
-                if (n == 0) break;
-                total_read += n;
-                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
-                const consumed = try parser.feed(buf[0 .. leftover + n]);
-                leftover = (leftover + n) - consumed;
-            }
-
-            parser.finishEof();
-            if (!parser.isComplete()) return error.InvalidResponse;
-
-            // Skip 1xx informational responses (e.g. 100 Continue).
-            if (parser.status_code) |code| {
-                if (code >= 100 and code < 200) {
-                    parser.reset();
-                    continue;
-                }
-            }
-            break;
+    /// Read bytes from either a Socket or an Io.Reader into `buf`.
+    fn recvFrom(source: anytype, buf: []u8) !usize {
+        const Source = @TypeOf(source);
+        if (Source == *Socket) {
+            return source.recv(buf);
+        } else {
+            // Io.Reader (TLS path)
+            var iov = [_][]u8{buf};
+            return source.readVec(&iov) catch |err| switch (err) {
+                error.EndOfStream => @as(usize, 0),
+                else => err,
+            };
         }
-
-        return self.responseFromParser(&parser);
     }
 
     fn responseFromParser(self: *Self, parser: *Parser) !Response {
@@ -535,12 +501,11 @@ pub const Client = struct {
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Allocate the decompression window per-call (not cached on Client) to
-        // avoid data races when concurrent fibers decompress in parallel.
-        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
-        defer self.allocator.free(decompress_buf);
+        // Stack-allocate the decompression window. Each fiber has its own stack,
+        // so this is safe for concurrent decompression without heap allocation.
+        var decompress_buf: [flate.max_window_len]u8 = undefined;
 
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, &decompress_buf);
 
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -832,31 +797,6 @@ const SliceIoReader = struct {
     };
 };
 
-/// Parses an HTTP response from raw data.
-fn parseResponse(allocator: Allocator, data: []const u8) !Response {
-    var parser = Parser.initResponse(allocator);
-    defer parser.deinit();
-
-    _ = try parser.feed(data);
-    if (!parser.isComplete()) return error.InvalidResponse;
-
-    const code = parser.status_code orelse return error.InvalidResponse;
-    var res = Response.init(allocator, code);
-    errdefer res.deinit();
-
-    // Move headers ownership from parser to response.
-    res.headers.deinit();
-    res.headers = parser.headers;
-    parser.headers = Headers.init(allocator);
-
-    if (parser.getBody().len > 0) {
-        res.body = try allocator.dupe(u8, parser.getBody());
-        res.body_owned = true;
-    }
-
-    return res;
-}
-
 test "Client initialization" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io);
@@ -880,11 +820,15 @@ test "Response parsing" {
     const allocator = std.testing.allocator;
     const data = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}";
 
-    var response = try parseResponse(allocator, data);
-    defer response.deinit();
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
 
-    try std.testing.expectEqual(@as(u16, 200), response.status.code);
-    try std.testing.expectEqualStrings("application/json", response.headers.get("Content-Type").?);
+    _ = try parser.feed(data);
+    try std.testing.expect(parser.isComplete());
+
+    const code = parser.status_code orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(u16, 200), code);
+    try std.testing.expectEqualStrings("application/json", parser.headers.get("Content-Type").?);
 }
 
 test "Client stores Set-Cookie headers" {
