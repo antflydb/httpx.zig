@@ -181,8 +181,11 @@ pub const TlsSession = struct {
         // System CA bundle (cross-platform); optional if verification is disabled.
         if (verify) {
             var bundle: std.crypto.Certificate.Bundle = .{};
-            errdefer bundle.deinit(self.allocator);
             try bundle.rescan(self.allocator, self.io, Io.Timestamp.now(self.io, .real));
+            // Transfer ownership to self immediately so deinit() handles cleanup
+            // if a later fallible operation (e.g. tls.Client.init) fails. An errdefer
+            // on the local `bundle` would cause a double-free because `bundle` is
+            // captured by value while `self.ca_bundle` holds the same allocation.
             self.ca_bundle = bundle;
         }
 

@@ -37,11 +37,26 @@ pub const ParserMode = enum {
     response,
 };
 
+/// Reason for the parser entering the error state.
+pub const ErrorReason = enum {
+    none,
+    header_too_large,
+    too_many_headers,
+    body_too_large,
+    invalid_header,
+    invalid_chunk_encoding,
+    malformed_request_line,
+    malformed_status_line,
+    malformed_chunk_size,
+    smuggling_detected,
+};
+
 /// Incremental HTTP message parser.
 pub const Parser = struct {
     allocator: Allocator,
     state: ParserState = .start,
     mode: ParserMode = .request,
+    error_reason: ErrorReason = .none,
     method: ?types.Method = null,
     path: ?[]const u8 = null,
     version: types.Version = .HTTP_1_1,
@@ -144,9 +159,15 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Returns the reason for the parser entering the error state.
+    pub fn getErrorReason(self: *const Self) ErrorReason {
+        return self.error_reason;
+    }
+
     /// Resets the parser for reuse.
     pub fn reset(self: *Self) void {
         self.state = .start;
+        self.error_reason = .none;
         self.method = null;
         if (self.path) |p| {
             self.allocator.free(p);
@@ -169,6 +190,7 @@ pub const Parser = struct {
     fn checkLineBufferLimit(self: *Self) !void {
         if (self.line_buffer.items.len > self.max_header_size) {
             self.state = .err;
+            self.error_reason = .header_too_large;
             return error.HeaderTooLarge;
         }
     }
@@ -178,6 +200,7 @@ pub const Parser = struct {
         self.header_bytes += line_len + 2;
         if (self.header_bytes > self.max_header_size) {
             self.state = .err;
+            self.error_reason = .header_too_large;
             return error.HeaderTooLarge;
         }
     }
@@ -209,18 +232,21 @@ pub const Parser = struct {
 
         const method_str = parts.next() orelse {
             self.state = .err;
+            self.error_reason = .malformed_request_line;
             return line_end + 2;
         };
         self.method = types.Method.fromString(method_str) orelse .CUSTOM;
 
         const path = parts.next() orelse {
             self.state = .err;
+            self.error_reason = .malformed_request_line;
             return line_end + 2;
         };
         self.path = try self.allocator.dupe(u8, path);
 
         const version_str = parts.next() orelse {
             self.state = .err;
+            self.error_reason = .malformed_request_line;
             return line_end + 2;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
@@ -248,16 +274,19 @@ pub const Parser = struct {
 
         const version_str = parts.next() orelse {
             self.state = .err;
+            self.error_reason = .malformed_status_line;
             return line_end + 2;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
         const status_str = parts.next() orelse {
             self.state = .err;
+            self.error_reason = .malformed_status_line;
             return line_end + 2;
         };
         self.status_code = std.fmt.parseInt(u16, status_str, 10) catch {
             self.state = .err;
+            self.error_reason = .malformed_status_line;
             return line_end + 2;
         };
 
@@ -292,6 +321,7 @@ pub const Parser = struct {
         if (mem.indexOf(u8, line, ":")) |sep| {
             if (self.header_count >= self.max_headers) {
                 self.state = .err;
+                self.error_reason = .too_many_headers;
                 return error.TooManyHeaders;
             }
             const name = mem.trim(u8, line[0..sep], " \t");
@@ -302,6 +332,7 @@ pub const Parser = struct {
                 mem.indexOfAny(u8, value, "\r\n") != null)
             {
                 self.state = .err;
+                self.error_reason = .invalid_header;
                 return error.InvalidHeader;
             }
 
@@ -326,6 +357,7 @@ pub const Parser = struct {
         // Transfer-Encoding to prevent request smuggling.
         if (self.chunked and self.content_length != null) {
             self.state = .err;
+            self.error_reason = .smuggling_detected;
             return;
         }
 
@@ -334,6 +366,7 @@ pub const Parser = struct {
         } else if (self.content_length) |len| {
             if (len > self.max_body_size) {
                 self.state = .err;
+                self.error_reason = .body_too_large;
                 return;
             }
             if (len > 0) {
@@ -364,6 +397,7 @@ pub const Parser = struct {
         self.total_body_bytes += data.len;
         if (self.total_body_bytes > self.max_body_size) {
             self.state = .err;
+            self.error_reason = .body_too_large;
             return error.BodyTooLarge;
         }
         try self.body_buffer.appendSlice(self.allocator, data);
@@ -389,11 +423,13 @@ pub const Parser = struct {
 
         self.current_chunk_size = std.fmt.parseInt(usize, size_part, 16) catch {
             self.state = .err;
+            self.error_reason = .malformed_chunk_size;
             return line_end + 2;
         };
 
         if (self.current_chunk_size > self.max_body_size) {
             self.state = .err;
+            self.error_reason = .body_too_large;
             return line_end + 2;
         }
 
@@ -417,6 +453,7 @@ pub const Parser = struct {
         self.total_body_bytes += to_read;
         if (self.total_body_bytes > self.max_body_size) {
             self.state = .err;
+            self.error_reason = .body_too_large;
             return error.BodyTooLarge;
         }
 
@@ -439,10 +476,12 @@ pub const Parser = struct {
             switch (self.chunk_crlf_read) {
                 0 => if (b != '\r') {
                     self.state = .err;
+                    self.error_reason = .invalid_chunk_encoding;
                     return error.InvalidChunkEncoding;
                 },
                 1 => if (b != '\n') {
                     self.state = .err;
+                    self.error_reason = .invalid_chunk_encoding;
                     return error.InvalidChunkEncoding;
                 },
                 else => {},

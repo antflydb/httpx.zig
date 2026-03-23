@@ -48,6 +48,7 @@ pub const ClientConfig = struct {
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
+    max_cookies: usize = 1000,
 };
 
 /// Per-request options.
@@ -246,8 +247,16 @@ pub const Client = struct {
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.read_ms;
-        const write_timeout_ms = timeout_override_ms orelse self.config.timeouts.write_ms;
+        // Use request_ms as a fallback ceiling for socket timeouts when the
+        // specific read/write timeouts are not set via per-request override.
+        const timeout_ms = timeout_override_ms orelse blk: {
+            if (self.config.timeouts.request_ms > 0) break :blk self.config.timeouts.request_ms;
+            break :blk self.config.timeouts.read_ms;
+        };
+        const write_timeout_ms = timeout_override_ms orelse blk: {
+            if (self.config.timeouts.request_ms > 0) break :blk self.config.timeouts.request_ms;
+            break :blk self.config.timeouts.write_ms;
+        };
 
         const request_data = try http.formatRequest(req, self.allocator);
         defer self.allocator.free(request_data);
@@ -271,8 +280,14 @@ pub const Client = struct {
 
         if (self.config.keep_alive) {
             var conn = try self.pool.getConnection(host, port);
-            errdefer conn.close();
-            defer self.pool.releaseConnection(conn);
+            var ok = false;
+            defer {
+                if (ok) {
+                    self.pool.releaseConnection(conn);
+                } else {
+                    self.pool.evictConnection(conn);
+                }
+            }
 
             if (timeout_ms > 0) {
                 try conn.socket.setRecvTimeout(timeout_ms);
@@ -280,12 +295,15 @@ pub const Client = struct {
             if (write_timeout_ms > 0) {
                 try conn.socket.setSendTimeout(write_timeout_ms);
             }
-            try conn.socket.setKeepAlive(true);
+            conn.socket.setKeepAlive(true) catch {};
 
             try conn.socket.sendAll(request_data);
             var res = try self.readResponseFromTcp(&conn.socket);
             if (!res.headers.isKeepAlive(.HTTP_1_1)) {
-                conn.close();
+                // Non-keepalive response: evict the connection after this request.
+                ok = false;
+            } else {
+                ok = true;
             }
             return res;
         }
@@ -329,17 +347,45 @@ pub const Client = struct {
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
-        while (!parser.isComplete()) {
-            const n = try socket.recv(&buf);
-            if (n == 0) break;
-            total_read += n;
-            if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
-            _ = try parser.feed(buf[0..n]);
+        // Leftover bytes from previous recv that were not consumed by the parser
+        // (can happen when a 1xx informational response and the real response
+        // arrive in the same TCP segment).
+        var leftover: usize = 0;
+
+        while (true) {
+            while (!parser.isComplete()) {
+                // First consume any leftover bytes from the previous iteration.
+                if (leftover > 0) {
+                    const consumed = try parser.feed(buf[0..leftover]);
+                    if (consumed < leftover) {
+                        // Shift remaining bytes to front of buffer.
+                        std.mem.copyForwards(u8, buf[0 .. leftover - consumed], buf[consumed..leftover]);
+                    }
+                    leftover -= consumed;
+                    continue;
+                }
+
+                const n = try socket.recv(buf[leftover..]);
+                if (n == 0) break;
+                total_read += n;
+                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+                const consumed = try parser.feed(buf[0 .. leftover + n]);
+                leftover = (leftover + n) - consumed;
+            }
+
+            parser.finishEof();
+            if (!parser.isComplete()) return error.InvalidResponse;
+
+            // Skip 1xx informational responses (e.g. 100 Continue).
+            if (parser.status_code) |code| {
+                if (code >= 100 and code < 200) {
+                    parser.reset();
+                    continue;
+                }
+            }
+            break;
         }
 
-        parser.finishEof();
-
-        if (!parser.isComplete()) return error.InvalidResponse;
         return self.responseFromParser(&parser);
     }
 
@@ -351,21 +397,44 @@ pub const Client = struct {
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
-        while (!parser.isComplete()) {
-            var iov = [_][]u8{buf[0..]};
-            const n = r.readVec(&iov) catch |err| switch (err) {
-                error.EndOfStream => 0,
-                else => return err,
-            };
-            if (n == 0) break;
-            total_read += n;
-            if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
-            _ = try parser.feed(buf[0..n]);
+        var leftover: usize = 0;
+
+        while (true) {
+            while (!parser.isComplete()) {
+                if (leftover > 0) {
+                    const consumed = try parser.feed(buf[0..leftover]);
+                    if (consumed < leftover) {
+                        std.mem.copyForwards(u8, buf[0 .. leftover - consumed], buf[consumed..leftover]);
+                    }
+                    leftover -= consumed;
+                    continue;
+                }
+
+                var iov = [_][]u8{buf[leftover..]};
+                const n = r.readVec(&iov) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => return err,
+                };
+                if (n == 0) break;
+                total_read += n;
+                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+                const consumed = try parser.feed(buf[0 .. leftover + n]);
+                leftover = (leftover + n) - consumed;
+            }
+
+            parser.finishEof();
+            if (!parser.isComplete()) return error.InvalidResponse;
+
+            // Skip 1xx informational responses (e.g. 100 Continue).
+            if (parser.status_code) |code| {
+                if (code >= 100 and code < 200) {
+                    parser.reset();
+                    continue;
+                }
+            }
+            break;
         }
 
-        parser.finishEof();
-
-        if (!parser.isComplete()) return error.InvalidResponse;
         return self.responseFromParser(&parser);
     }
 
@@ -391,6 +460,10 @@ pub const Client = struct {
     fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
         // Absolute URL.
         if (mem.indexOf(u8, location, "://") != null) {
+            // Only allow http/https schemes to prevent open redirects (e.g. file://, ftp://).
+            if (!mem.startsWith(u8, location, "http://") and !mem.startsWith(u8, location, "https://")) {
+                return error.UnsafeRedirect;
+            }
             return self.allocator.dupe(u8, location);
         }
 
@@ -444,9 +517,15 @@ pub const Client = struct {
     }
 
     fn setCookieLocked(self: *Self, name: []const u8, value: []const u8) !void {
-        if (self.cookies.fetchRemove(name)) |removed| {
+        const was_present = if (self.cookies.fetchRemove(name)) |removed| blk: {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value);
+            break :blk true;
+        } else false;
+
+        // Cap check: only enforce for genuinely new cookies (replacements are fine).
+        if (!was_present and self.cookies.count() >= self.config.max_cookies) {
+            return; // silently drop — don't fail the request over a cookie limit
         }
 
         const owned_name = try self.allocator.dupe(u8, name);

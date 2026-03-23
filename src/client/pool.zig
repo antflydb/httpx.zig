@@ -38,6 +38,7 @@ pub const Connection = struct {
     host: []const u8,
     port: u16,
     in_use: bool = false,
+    broken: bool = false,
     created_at: i64,
     last_used: i64,
     requests_made: u32 = 0,
@@ -60,13 +61,20 @@ pub const Connection = struct {
     /// Returns true if the connection is healthy and reusable.
     pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
         if (self.in_use) return false;
+        if (self.broken) return false;
         const idle_time = milliTimestamp() - self.last_used;
         return idle_time < max_idle_ms;
+    }
+
+    /// Marks this connection as broken so it will not be reused.
+    pub fn markBroken(self: *Self) void {
+        self.broken = true;
     }
 
     /// Returns true if this connection should be evicted from the pool.
     pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
         if (self.in_use) return false;
+        if (self.broken) return true;
         if (self.requests_made >= max_requests_per_connection) return true;
         const idle_time = milliTimestamp() - self.last_used;
         return idle_time >= idle_timeout_ms;
@@ -184,6 +192,21 @@ pub const ConnectionPool = struct {
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        // Re-check limits after re-acquiring the mutex — another fiber may have
+        // raced and filled the pool while we were connecting.
+        // Cleanup is handled by the errdefer blocks above.
+        if (self.connections.items.len >= self.config.max_connections) {
+            return PoolError.PoolExhausted;
+        }
+        var recheck_host_count: u32 = 0;
+        for (self.connections.items) |c| {
+            if (std.mem.eql(u8, c.host, host) and c.port == port) recheck_host_count += 1;
+        }
+        if (recheck_host_count >= self.config.max_per_host) {
+            return PoolError.PoolExhaustedForHost;
+        }
+
         try self.connections.append(self.allocator, conn);
 
         return conn;
@@ -194,6 +217,24 @@ pub const ConnectionPool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         conn.release();
+    }
+
+    /// Removes a specific connection from the pool and frees its resources.
+    /// Use this when a network error occurs instead of just closing the socket.
+    pub fn evictConnection(self: *Self, conn: *Connection) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        for (self.connections.items, 0..) |c, i| {
+            if (c == conn) {
+                _ = self.connections.swapRemove(i);
+                break;
+            }
+        }
+
+        conn.close();
+        self.allocator.free(conn.host);
+        self.allocator.destroy(conn);
     }
 
     /// Removes idle connections that have exceeded the timeout.
