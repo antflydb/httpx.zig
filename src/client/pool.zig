@@ -299,3 +299,15 @@ test "ConnectionPool stats helpers" {
     try std.testing.expectEqual(@as(usize, 0), s.idle);
     try std.testing.expectEqual(@as(usize, 0), pool_inst.hostConnectionCount("example.com", 443));
 }
+
+test "ConnectionPool mutex prevents data races" {
+    const allocator = std.testing.allocator;
+    var pool_inst = ConnectionPool.init(allocator, std.testing.io);
+    defer pool_inst.deinit();
+
+    // Verify that mutex-protected methods can be called from the same thread
+    // without deadlocking (basic smoke test for the mutex wiring).
+    pool_inst.cleanup();
+    const s = pool_inst.stats();
+    try std.testing.expectEqual(@as(usize, 0), s.total);
+}

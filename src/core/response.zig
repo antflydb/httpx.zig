@@ -337,3 +337,35 @@ test "Response fromText and fromJson constructors" {
     try std.testing.expectEqualStrings("application/json", json_resp.contentType().?);
     try std.testing.expect(json_resp.text() != null);
 }
+
+test "ResponseBuilder json replaces previous owned body without leak" {
+    const allocator = std.testing.allocator;
+    var builder = ResponseBuilder.init(allocator);
+    defer builder.deinit();
+
+    // Set a JSON body, then replace it. The first allocation must be freed.
+    _ = try builder.json(.{ .first = true });
+    _ = try builder.json(.{ .second = true });
+
+    var response = try builder.build();
+    defer response.deinit();
+
+    // The built response should contain the second JSON body.
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(mem.indexOf(u8, response.body.?, "second") != null);
+}
+
+test "ResponseBuilder body clears owned json body without leak" {
+    const allocator = std.testing.allocator;
+    var builder = ResponseBuilder.init(allocator);
+    defer builder.deinit();
+
+    // Set a JSON body (owned), then replace with a plain body (not owned).
+    _ = try builder.json(.{ .allocated = true });
+    _ = builder.body("plain text");
+
+    var response = try builder.build();
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("plain text", response.body.?);
+}

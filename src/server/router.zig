@@ -508,3 +508,25 @@ test "Router no routes registered" {
     const result3 = router.find(.DELETE, "/some/deep/path");
     try std.testing.expect(result3 == null);
 }
+
+test "RouteGroup routes use owned pattern strings" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            return error.TestUnexpectedResult;
+        }
+    }.h;
+
+    // Create a group and add a route. The group's prefix+path concatenation
+    // is built with a temporary ArrayList that is freed when add() returns.
+    // The route must hold an owned copy so the pattern remains valid.
+    var group = router.group("/api");
+    try group.add(.GET, "/users", handler);
+
+    // If the pattern were not owned, this lookup would read freed memory.
+    const result = router.find(.GET, "/api/users");
+    try std.testing.expect(result != null);
+}

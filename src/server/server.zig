@@ -49,6 +49,8 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
+    max_headers: usize = 100,
+    max_file_size: usize = 100 * 1024 * 1024,
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
@@ -63,6 +65,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(*anyopaque),
+    max_file_size: usize = 100 * 1024 * 1024,
 
     const Self = @This();
 
@@ -158,8 +161,7 @@ pub const Context = struct {
         defer f.close();
 
         const stat = try f.stat();
-        const max_file_size: u64 = 100 * 1024 * 1024; // 100 MB
-        if (stat.size > max_file_size) {
+        if (stat.size > self.max_file_size) {
             return self.status(413).text("File Too Large");
         }
 
@@ -389,6 +391,7 @@ pub const Server = struct {
             var parser = Parser.init(self.allocator);
             defer parser.deinit();
             parser.max_body_size = self.config.max_body_size;
+            parser.max_headers = self.config.max_headers;
 
             while (!parser.isComplete()) {
                 const n = try sock.recv(&buffer);
@@ -423,6 +426,7 @@ pub const Server = struct {
             }
 
             var ctx = Context.init(self.allocator, &req);
+            ctx.max_file_size = self.config.max_file_size;
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
@@ -715,4 +719,63 @@ test "Server any() registers all methods" {
     try std.testing.expect(server.router.find(.POST, "/wild") != null);
     try std.testing.expect(server.router.find(.TRACE, "/wild") != null);
     try std.testing.expect(server.router.find(.CONNECT, "/wild") != null);
+}
+
+test "ServerConfig defaults" {
+    const config = ServerConfig{};
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.max_body_size);
+    try std.testing.expectEqual(@as(usize, 100), config.max_headers);
+    try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), config.max_file_size);
+}
+
+test "Context max_file_size default and override" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+
+    // Default should match ServerConfig default.
+    try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), ctx.max_file_size);
+
+    // Can be overridden (as server does in handleConnection).
+    ctx.max_file_size = 1024;
+    try std.testing.expectEqual(@as(usize, 1024), ctx.max_file_size);
+}
+
+test "Context file rejects path traversal" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+
+    var response = try ctx.file("../etc/passwd");
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 403), response.status.code);
+}
+
+test "Parser max_headers is configurable" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    parser.max_headers = 2;
+
+    // Feed a request with 3 headers — should trigger error state.
+    _ = try parser.feed("GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n");
+    try std.testing.expect(parser.isError());
+}
+
+test "Parser max_body_size is configurable" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    parser.max_body_size = 4;
+
+    _ = try parser.feed("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
+    // Content-Length 10 > max_body_size 4, should be error state.
+    try std.testing.expect(parser.isError());
 }

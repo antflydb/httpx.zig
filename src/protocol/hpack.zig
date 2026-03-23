@@ -1195,3 +1195,54 @@ test "RFC 7541 - Integer encode/decode roundtrip with various prefix bits" {
         }
     }
 }
+
+test "HPACK header count limit" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Build a header block with 3 indexed headers (static table entries).
+    // Each byte 0x82, 0x84, 0x86 encodes static entries 2, 4, 6.
+    const data = &[_]u8{ 0x82, 0x84, 0x86 };
+
+    // Limit to 2 headers — third should trigger TooManyHeaders.
+    const result = decodeHeadersWithOptions(&ctx, data, allocator, .{ .max_headers = 2 });
+    try std.testing.expectError(error.TooManyHeaders, result);
+}
+
+test "HPACK decoded size limit" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Static entry 2 = :method GET (name=7 + value=3 = 10 bytes decoded).
+    // Static entry 4 = :path / (name=5 + value=1 = 6 bytes decoded).
+    // Total = 16 bytes. Set limit to 12 to trigger after first entry succeeds.
+    const data = &[_]u8{ 0x82, 0x84 };
+
+    const result = decodeHeadersWithOptions(&ctx, data, allocator, .{ .max_decoded_size = 12 });
+    try std.testing.expectError(error.HeaderBlockTooLarge, result);
+}
+
+test "HPACK limits allow valid blocks within bounds" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Two indexed headers, both within limits.
+    const data = &[_]u8{ 0x82, 0x84 };
+
+    const headers = try decodeHeadersWithOptions(&ctx, data, allocator, .{
+        .max_headers = 10,
+        .max_decoded_size = 256 * 1024,
+    });
+    defer {
+        for (headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+}

@@ -40,6 +40,7 @@ pub const ClientConfig = struct {
     default_headers: ?[]const [2][]const u8 = null,
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = 100 * 1024 * 1024,
+    max_response_headers: usize = 256,
     follow_redirects: bool = true,
     verify_ssl: bool = true,
     http2_enabled: bool = false,
@@ -314,6 +315,8 @@ pub const Client = struct {
     fn readResponseFromTcp(self: *Self, socket: *Socket) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
+        parser.max_body_size = self.config.max_response_size;
+        parser.max_headers = self.config.max_response_headers;
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
@@ -334,6 +337,8 @@ pub const Client = struct {
     fn readResponseFromIo(self: *Self, r: *std.Io.Reader) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
+        parser.max_body_size = self.config.max_response_size;
+        parser.max_headers = self.config.max_response_headers;
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
@@ -700,4 +705,21 @@ test "Client HTTP version default" {
     const config = ClientConfig{};
     try std.testing.expect(!config.http2_enabled);
     try std.testing.expect(!config.http3_enabled);
+}
+
+test "Client config max_response_headers default" {
+    const config = ClientConfig{};
+    try std.testing.expectEqual(@as(usize, 256), config.max_response_headers);
+}
+
+test "Client config limits are customizable" {
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{
+        .max_response_size = 1024,
+        .max_response_headers = 32,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1024), client.config.max_response_size);
+    try std.testing.expectEqual(@as(usize, 32), client.config.max_response_headers);
 }
