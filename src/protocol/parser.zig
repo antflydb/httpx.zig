@@ -340,10 +340,28 @@ pub const Parser = struct {
             self.header_count += 1;
 
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
+                // RFC 9112 §8.6: reject duplicate Content-Length with different values.
+                if (self.content_length) |existing| {
+                    const new_cl = std.fmt.parseInt(u64, value, 10) catch null;
+                    if (new_cl) |cl| {
+                        if (cl != existing) {
+                            self.state = .err;
+                            self.error_reason = .smuggling_detected;
+                            return error.InvalidHeader;
+                        }
+                    }
+                } else {
+                    self.content_length = std.fmt.parseInt(u64, value, 10) catch null;
+                }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                if (mem.indexOf(u8, value, "chunked") != null) {
-                    self.chunked = true;
+                // Token-list match per RFC 7230 §3.3.1 — prevent "chunkedx" bypass.
+                var it = mem.splitScalar(u8, value, ',');
+                while (it.next()) |part| {
+                    const trimmed = mem.trim(u8, part, " \t");
+                    if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) {
+                        self.chunked = true;
+                        break;
+                    }
                 }
             }
         }

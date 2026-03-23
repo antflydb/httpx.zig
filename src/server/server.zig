@@ -10,10 +10,22 @@
 //! - Cross-platform (Linux, Windows, macOS)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
+
+/// Monotonic millisecond timestamp for request deadline tracking.
+fn milliTimestamp() i64 {
+    if (builtin.os.tag == .macos) {
+        return @intCast(std.c.mach_absolute_time() / std.time.ns_per_ms);
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+    }
+}
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -415,12 +427,28 @@ pub const Server = struct {
             parser.max_body_size = self.config.max_body_size;
             parser.max_headers = self.config.max_headers;
 
+            // Wall-clock deadline prevents slow-loris attacks where an attacker
+            // trickles bytes just fast enough to avoid per-recv timeouts.
+            const deadline_ms: i64 = if (timeout_ms > 0) milliTimestamp() + @as(i64, @intCast(timeout_ms)) else 0;
+
             while (!parser.isComplete()) {
+                if (deadline_ms > 0 and milliTimestamp() >= deadline_ms) {
+                    try self.sendError(&sock, 408);
+                    return;
+                }
                 const n = try sock.recv(&buffer);
                 if (n == 0) return;
                 _ = parser.feed(buffer[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
                         try self.sendError(&sock, 413);
+                        return;
+                    },
+                    error.HeaderTooLarge, error.TooManyHeaders => {
+                        try self.sendError(&sock, 431);
+                        return;
+                    },
+                    error.InvalidHeader, error.InvalidChunkEncoding => {
+                        try self.sendError(&sock, 400);
                         return;
                     },
                     else => return err,
@@ -444,7 +472,10 @@ pub const Server = struct {
             }
 
             if (parser.getBody().len > 0) {
-                req.body = parser.getBody();
+                // Dupe the body so req owns its data independently of the parser,
+                // which is stack-allocated and cleaned up via defer.
+                req.body = try self.allocator.dupe(u8, parser.getBody());
+                req.body_owned = true;
             }
 
             var ctx = Context.init(self.allocator, &req);

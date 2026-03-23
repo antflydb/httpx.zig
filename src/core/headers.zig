@@ -197,17 +197,19 @@ pub const Headers = struct {
     }
 
     /// Returns true if Transfer-Encoding includes chunked.
+    /// Uses token-list parsing per RFC 7230 §3.3.1.
     pub fn isChunked(self: *const Self) bool {
         const value = self.get(HeaderName.TRANSFER_ENCODING) orelse return false;
-        return mem.indexOf(u8, value, "chunked") != null;
+        return containsToken(value, "chunked");
     }
 
     /// Determines if connection should be kept alive based on headers and version.
+    /// Parses the Connection header as a comma-separated token list per RFC 7230 §6.1.
     pub fn isKeepAlive(self: *const Self, version: types.Version) bool {
         const conn = self.get(HeaderName.CONNECTION);
         if (conn) |c| {
-            if (mem.indexOf(u8, c, "close") != null) return false;
-            if (mem.indexOf(u8, c, "keep-alive") != null) return true;
+            if (containsToken(c, "close")) return false;
+            if (containsToken(c, "keep-alive")) return true;
         }
         return version == .HTTP_1_1 or version == .HTTP_2 or version == .HTTP_3;
     }
@@ -235,6 +237,17 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
+}
+
+/// Returns true if `header_value` contains `token` as a comma-separated,
+/// whitespace-trimmed, case-insensitive token per RFC 7230 §3.2.6.
+fn containsToken(header_value: []const u8, token: []const u8) bool {
+    var it = mem.splitScalar(u8, header_value, ',');
+    while (it.next()) |part| {
+        const trimmed = mem.trim(u8, part, " \t");
+        if (eqlIgnoreCase(trimmed, token)) return true;
+    }
+    return false;
 }
 
 test "Headers basic operations" {

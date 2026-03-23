@@ -86,7 +86,6 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
-    decompress_window: ?[]u8 = null,
 
     const Self = @This();
 
@@ -121,7 +120,6 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
-        if (self.decompress_window) |w| self.allocator.free(w);
     }
 
     /// Adds an interceptor to the client.
@@ -190,6 +188,8 @@ pub const Client = struct {
         }
 
         var response = try self.executeRequest(&req, reqOpts.timeout_ms);
+        errdefer response.deinit();
+
         try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
@@ -501,7 +501,8 @@ pub const Client = struct {
 
         // Transparently decompress gzip/deflate responses.
         if (res.body) |compressed_body| {
-            if (res.headers.get(HeaderName.CONTENT_ENCODING)) |enc| {
+            if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| {
+                const enc = std.mem.trim(u8, raw_enc, " \t");
                 const container: ?flate.Container =
                     if (std.ascii.eqlIgnoreCase(enc, "gzip")) .gzip
                     else if (std.ascii.eqlIgnoreCase(enc, "deflate")) .zlib
@@ -534,12 +535,12 @@ pub const Client = struct {
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Reuse or lazily allocate the decompression window (flate.max_window_len = 65536).
-        if (self.decompress_window == null) {
-            self.decompress_window = try self.allocator.alloc(u8, flate.max_window_len);
-        }
+        // Allocate the decompression window per-call (not cached on Client) to
+        // avoid data races when concurrent fibers decompress in parallel.
+        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
+        defer self.allocator.free(decompress_buf);
 
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, self.decompress_window.?);
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
 
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -563,7 +564,10 @@ pub const Client = struct {
         // Absolute URL.
         if (mem.indexOf(u8, location, "://") != null) {
             // Only allow http/https schemes to prevent open redirects (e.g. file://, ftp://).
-            if (!mem.startsWith(u8, location, "http://") and !mem.startsWith(u8, location, "https://")) {
+            // Use case-insensitive comparison per RFC 3986 §3.1 (schemes are case-insensitive).
+            const has_http = location.len >= 7 and std.ascii.eqlIgnoreCase(location[0..7], "http://");
+            const has_https = location.len >= 8 and std.ascii.eqlIgnoreCase(location[0..8], "https://");
+            if (!has_http and !has_https) {
                 return error.UnsafeRedirect;
             }
             return self.allocator.dupe(u8, location);
@@ -618,7 +622,20 @@ pub const Client = struct {
         }
     }
 
+    /// Returns true if a cookie name or value contains characters that could
+    /// enable header injection (CR, LF) or malform the Cookie header (;).
+    fn isSafeCookieToken(s: []const u8) bool {
+        for (s) |c| {
+            if (c == '\r' or c == '\n' or c == ';') return false;
+        }
+        return true;
+    }
+
     fn setCookieLocked(self: *Self, name: []const u8, value: []const u8) !void {
+        // Reject cookies with characters that enable header injection (CRLF)
+        // or malform the Cookie header (semicolon in value).
+        if (!isSafeCookieToken(name) or !isSafeCookieToken(value)) return;
+
         const was_present = if (self.cookies.fetchRemove(name)) |removed| blk: {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value);
