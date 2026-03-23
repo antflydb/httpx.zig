@@ -66,9 +66,6 @@ pub const Executor = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
         self.tasks.deinit(self.allocator);
-        if (self.threads.len > 0) {
-            self.allocator.free(self.threads);
-        }
     }
 
     /// Submits a task for execution.
@@ -113,7 +110,7 @@ pub const Executor = struct {
         }
     }
 
-    /// Stops all executor threads.
+    /// Stops all executor threads and frees the thread handle slice.
     pub fn stop(self: *Self) void {
         if (!self.running) return;
         self.mutex.lock();
@@ -122,6 +119,8 @@ pub const Executor = struct {
         self.mutex.unlock();
 
         for (self.threads) |thread| thread.join();
+        self.allocator.free(self.threads);
+        self.threads = &.{};
     }
 
     /// Returns the number of pending tasks.

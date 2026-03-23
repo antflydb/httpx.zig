@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const common = @import("../util/common.zig");
 const Context = @import("server.zig").Context;
 const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
@@ -41,28 +42,39 @@ pub fn cors(config: CorsConfig) Middleware {
     return .{
         .name = "cors",
         .handler = struct {
-            fn methodList(allocator: std.mem.Allocator, methods: []const types.Method) ![]u8 {
-                var out = std.ArrayListUnmanaged(u8).empty;
-                errdefer out.deinit(allocator);
-                const writer = arrayListWriter(&out, allocator);
-
-                for (methods, 0..) |m, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try writer.writeAll(m.toString());
+            fn writeCommaList(buf: []u8, items: []const []const u8) []const u8 {
+                var pos: usize = 0;
+                for (items, 0..) |item, i| {
+                    if (i > 0) {
+                        if (pos + 2 <= buf.len) {
+                            buf[pos] = ',';
+                            buf[pos + 1] = ' ';
+                            pos += 2;
+                        }
+                    }
+                    const end = @min(pos + item.len, buf.len);
+                    @memcpy(buf[pos..end], item[0 .. end - pos]);
+                    pos = end;
                 }
-                return out.toOwnedSlice(allocator);
+                return buf[0..pos];
             }
 
-            fn headerList(allocator: std.mem.Allocator, headers_in: []const []const u8) ![]u8 {
-                var out = std.ArrayListUnmanaged(u8).empty;
-                errdefer out.deinit(allocator);
-                const writer = arrayListWriter(&out, allocator);
-
-                for (headers_in, 0..) |h, i| {
-                    if (i > 0) try writer.writeAll(", ");
-                    try writer.writeAll(h);
+            fn writeMethodList(buf: []u8, methods: []const types.Method) []const u8 {
+                var pos: usize = 0;
+                for (methods, 0..) |m, i| {
+                    const name = m.toString();
+                    if (i > 0) {
+                        if (pos + 2 <= buf.len) {
+                            buf[pos] = ',';
+                            buf[pos + 1] = ' ';
+                            pos += 2;
+                        }
+                    }
+                    const end = @min(pos + name.len, buf.len);
+                    @memcpy(buf[pos..end], name[0 .. end - pos]);
+                    pos = end;
                 }
-                return out.toOwnedSlice(allocator);
+                return buf[0..pos];
             }
 
             fn allowedOrigin(ctx: *Context, cfg: CorsConfig) []const u8 {
@@ -80,18 +92,15 @@ pub fn cors(config: CorsConfig) Middleware {
                 try ctx.setHeader("Access-Control-Allow-Origin", origin);
                 try ctx.setHeader("Vary", "Origin");
 
-                const methods = try methodList(ctx.allocator, config.allowed_methods);
-                defer ctx.allocator.free(methods);
-                try ctx.setHeader("Access-Control-Allow-Methods", methods);
+                var methods_buf: [256]u8 = undefined;
+                try ctx.setHeader("Access-Control-Allow-Methods", writeMethodList(&methods_buf, config.allowed_methods));
 
-                const allowed_headers = try headerList(ctx.allocator, config.allowed_headers);
-                defer ctx.allocator.free(allowed_headers);
-                try ctx.setHeader("Access-Control-Allow-Headers", allowed_headers);
+                var headers_buf: [512]u8 = undefined;
+                try ctx.setHeader("Access-Control-Allow-Headers", writeCommaList(&headers_buf, config.allowed_headers));
 
                 if (config.exposed_headers.len > 0) {
-                    const exposed = try headerList(ctx.allocator, config.exposed_headers);
-                    defer ctx.allocator.free(exposed);
-                    try ctx.setHeader("Access-Control-Expose-Headers", exposed);
+                    var exposed_buf: [512]u8 = undefined;
+                    try ctx.setHeader("Access-Control-Expose-Headers", writeCommaList(&exposed_buf, config.exposed_headers));
                 }
 
                 if (config.allow_credentials) {

@@ -17,6 +17,18 @@ pub fn milliTimestamp() i64 {
     }
 }
 
+/// Joins string slices with `sep`, writing into a heap-allocated buffer.
+pub fn joinStrings(allocator: std.mem.Allocator, items: []const []const u8, sep: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    const writer = arrayListWriter(&out, allocator);
+    for (items, 0..) |item, i| {
+        if (i > 0) try writer.writeAll(sep);
+        try writer.writeAll(item);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Parsed cookie name/value pair from a Set-Cookie header value.
 pub const CookiePair = struct {
     name: []const u8,
@@ -127,24 +139,29 @@ pub fn buildSetCookieHeader(allocator: std.mem.Allocator, name: []const u8, valu
 
 /// Returns a best-effort MIME type for a file path extension.
 pub fn mimeTypeFromPath(path: []const u8) []const u8 {
+    const mime_map = std.StaticStringMap([]const u8).initComptime(.{
+        .{ ".html", "text/html; charset=utf-8" },
+        .{ ".htm", "text/html; charset=utf-8" },
+        .{ ".css", "text/css; charset=utf-8" },
+        .{ ".js", "application/javascript; charset=utf-8" },
+        .{ ".json", "application/json" },
+        .{ ".txt", "text/plain; charset=utf-8" },
+        .{ ".svg", "image/svg+xml" },
+        .{ ".png", "image/png" },
+        .{ ".jpg", "image/jpeg" },
+        .{ ".jpeg", "image/jpeg" },
+        .{ ".gif", "image/gif" },
+        .{ ".webp", "image/webp" },
+        .{ ".ico", "image/x-icon" },
+        .{ ".xml", "application/xml" },
+        .{ ".pdf", "application/pdf" },
+        .{ ".woff", "font/woff" },
+        .{ ".woff2", "font/woff2" },
+        .{ ".mp4", "video/mp4" },
+        .{ ".webm", "video/webm" },
+    });
     const ext = std.fs.path.extension(path);
-    if (ext.len == 0) return "application/octet-stream";
-
-    if (mem.eql(u8, ext, ".html") or mem.eql(u8, ext, ".htm")) return "text/html; charset=utf-8";
-    if (mem.eql(u8, ext, ".css")) return "text/css; charset=utf-8";
-    if (mem.eql(u8, ext, ".js")) return "application/javascript; charset=utf-8";
-    if (mem.eql(u8, ext, ".json")) return "application/json";
-    if (mem.eql(u8, ext, ".txt")) return "text/plain; charset=utf-8";
-    if (mem.eql(u8, ext, ".svg")) return "image/svg+xml";
-    if (mem.eql(u8, ext, ".png")) return "image/png";
-    if (mem.eql(u8, ext, ".jpg") or mem.eql(u8, ext, ".jpeg")) return "image/jpeg";
-    if (mem.eql(u8, ext, ".gif")) return "image/gif";
-    if (mem.eql(u8, ext, ".webp")) return "image/webp";
-    if (mem.eql(u8, ext, ".ico")) return "image/x-icon";
-    if (mem.eql(u8, ext, ".xml")) return "application/xml";
-    if (mem.eql(u8, ext, ".pdf")) return "application/pdf";
-
-    return "application/octet-stream";
+    return mime_map.get(ext) orelse "application/octet-stream";
 }
 
 test "queryValue parses normal and key-only params" {

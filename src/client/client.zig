@@ -142,11 +142,12 @@ pub const Client = struct {
     }
 
     fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
-        const full_url = if (self.config.base_url) |base|
+        const owned_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
-            try self.allocator.dupe(u8, url);
-        defer self.allocator.free(full_url);
+            null;
+        defer if (owned_url) |u| self.allocator.free(u);
+        const full_url = owned_url orelse url;
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
@@ -253,6 +254,11 @@ pub const Client = struct {
         }
     }
 
+    fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64) !void {
+        if (recv_ms > 0) try socket.setRecvTimeout(recv_ms);
+        if (send_ms > 0) try socket.setSendTimeout(send_ms);
+    }
+
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
@@ -279,12 +285,7 @@ pub const Client = struct {
                     }
                 }
 
-                if (timeout_ms > 0) {
-                    try tls_conn.socket.setRecvTimeout(timeout_ms);
-                }
-                if (write_timeout_ms > 0) {
-                    try tls_conn.socket.setSendTimeout(write_timeout_ms);
-                }
+                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms);
 
                 const w = try tls_conn.session.getWriter();
                 try req.serialize(w);
@@ -306,12 +307,7 @@ pub const Client = struct {
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
 
-            if (timeout_ms > 0) {
-                try socket.setRecvTimeout(timeout_ms);
-            }
-            if (write_timeout_ms > 0) {
-                try socket.setSendTimeout(write_timeout_ms);
-            }
+            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
 
             return self.executeTlsHttp(&socket, host, req);
         }
@@ -327,12 +323,7 @@ pub const Client = struct {
                 }
             }
 
-            if (timeout_ms > 0) {
-                try conn.socket.setRecvTimeout(timeout_ms);
-            }
-            if (write_timeout_ms > 0) {
-                try conn.socket.setSendTimeout(write_timeout_ms);
-            }
+            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
             conn.socket.setKeepAlive(true) catch {};
 
             try req.serialize(conn.socket.writer());
@@ -351,12 +342,7 @@ pub const Client = struct {
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
 
-        if (timeout_ms > 0) {
-            try socket.setRecvTimeout(timeout_ms);
-        }
-        if (write_timeout_ms > 0) {
-            try socket.setSendTimeout(write_timeout_ms);
-        }
+        try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
 
         try req.serialize(socket.writer());
         return self.readResponse(&socket);
@@ -418,6 +404,7 @@ pub const Client = struct {
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
                     parser.reset();
+                    total_read = 0;
                     continue;
                 }
             }

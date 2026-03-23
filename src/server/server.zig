@@ -28,6 +28,7 @@ const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
 const TcpListener = @import("../net/socket.zig").TcpListener;
 const Router = @import("router.zig").Router;
+const RouteParam = @import("router.zig").RouteParam;
 const Middleware = @import("middleware.zig").Middleware;
 const common = @import("../util/common.zig");
 
@@ -513,12 +514,13 @@ pub const Server = struct {
             }
 
             var suppress_body = false;
-            var route_result = self.router.find(req.method, req.uri.path);
+            var params_buf: [16]RouteParam = undefined;
+            var route_result = self.router.find(req.method, req.uri.path, &params_buf);
 
             // If HEAD is not explicitly registered, fall back to GET semantics
             // and suppress the response body.
             if (route_result == null and req.method == .HEAD) {
-                route_result = self.router.find(.GET, req.uri.path);
+                route_result = self.router.find(.GET, req.uri.path, &params_buf);
                 suppress_body = route_result != null;
             }
 
@@ -824,10 +826,11 @@ test "Server any() registers all methods" {
 
     try server.any("/wild", handler);
 
-    try std.testing.expect(server.router.find(.GET, "/wild") != null);
-    try std.testing.expect(server.router.find(.POST, "/wild") != null);
-    try std.testing.expect(server.router.find(.TRACE, "/wild") != null);
-    try std.testing.expect(server.router.find(.CONNECT, "/wild") != null);
+    var pbuf: [16]RouteParam = undefined;
+    try std.testing.expect(server.router.find(.GET, "/wild", &pbuf) != null);
+    try std.testing.expect(server.router.find(.POST, "/wild", &pbuf) != null);
+    try std.testing.expect(server.router.find(.TRACE, "/wild", &pbuf) != null);
+    try std.testing.expect(server.router.find(.CONNECT, "/wild", &pbuf) != null);
 }
 
 test "ServerConfig defaults" {

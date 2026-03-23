@@ -111,13 +111,14 @@ pub const Router = struct {
     }
 
     /// Finds a matching route for the given method and path.
-    pub fn find(self: *Self, method: types.Method, path: []const u8) ?struct { handler: Handler, params: []const RouteParam } {
-        var params_buf: [16]RouteParam = undefined;
-
+    /// `params_buf` is caller-owned storage for matched route parameters;
+    /// the returned slice borrows from it, so it remains valid as long as
+    /// the caller keeps the buffer alive.
+    pub fn find(self: *Self, method: types.Method, path: []const u8, params_buf: *[16]RouteParam) ?struct { handler: Handler, params: []const RouteParam } {
         for (self.routes.items) |route| {
             if (route.method != method) continue;
 
-            if (self.matchRoute(route, path, &params_buf)) |param_count| {
+            if (self.matchRoute(route, path, params_buf)) |param_count| {
                 return .{
                     .handler = route.handler,
                     .params = params_buf[0..param_count],
@@ -247,6 +248,7 @@ test "Router basic matching" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -258,17 +260,17 @@ test "Router basic matching" {
     try router.add(.GET, "/users/:id", handler);
     try router.add(.POST, "/users", handler);
 
-    const result1 = router.find(.GET, "/users");
+    const result1 = router.find(.GET, "/users", &pbuf);
     try std.testing.expect(result1 != null);
     try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
 
-    const result2 = router.find(.GET, "/users/123");
+    const result2 = router.find(.GET, "/users/123", &pbuf);
     try std.testing.expect(result2 != null);
     try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
     try std.testing.expectEqualStrings("id", result2.?.params[0].name);
     try std.testing.expectEqualStrings("123", result2.?.params[0].value);
 
-    const result3 = router.find(.DELETE, "/users");
+    const result3 = router.find(.DELETE, "/users", &pbuf);
     try std.testing.expect(result3 == null);
 }
 
@@ -276,6 +278,7 @@ test "Router multiple parameters" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -285,7 +288,7 @@ test "Router multiple parameters" {
 
     try router.add(.GET, "/users/:userId/posts/:postId", handler);
 
-    const result = router.find(.GET, "/users/42/posts/99");
+    const result = router.find(.GET, "/users/42/posts/99", &pbuf);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 2), result.?.params.len);
     try std.testing.expectEqualStrings("userId", result.?.params[0].name);
@@ -298,6 +301,7 @@ test "Router wildcard route" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -307,13 +311,13 @@ test "Router wildcard route" {
 
     try router.add(.GET, "/static/*", handler);
 
-    const result1 = router.find(.GET, "/static/css/style.css");
+    const result1 = router.find(.GET, "/static/css/style.css", &pbuf);
     try std.testing.expect(result1 != null);
 
-    const result2 = router.find(.GET, "/static/js/app.js");
+    const result2 = router.find(.GET, "/static/js/app.js", &pbuf);
     try std.testing.expect(result2 != null);
 
-    const result3 = router.find(.GET, "/other/path");
+    const result3 = router.find(.GET, "/other/path", &pbuf);
     try std.testing.expect(result3 == null);
 }
 
@@ -321,6 +325,7 @@ test "Router wildcard at root" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -330,10 +335,10 @@ test "Router wildcard at root" {
 
     try router.add(.GET, "/*", handler);
 
-    const result1 = router.find(.GET, "/anything");
+    const result1 = router.find(.GET, "/anything", &pbuf);
     try std.testing.expect(result1 != null);
 
-    const result2 = router.find(.GET, "/deep/nested/path");
+    const result2 = router.find(.GET, "/deep/nested/path", &pbuf);
     try std.testing.expect(result2 != null);
 }
 
@@ -341,6 +346,7 @@ test "Router no match" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -350,10 +356,10 @@ test "Router no match" {
 
     try router.add(.GET, "/users", handler);
 
-    const result1 = router.find(.GET, "/posts");
+    const result1 = router.find(.GET, "/posts", &pbuf);
     try std.testing.expect(result1 == null);
 
-    const result2 = router.find(.GET, "/users/extra/segments");
+    const result2 = router.find(.GET, "/users/extra/segments", &pbuf);
     try std.testing.expect(result2 == null);
 }
 
@@ -361,6 +367,7 @@ test "Router trailing slash" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -370,7 +377,7 @@ test "Router trailing slash" {
 
     try router.add(.GET, "/users", handler);
 
-    const result = router.find(.GET, "/users/");
+    const result = router.find(.GET, "/users/", &pbuf);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 0), result.?.params.len);
 }
@@ -379,6 +386,7 @@ test "Router method filtering" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -389,13 +397,13 @@ test "Router method filtering" {
     try router.add(.GET, "/api", handler);
     try router.add(.POST, "/api", handler);
 
-    const result1 = router.find(.GET, "/api");
+    const result1 = router.find(.GET, "/api", &pbuf);
     try std.testing.expect(result1 != null);
 
-    const result2 = router.find(.POST, "/api");
+    const result2 = router.find(.POST, "/api", &pbuf);
     try std.testing.expect(result2 != null);
 
-    const result3 = router.find(.DELETE, "/api");
+    const result3 = router.find(.DELETE, "/api", &pbuf);
     try std.testing.expect(result3 == null);
 }
 
@@ -423,6 +431,7 @@ test "Router route priority" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const literal_handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -439,12 +448,12 @@ test "Router route priority" {
     try router.add(.GET, "/users/me", literal_handler);
     try router.add(.GET, "/users/:id", param_handler);
 
-    const result1 = router.find(.GET, "/users/me");
+    const result1 = router.find(.GET, "/users/me", &pbuf);
     try std.testing.expect(result1 != null);
     try std.testing.expectEqual(literal_handler, result1.?.handler);
     try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
 
-    const result2 = router.find(.GET, "/users/123");
+    const result2 = router.find(.GET, "/users/123", &pbuf);
     try std.testing.expect(result2 != null);
     try std.testing.expectEqual(param_handler, result2.?.handler);
     try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
@@ -456,6 +465,7 @@ test "Router empty path segments" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -465,7 +475,7 @@ test "Router empty path segments" {
 
     try router.add(.GET, "/users", handler);
 
-    const result = router.find(.GET, "//users");
+    const result = router.find(.GET, "//users", &pbuf);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 0), result.?.params.len);
 }
@@ -474,6 +484,7 @@ test "Router deep nesting" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -483,7 +494,7 @@ test "Router deep nesting" {
 
     try router.add(.GET, "/a/:b/c/:d/e/:f", handler);
 
-    const result = router.find(.GET, "/a/1/c/2/e/3");
+    const result = router.find(.GET, "/a/1/c/2/e/3", &pbuf);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 3), result.?.params.len);
     try std.testing.expectEqualStrings("b", result.?.params[0].name);
@@ -498,14 +509,15 @@ test "Router no routes registered" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
-    const result1 = router.find(.GET, "/anything");
+    const result1 = router.find(.GET, "/anything", &pbuf);
     try std.testing.expect(result1 == null);
 
-    const result2 = router.find(.POST, "/");
+    const result2 = router.find(.POST, "/", &pbuf);
     try std.testing.expect(result2 == null);
 
-    const result3 = router.find(.DELETE, "/some/deep/path");
+    const result3 = router.find(.DELETE, "/some/deep/path", &pbuf);
     try std.testing.expect(result3 == null);
 }
 
@@ -513,6 +525,7 @@ test "RouteGroup routes use owned pattern strings" {
     const allocator = std.testing.allocator;
     var router = Router.init(allocator);
     defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
 
     const handler = struct {
         fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
@@ -527,6 +540,6 @@ test "RouteGroup routes use owned pattern strings" {
     try group.add(.GET, "/users", handler);
 
     // If the pattern were not owned, this lookup would read freed memory.
-    const result = router.find(.GET, "/api/users");
+    const result = router.find(.GET, "/api/users", &pbuf);
     try std.testing.expect(result != null);
 }

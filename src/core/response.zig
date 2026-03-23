@@ -246,7 +246,14 @@ pub const ResponseBuilder = struct {
         }
 
         if (self.body_data) |b| {
-            response.body = try self.allocator.dupe(u8, b);
+            if (self.body_owned) {
+                // Transfer ownership instead of copying.
+                response.body = b;
+                self.body_data = null;
+                self.body_owned = false;
+            } else {
+                response.body = try self.allocator.dupe(u8, b);
+            }
             response.body_owned = true;
 
             if (!response.headers.isChunked()) {

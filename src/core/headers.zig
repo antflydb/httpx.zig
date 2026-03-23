@@ -69,7 +69,6 @@ pub const Header = struct {
 pub const Headers = struct {
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Header) = .empty,
-    max_headers: usize = 100,
 
     const Self = @This();
 
