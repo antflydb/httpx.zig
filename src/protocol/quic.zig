@@ -11,7 +11,6 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const net = std.net;
 const posix = std.posix;
 
 const http = @import("http.zig");
@@ -620,7 +619,7 @@ pub const TransportParameters = struct {
 
     /// Encodes transport parameters.
     pub fn encode(self: TransportParameters, allocator: Allocator) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(allocator);
 
         inline for (@typeInfo(TransportParameters).@"struct".fields) |field| {

@@ -9,10 +9,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const net = std.net;
+const Io = std.Io;
 
 const Socket = @import("../net/socket.zig").Socket;
-const address_mod = @import("../net/address.zig");
+const Address = @import("../net/socket.zig").Address;
 
 pub const PoolError = error{
     PoolExhausted,
@@ -47,7 +47,6 @@ pub const Connection = struct {
     /// Returns true if the connection is healthy and reusable.
     pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
         if (self.in_use) return false;
-        if (!self.socket.isValid()) return false;
         const idle_time = std.time.milliTimestamp() - self.last_used;
         return idle_time < max_idle_ms;
     }
@@ -55,7 +54,6 @@ pub const Connection = struct {
     /// Returns true if this connection should be evicted from the pool.
     pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
         if (self.in_use) return false;
-        if (!self.socket.isValid()) return true;
         if (self.requests_made >= max_requests_per_connection) return true;
         const idle_time = std.time.milliTimestamp() - self.last_used;
         return idle_time >= idle_timeout_ms;
@@ -86,6 +84,7 @@ pub const PoolStats = struct {
 /// HTTP connection pool.
 pub const ConnectionPool = struct {
     allocator: Allocator,
+    io: Io,
     config: PoolConfig,
     connections: std.ArrayListUnmanaged(Connection) = .empty,
     hosts_owned: std.ArrayListUnmanaged([]u8) = .empty,
@@ -93,14 +92,15 @@ pub const ConnectionPool = struct {
     const Self = @This();
 
     /// Creates a new connection pool.
-    pub fn init(allocator: Allocator) Self {
-        return initWithConfig(allocator, .{});
+    pub fn init(allocator: Allocator, io: Io) Self {
+        return initWithConfig(allocator, io, .{});
     }
 
     /// Creates a connection pool with custom configuration.
-    pub fn initWithConfig(allocator: Allocator, config: PoolConfig) Self {
+    pub fn initWithConfig(allocator: Allocator, io: Io, config: PoolConfig) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
         };
     }
@@ -145,11 +145,10 @@ pub const ConnectionPool = struct {
         const host_owned = try self.allocator.dupe(u8, host);
         try self.hosts_owned.append(self.allocator, host_owned);
 
-        const addr = try address_mod.resolve(host, port);
+        const addr = try Address.resolve(self.io, host, port);
 
-        var socket = try Socket.createForAddress(addr);
+        var socket = try Socket.connect(addr, self.io);
         errdefer socket.close();
-        try socket.connect(addr);
 
         const now = std.time.milliTimestamp();
 
@@ -177,10 +176,22 @@ pub const ConnectionPool = struct {
         while (i < self.connections.items.len) {
             const conn = &self.connections.items[i];
             if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
+                self.freeHostString(conn.host);
                 conn.close();
                 _ = self.connections.orderedRemove(i);
             } else {
                 i += 1;
+            }
+        }
+    }
+
+    /// Frees a host string from the owned list.
+    fn freeHostString(self: *Self, host: []const u8) void {
+        for (self.hosts_owned.items, 0..) |owned, j| {
+            if (owned.ptr == host.ptr) {
+                self.allocator.free(owned);
+                _ = self.hosts_owned.orderedRemove(j);
+                return;
             }
         }
     }
@@ -225,27 +236,33 @@ pub const ConnectionPool = struct {
 
 test "ConnectionPool initialization" {
     const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator);
-    defer pool.deinit();
+    var pool_inst = ConnectionPool.init(allocator, std.testing.io);
+    defer pool_inst.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), pool.totalCount());
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.totalCount());
 }
 
 test "ConnectionPool config" {
     const allocator = std.testing.allocator;
-    var pool = ConnectionPool.initWithConfig(allocator, .{
+    var pool_inst = ConnectionPool.initWithConfig(allocator, std.testing.io, .{
         .max_connections = 50,
         .max_per_host = 10,
     });
-    defer pool.deinit();
+    defer pool_inst.deinit();
 
-    try std.testing.expectEqual(@as(u32, 50), pool.config.max_connections);
-    try std.testing.expectEqual(@as(u32, 10), pool.config.max_per_host);
+    try std.testing.expectEqual(@as(u32, 50), pool_inst.config.max_connections);
+    try std.testing.expectEqual(@as(u32, 10), pool_inst.config.max_per_host);
 }
 
 test "Connection health check" {
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try @import("../net/socket.zig").TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
     var conn = Connection{
-        .socket = try Socket.create(),
+        .socket = try Socket.connect(bound_addr, io),
         .host = "localhost",
         .port = 8080,
         .created_at = std.time.milliTimestamp(),
@@ -261,12 +278,12 @@ test "Connection health check" {
 
 test "ConnectionPool stats helpers" {
     const allocator = std.testing.allocator;
-    var pool = ConnectionPool.init(allocator);
-    defer pool.deinit();
+    var pool_inst = ConnectionPool.init(allocator, std.testing.io);
+    defer pool_inst.deinit();
 
-    const s = pool.stats();
+    const s = pool_inst.stats();
     try std.testing.expectEqual(@as(usize, 0), s.total);
     try std.testing.expectEqual(@as(usize, 0), s.active);
     try std.testing.expectEqual(@as(usize, 0), s.idle);
-    try std.testing.expectEqual(@as(usize, 0), pool.hostConnectionCount("example.com", 443));
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.hostConnectionCount("example.com", 443));
 }

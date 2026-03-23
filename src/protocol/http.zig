@@ -9,6 +9,7 @@
 //! - HTTP/3: QUIC varint + HTTP/3 frame header helpers.
 
 const std = @import("std");
+const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const builtin = @import("builtin");
@@ -155,7 +156,7 @@ pub const Http1Connection = struct {
 
     /// Decodes a chunked transfer encoded body.
     fn readChunkedBody(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result = std.ArrayListUnmanaged(u8).empty;
         var line_buf: [256]u8 = undefined;
 
         while (true) {
@@ -184,7 +185,7 @@ pub const Http1Connection = struct {
 
     /// Reads all remaining data until the connection is closed by the peer.
     fn readUntilClose(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8){};
+        var result = std.ArrayListUnmanaged(u8).empty;
         var buf: [4096]u8 = undefined;
 
         while (true) {
@@ -362,7 +363,7 @@ pub const Http2Connection = struct {
 
     /// Transmits the local settings to the peer.
     fn sendSettings(self: *Self) !void {
-        var payload = std.ArrayListUnmanaged(u8){};
+        var payload = std.ArrayListUnmanaged(u8).empty;
         defer payload.deinit(self.allocator);
 
         try encodeSettingsPayload(self.settings, self.allocator, &payload);
@@ -590,8 +591,8 @@ pub const Http3FrameHeader = struct {
 
 /// Formats a request object into HTTP/1.x wire format.
 pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
-    const writer = buffer.writer(allocator);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    const writer = arrayListWriter(&buffer, allocator);
 
     const method_str = req.method.toString();
     try writer.print("{s} {s}", .{ method_str, req.uri.path });
@@ -614,8 +615,8 @@ pub fn formatRequest(req: *const Request, allocator: Allocator) ![]u8 {
 
 /// Formats a response object into HTTP/1.x wire format.
 pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
-    const writer = buffer.writer(allocator);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    const writer = arrayListWriter(&buffer, allocator);
 
     try writer.print("{s} {d} {s}\r\n", .{
         resp.version.toString(),
@@ -637,9 +638,9 @@ pub fn formatResponse(resp: *const Response, allocator: Allocator) ![]u8 {
 
 /// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.
 pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator: Allocator) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    const writer = arrayListWriter(&out, allocator);
 
     const chunk_size: usize = 4096;
     var offset: usize = 0;
@@ -773,7 +774,7 @@ test "HTTP/2 SETTINGS payload encode/decode" {
         .max_header_list_size = 9000,
     };
 
-    var payload = std.ArrayListUnmanaged(u8){};
+    var payload = std.ArrayListUnmanaged(u8).empty;
     defer payload.deinit(allocator);
     try encodeSettingsPayload(settings_in, allocator, &payload);
 

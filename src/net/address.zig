@@ -2,34 +2,11 @@
 //!
 //! Provides network address handling including:
 //!
-//! - DNS hostname resolution
 //! - IPv4 and IPv6 address parsing
 //! - Host:port string parsing
-//! - Address formatting
+//! - Address identification
 
 const std = @import("std");
-const net = std.net;
-const Allocator = std.mem.Allocator;
-
-/// Resolves a hostname to a network address.
-pub fn resolve(hostname: []const u8, port: u16) !net.Address {
-    if (parseIp4(hostname)) |ip4| {
-        return net.Address.initIp4(ip4, port);
-    }
-
-    if (parseIp6(hostname)) |ip6| {
-        return net.Address.initIp6(ip6, port, 0, 0);
-    }
-
-    const list = try net.getAddressList(std.heap.page_allocator, hostname, port);
-    defer list.deinit();
-
-    if (list.addrs.len == 0) {
-        return error.DnsResolutionFailed;
-    }
-
-    return list.addrs[0];
-}
 
 /// Parses an IPv4 address string (e.g., "192.168.1.1").
 fn parseIp4(str: []const u8) ?[4]u8 {
@@ -61,12 +38,9 @@ fn parseIp4(str: []const u8) ?[4]u8 {
 
 /// Parses an IPv6 address string.
 fn parseIp6(str: []const u8) ?[16]u8 {
-    // Minimal IPv6 parser supporting RFC5952-style hex groups with optional "::" abbreviation.
-    // Zone IDs ("%eth0") are intentionally not supported.
     if (str.len < 2 or str.len > 39) return null;
     if (std.mem.indexOfScalar(u8, str, '%') != null) return null;
 
-    // Address cannot start or end with a single ':'
     if ((str[0] == ':' and str.len > 1 and str[1] != ':') or
         (str.len >= 2 and str[str.len - 2] != ':' and str[str.len - 1] == ':'))
     {
@@ -81,7 +55,6 @@ fn parseIp6(str: []const u8) ?[16]u8 {
     while (i < str.len) {
         if (group_count >= 8) return null;
 
-        // Handle abbreviation
         if (str[i] == ':') {
             if (i + 1 < str.len and str[i + 1] == ':') {
                 if (abbreviated_at != null) return null;
@@ -90,12 +63,10 @@ fn parseIp6(str: []const u8) ?[16]u8 {
                 if (i >= str.len) break;
                 continue;
             }
-            // single ':' separator
             i += 1;
             continue;
         }
 
-        // Parse up to 4 hex digits
         var value: u16 = 0;
         var digits: usize = 0;
         while (i < str.len) : (i += 1) {
@@ -121,12 +92,10 @@ fn parseIp6(str: []const u8) ?[16]u8 {
         }
     }
 
-    // Expand abbreviation to 8 groups if present
     if (group_count != 8) {
         const at = abbreviated_at orelse return null;
         const tail = group_count - at;
 
-        // Move tail groups to the end
         var dst: isize = 7;
         var src: isize = @intCast(group_count - 1);
         var moved: usize = 0;
@@ -135,13 +104,11 @@ fn parseIp6(str: []const u8) ?[16]u8 {
             dst -= 1;
             src -= 1;
         }
-        // Zero fill between at and the start of moved tail
         var z: usize = at;
         while (z <= @as(usize, @intCast(dst))) : (z += 1) {
             groups[z] = 0;
         }
     } else if (abbreviated_at != null) {
-        // "::" with exactly 8 groups is not valid
         return null;
     }
 
@@ -176,11 +143,6 @@ pub fn parseHostPort(str: []const u8, default_port: u16) !struct { host: []const
     }
 
     return .{ .host = str, .port = default_port };
-}
-
-/// Formats a network address as a string.
-pub fn formatAddress(addr: net.Address, allocator: Allocator) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{}", .{addr});
 }
 
 /// Returns true if the string looks like an IP address (not a hostname).

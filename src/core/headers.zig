@@ -10,6 +10,7 @@
 //! - Memory-safe ownership model with automatic cleanup
 
 const std = @import("std");
+const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
@@ -116,7 +117,7 @@ pub const Headers = struct {
 
     /// Returns all values for a header name.
     pub fn getAll(self: *const Self, name: []const u8, allocator: Allocator) ![][]const u8 {
-        var values = std.ArrayListUnmanaged([]const u8){};
+        var values = std.ArrayListUnmanaged([]const u8).empty;
         for (self.entries.items) |entry| {
             if (eqlIgnoreCase(entry.name, name)) {
                 try values.append(allocator, entry.value);
@@ -220,8 +221,8 @@ pub const Headers = struct {
 
     /// Serializes headers to an allocated string.
     pub fn toSlice(self: *const Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8){};
-        const writer = buffer.writer(allocator);
+        var buffer = std.ArrayListUnmanaged(u8).empty;
+        const writer = arrayListWriter(&buffer, allocator);
         try self.serialize(writer);
         return buffer.toOwnedSlice(allocator);
     }

@@ -185,7 +185,7 @@ pub const TlsSession = struct {
 
         const sni_host = self.config.server_name orelse hostname;
 
-        const client = try tls.Client.init(&self.net_in.?.reader, &self.net_out.?.writer, .{
+        const client = try tls.Client.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
             .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
             .ca = if (verify) .{ .bundle = self.ca_bundle.? } else .{ .no_verification = {} },
             .ssl_key_log = null,

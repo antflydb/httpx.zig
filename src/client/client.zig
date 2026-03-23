@@ -7,9 +7,10 @@
 //!   currently speaks HTTP/1.1.
 
 const std = @import("std");
+const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const net = std.net;
+const Io = std.Io;
 
 const types = @import("../core/types.zig");
 const meta = @import("../core/meta.zig");
@@ -20,9 +21,9 @@ const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
 const Socket = @import("../net/socket.zig").Socket;
+const Address = @import("../net/socket.zig").Address;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
-const address_mod = @import("../net/address.zig");
 const http = @import("../protocol/http.zig");
 const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
@@ -73,6 +74,7 @@ pub const Interceptor = struct {
 /// HTTP Client.
 pub const Client = struct {
     allocator: Allocator,
+    io: Io,
     config: ClientConfig,
     interceptors: std.ArrayListUnmanaged(Interceptor) = .empty,
     cookies: std.StringHashMapUnmanaged([]const u8) = .{},
@@ -81,16 +83,17 @@ pub const Client = struct {
     const Self = @This();
 
     /// Creates a new HTTP client with default configuration.
-    pub fn init(allocator: Allocator) Self {
-        return initWithConfig(allocator, .{});
+    pub fn init(allocator: Allocator, io: Io) Self {
+        return initWithConfig(allocator, io, .{});
     }
 
     /// Creates a new HTTP client with custom configuration.
-    pub fn initWithConfig(allocator: Allocator, config: ClientConfig) Self {
+    pub fn initWithConfig(allocator: Allocator, io: Io, config: ClientConfig) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
-            .pool = ConnectionPool.initWithConfig(allocator, .{
+            .pool = ConnectionPool.initWithConfig(allocator, io, .{
                 .max_connections = config.pool_max_connections,
                 .max_per_host = config.pool_max_per_host,
             }),
@@ -241,9 +244,9 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             // TLS pooling requires keeping a live TLS session; not implemented yet.
-            const addr = try address_mod.resolve(host, port);
+            const addr = try Address.resolve(self.io, host, port);
 
-            var socket = try Socket.createForAddress(addr);
+            var socket = try Socket.connect(addr, self.io);
             defer socket.close();
 
             if (timeout_ms > 0) {
@@ -252,8 +255,6 @@ pub const Client = struct {
             if (write_timeout_ms > 0) {
                 try socket.setSendTimeout(write_timeout_ms);
             }
-
-            try socket.connect(addr);
 
             return self.executeTlsHttp(&socket, host, request_data);
         }
@@ -279,9 +280,9 @@ pub const Client = struct {
             return res;
         }
 
-        const addr = try address_mod.resolve(host, port);
+        const addr = try Address.resolve(self.io, host, port);
 
-        var socket = try Socket.createForAddress(addr);
+        var socket = try Socket.connect(addr, self.io);
         defer socket.close();
 
         if (timeout_ms > 0) {
@@ -290,8 +291,6 @@ pub const Client = struct {
         if (write_timeout_ms > 0) {
             try socket.setSendTimeout(write_timeout_ms);
         }
-
-        try socket.connect(addr);
 
         try socket.sendAll(request_data);
         return self.readResponseFromTcp(&socket);
@@ -399,9 +398,9 @@ pub const Client = struct {
     fn attachCookies(self: *Self, req: *Request) !void {
         if (self.cookies.count() == 0) return;
 
-        var list = std.ArrayListUnmanaged(u8){};
+        var list = std.ArrayListUnmanaged(u8).empty;
         defer list.deinit(self.allocator);
-        const writer = list.writer(self.allocator);
+        const writer = arrayListWriter(&list, self.allocator);
 
         var it = self.cookies.iterator();
         var first = true;
@@ -544,7 +543,7 @@ fn parseResponse(allocator: Allocator, data: []const u8) !Response {
 
 test "Client initialization" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
@@ -552,7 +551,7 @@ test "Client initialization" {
 
 test "Client with config" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, .{
+    var client = Client.initWithConfig(allocator, std.testing.io, .{
         .base_url = "https://api.example.com",
         .user_agent = "TestClient/1.0",
     });
@@ -574,7 +573,7 @@ test "Response parsing" {
 
 test "Client stores Set-Cookie headers" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     var response = Response.init(allocator, 200);
@@ -591,7 +590,7 @@ test "Client stores Set-Cookie headers" {
 
 test "Client attaches Cookie header from jar" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
@@ -609,7 +608,7 @@ test "Client attaches Cookie header from jar" {
 
 test "Client cookie jar public API" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
@@ -627,7 +626,7 @@ test "Client cookie jar public API" {
 
 test "Client send/fetch/options aliases" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     // Compile-time alias checks through function pointer assignment.
@@ -641,7 +640,7 @@ test "Client send/fetch/options aliases" {
 
 test "Client hasCookie and cookieCount" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator);
+    var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), client.cookieCount());

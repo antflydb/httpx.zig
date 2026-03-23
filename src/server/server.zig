@@ -10,9 +10,10 @@
 //! - Cross-platform (Linux, Windows, macOS)
 
 const std = @import("std");
+const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const net = std.net;
+const Io = std.Io;
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -23,6 +24,7 @@ const HeaderName = @import("../core/headers.zig").HeaderName;
 const Parser = @import("../protocol/parser.zig").Parser;
 const http = @import("../protocol/http.zig");
 const Socket = @import("../net/socket.zig").Socket;
+const Address = @import("../net/socket.zig").Address;
 const TcpListener = @import("../net/socket.zig").TcpListener;
 const Router = @import("router.zig").Router;
 const Middleware = @import("middleware.zig").Middleware;
@@ -176,9 +178,9 @@ pub const Context = struct {
 
     /// Sends one-shot Server-Sent Events payload.
     pub fn sse(self: *Self, events: []const SseEvent) !Response {
-        var payload = std.ArrayListUnmanaged(u8){};
+        var payload = std.ArrayListUnmanaged(u8).empty;
         defer payload.deinit(self.allocator);
-        const writer = payload.writer(self.allocator);
+        const writer = arrayListWriter(&payload, self.allocator);
 
         for (events) |evt| {
             if (evt.id) |id| try writer.print("id: {s}\n", .{id});
@@ -219,6 +221,7 @@ pub const Handler = *const fn (*Context) anyerror!Response;
 /// HTTP Server.
 pub const Server = struct {
     allocator: Allocator,
+    io: Io,
     config: ServerConfig,
     router: Router,
     middleware: std.ArrayListUnmanaged(Middleware) = .empty,
@@ -230,12 +233,12 @@ pub const Server = struct {
     const Self = @This();
 
     /// Creates a server with default configuration.
-    pub fn init(allocator: Allocator) Self {
-        return initWithConfig(allocator, .{});
+    pub fn init(allocator: Allocator, io: Io) Self {
+        return initWithConfig(allocator, io, .{});
     }
 
     /// Creates a server with custom configuration.
-    pub fn initWithConfig(allocator: Allocator, config: ServerConfig) Self {
+    pub fn initWithConfig(allocator: Allocator, io: Io, config: ServerConfig) Self {
         var cfg = config;
         if (cfg.max_connections == 0) cfg.max_connections = 1000;
         if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
@@ -243,6 +246,7 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .config = cfg,
             .router = Router.init(allocator),
         };
@@ -326,10 +330,13 @@ pub const Server = struct {
 
     /// Starts the server and begins accepting connections.
     pub fn listen(self: *Self) !void {
-        const addr = try net.Address.parseIp(self.config.host, self.config.port);
+        const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        self.listener = try TcpListener.initWithBacklog(addr, backlog);
+        self.listener = try TcpListener.initWithOptions(addr, self.io, .{
+            .kernel_backlog = backlog,
+            .reuse_address = true,
+        });
         self.running = true;
 
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
@@ -503,9 +510,9 @@ pub const Server = struct {
 
     /// Sets the `Allow` header for automatic OPTIONS and 405 responses.
     fn setAllowHeader(self: *Self, headers: *Headers, methods: []const types.Method) !void {
-        var allow = std.ArrayListUnmanaged(u8){};
+        var allow = std.ArrayListUnmanaged(u8).empty;
         defer allow.deinit(self.allocator);
-        const writer = allow.writer(self.allocator);
+        const writer = arrayListWriter(&allow, self.allocator);
 
         var first = true;
         var has_options = false;
@@ -557,9 +564,9 @@ pub const Server = struct {
 };
 
 fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    const writer = arrayListWriter(&out, allocator);
 
     var first = true;
     for (headers.entries.items) |h| {
@@ -573,7 +580,7 @@ fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
 
 test "Server initialization" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
     try std.testing.expectEqual(@as(u16, 8080), server.config.port);
@@ -593,7 +600,7 @@ test "Context response helpers" {
 
 test "Server with config" {
     const allocator = std.testing.allocator;
-    var server = Server.initWithConfig(allocator, .{
+    var server = Server.initWithConfig(allocator, std.testing.io, .{
         .host = "0.0.0.0",
         .port = 3000,
     });
@@ -641,7 +648,7 @@ test "Context cookie helpers" {
 
 test "Router allowed methods for path" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
     const handler = struct {
@@ -675,7 +682,7 @@ test "Router allowed methods for path" {
 
 test "Server any() registers all methods" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
     const handler = struct {

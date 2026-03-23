@@ -271,74 +271,75 @@ pub fn allSettled(allocator: std.mem.Allocator, client: *Client, specs: []const 
 }
 
 /// Convenience function to create a GET request.
-pub fn get(allocator: std.mem.Allocator, url: []const u8) !Response {
-    var c = Client.init(allocator);
+pub fn get(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.get(url, .{});
 }
 
 /// Convenience alias for GET requests.
-pub fn fetch(allocator: std.mem.Allocator, url: []const u8) !Response {
-    return get(allocator, url);
+pub fn fetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {
+    return get(allocator, io, url);
 }
 
 /// Convenience function to create a request with an explicit method.
 pub fn send(
     allocator: std.mem.Allocator,
+    io: std.Io,
     method: Method,
     url: []const u8,
     req_options: RequestOptions,
 ) !Response {
-    var c = Client.init(allocator);
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.request(method, url, req_options);
 }
 
 /// Convenience function to create a POST request with JSON body.
-pub fn postJson(allocator: std.mem.Allocator, url: []const u8, body: []const u8) !Response {
-    var c = Client.init(allocator);
+pub fn postJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []const u8) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.post(url, .{ .json = body });
 }
 
 /// Convenience function to create a POST request.
-pub fn post(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn post(allocator: std.mem.Allocator, io: std.Io, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.post(url, req_options);
 }
 
 /// Convenience function to create a PUT request.
-pub fn put(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn put(allocator: std.mem.Allocator, io: std.Io, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.put(url, req_options);
 }
 
 /// Convenience function to create a DELETE request.
-pub fn del(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn del(allocator: std.mem.Allocator, io: std.Io, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.delete(url, req_options);
 }
 
 /// Convenience function to create a PATCH request.
-pub fn patch(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn patch(allocator: std.mem.Allocator, io: std.Io, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.patch(url, req_options);
 }
 
 /// Convenience function to create a HEAD request.
-pub fn head(allocator: std.mem.Allocator, url: []const u8, req_options: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn head(allocator: std.mem.Allocator, io: std.Io, url: []const u8, req_options: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.head(url, req_options);
 }
 
 /// Convenience function to create an OPTIONS request.
-pub fn options(allocator: std.mem.Allocator, url: []const u8, options_in: RequestOptions) !Response {
-    var c = Client.init(allocator);
+pub fn options(allocator: std.mem.Allocator, io: std.Io, url: []const u8, options_in: RequestOptions) !Response {
+    var c = Client.init(allocator, io);
     defer c.deinit();
     return c.options(url, options_in);
 }

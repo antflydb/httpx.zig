@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.
 pub const CookiePair = struct {
@@ -83,9 +84,9 @@ pub fn cookieValue(cookie_header: []const u8, name: []const u8) ?[]const u8 {
 
 /// Builds a Set-Cookie header value with common RFC 6265 attributes.
 pub fn buildSetCookieHeader(allocator: std.mem.Allocator, name: []const u8, value: []const u8, options: CookieOptions) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    const writer = arrayListWriter(&out, allocator);
 
     try writer.print("{s}={s}", .{ name, value });
 
