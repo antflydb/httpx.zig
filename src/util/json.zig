@@ -32,8 +32,8 @@ pub const Json = struct {
     }
 
     /// Validates that a string is valid JSON.
-    pub fn validate(data: []const u8) bool {
-        var scanner = std.json.Scanner.initCompleteInput(std.testing.allocator, data);
+    pub fn validate(allocator: Allocator, data: []const u8) bool {
+        var scanner = std.json.Scanner.initCompleteInput(allocator, data);
         defer scanner.deinit();
 
         while (true) {

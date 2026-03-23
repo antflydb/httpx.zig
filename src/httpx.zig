@@ -224,9 +224,6 @@ pub const Middleware = middleware.Middleware;
 pub const Next = middleware.Next;
 pub const cors = middleware.cors;
 pub const logger = middleware.logger;
-pub const compression = middleware.compression;
-pub const rateLimit = middleware.rateLimit;
-pub const basicAuth = middleware.basicAuth;
 pub const helmet = middleware.helmet;
 
 pub const Buffer = buffer.Buffer;

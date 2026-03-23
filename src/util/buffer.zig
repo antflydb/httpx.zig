@@ -51,9 +51,9 @@ pub const Buffer = struct {
     fn ensureCapacity(self: *Self, needed: usize) !void {
         if (needed <= self.capacity) return;
 
-        var new_capacity = self.capacity;
+        var new_capacity = @max(self.capacity, 16);
         while (new_capacity < needed) {
-            new_capacity = new_capacity * 2;
+            new_capacity = std.math.mul(usize, new_capacity, 2) catch return error.OutOfMemory;
         }
 
         self.data = try self.allocator.realloc(self.data, new_capacity);

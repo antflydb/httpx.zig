@@ -72,7 +72,8 @@ pub const Response = struct {
     }
 
     /// Parses the response body as JSON into the given type.
-    pub fn json(self: *const Self, comptime T: type) !T {
+    /// Caller must call `.deinit()` on the returned `Parsed(T)` to free the arena.
+    pub fn json(self: *const Self, comptime T: type) !std.json.Parsed(T) {
         const body = self.body orelse return error.NoBody;
         return std.json.parseFromSlice(T, self.allocator, body, .{});
     }

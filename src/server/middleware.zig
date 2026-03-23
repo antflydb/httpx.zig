@@ -162,93 +162,23 @@ pub fn logger() Middleware {
     };
 }
 
-/// Creates compression middleware.
-pub fn compression() Middleware {
-    return .{
-        .name = "compression",
-        .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                _ = ctx.header("Accept-Encoding");
-                return next(ctx);
-            }
-        }.handler,
-    };
-}
-
 /// Rate limiting configuration.
 pub const RateLimitConfig = struct {
     max_requests: u32 = 100,
     window_ms: u64 = 60_000,
 };
 
-/// Creates rate limiting middleware.
-pub fn rateLimit(config: RateLimitConfig) Middleware {
-    _ = config;
-    return .{
-        .name = "rate_limit",
-        .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                return next(ctx);
-            }
-        }.handler,
-    };
-}
-
-/// Creates basic authentication middleware.
-pub fn basicAuth(realm: []const u8, validator: *const fn ([]const u8, []const u8) bool) Middleware {
-    _ = realm;
-    _ = validator;
-    return .{
-        .name = "basic_auth",
-        .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                const auth = ctx.header("Authorization") orelse {
-                    try ctx.setHeader("WWW-Authenticate", "Basic realm=\"Restricted\"");
-                    return ctx.status(401).text("Unauthorized");
-                };
-
-                if (!std.mem.startsWith(u8, auth, "Basic ")) {
-                    return ctx.status(401).text("Unauthorized");
-                }
-
-                return next(ctx);
-            }
-        }.handler,
-    };
-}
-
-/// Creates body parser middleware.
-pub fn bodyParser(max_size: usize) Middleware {
-    _ = max_size;
-    return .{
-        .name = "body_parser",
-        .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                return next(ctx);
-            }
-        }.handler,
-    };
-}
-
 /// Creates security headers middleware (Helmet).
+/// Sets common security headers on every response.
 pub fn helmet() Middleware {
     return .{
         .name = "helmet",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                return next(ctx);
-            }
-        }.handler,
-    };
-}
-
-/// Creates request timeout middleware.
-pub fn timeout(ms: u64) Middleware {
-    _ = ms;
-    return .{
-        .name = "timeout",
-        .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
+                try ctx.setHeader("X-Content-Type-Options", "nosniff");
+                try ctx.setHeader("X-Frame-Options", "SAMEORIGIN");
+                try ctx.setHeader("X-XSS-Protection", "0");
+                try ctx.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
                 return next(ctx);
             }
         }.handler,
@@ -277,12 +207,6 @@ test "CORS middleware" {
     const config = CorsConfig{};
     const mw = cors(config);
     try std.testing.expectEqualStrings("cors", mw.name);
-}
-
-test "Rate limit middleware" {
-    const config = RateLimitConfig{ .max_requests = 50 };
-    const mw = rateLimit(config);
-    try std.testing.expectEqualStrings("rate_limit", mw.name);
 }
 
 test "Helmet middleware" {

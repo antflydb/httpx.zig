@@ -152,12 +152,13 @@ pub const Context = struct {
 
     /// Sends a file response.
     pub fn file(self: *Self, path: []const u8) !Response {
-        // Reject path traversal attempts.
-        if (mem.indexOf(u8, path, "..") != null) {
+        // Reject path traversal: check for ".." segments in raw and
+        // percent-decoded form. Also reject absolute paths and null bytes.
+        if (containsTraversal(path)) {
             return self.status(403).text("Forbidden");
         }
 
-        const f = std.fs.cwd().openFile(path, .{}) catch return self.status(404).text("Not Found");
+        const f = std.fs.cwd().openFile(path, .{ .no_follow = true }) catch return self.status(404).text("Not Found");
         defer f.close();
 
         const stat = try f.stat();
@@ -584,6 +585,41 @@ pub const Server = struct {
         return state.route_handler(ctx);
     }
 };
+
+/// Returns true if `path` contains traversal sequences (`..`), null bytes,
+/// or starts with `/` (absolute). Checks both raw and common percent-encoded
+/// variants (`%2e`, `%2E`).
+fn containsTraversal(path: []const u8) bool {
+    // Reject null bytes — can bypass C-based filesystem APIs.
+    if (mem.indexOfScalar(u8, path, 0) != null) return true;
+    // Reject absolute paths.
+    if (path.len > 0 and path[0] == '/') return true;
+
+    // Check for ".." in raw form.
+    if (mem.indexOf(u8, path, "..") != null) return true;
+
+    // Check for percent-encoded dot variants: %2e and %2E.
+    var i: usize = 0;
+    while (i < path.len) {
+        if (isEncodedDot(path, i)) {
+            // Check if followed by another dot (raw or encoded).
+            const next = i + 3;
+            if (next < path.len and path[next] == '.') return true;
+            if (isEncodedDot(path, next)) return true;
+            // Check if preceded by a raw dot.
+            if (i > 0 and path[i - 1] == '.') return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn isEncodedDot(path: []const u8, i: usize) bool {
+    if (i + 2 >= path.len) return false;
+    if (path[i] != '%') return false;
+    if (path[i + 1] != '2') return false;
+    return path[i + 2] == 'e' or path[i + 2] == 'E';
+}
 
 fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;

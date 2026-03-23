@@ -506,7 +506,9 @@ pub const AckFrame = struct {
         const first_range = try decodeVarInt(data[offset..]);
         offset += first_range.len;
 
+        const max_ack_ranges = 256;
         const ranges_len: usize = @intCast(range_count.value);
+        if (ranges_len > max_ack_ranges) return error.AckRangeCountTooLarge;
         const ranges = try allocator.alloc(AckFrame.AckRange, ranges_len);
         errdefer allocator.free(ranges);
 

@@ -25,12 +25,7 @@ pub fn main() !void {
         .allowed_methods = &.{ .GET, .POST, .PUT, .DELETE },
         .allow_credentials = true,
     }));
-    try server.use(httpx.rateLimit(.{
-        .max_requests = 100,
-        .window_ms = 60_000,
-    }));
     try server.use(httpx.helmet());
-    try server.use(httpx.compression());
 
     try server.get("/api/data", apiHandler);
 
@@ -43,12 +38,7 @@ pub fn main() !void {
     std.debug.print("\nAvailable Middleware:\n", .{});
     std.debug.print("  - logger(): Request/response logging\n", .{});
     std.debug.print("  - cors(): Cross-Origin Resource Sharing\n", .{});
-    std.debug.print("  - rateLimit(): Request rate limiting\n", .{});
     std.debug.print("  - helmet(): Security headers\n", .{});
-    std.debug.print("  - compression(): Response compression\n", .{});
-    std.debug.print("  - basicAuth(): HTTP Basic authentication\n", .{});
-    std.debug.print("  - bodyParser(): Request body parsing\n", .{});
-    std.debug.print("  - timeout(): Request timeout\n", .{});
     std.debug.print("  - requestId(): Unique request ID\n", .{});
 
     std.debug.print("\nCORS Configuration:\n", .{});
@@ -60,11 +50,4 @@ pub fn main() !void {
     std.debug.print("  Max age: {d}s\n", .{cors_config.max_age});
     std.debug.print("  Allow credentials: {}\n", .{cors_config.allow_credentials});
 
-    std.debug.print("\nRate Limit Configuration:\n", .{});
-    const rate_config = httpx.middleware.RateLimitConfig{
-        .max_requests = 100,
-        .window_ms = 60_000,
-    };
-    std.debug.print("  Max requests: {d}\n", .{rate_config.max_requests});
-    std.debug.print("  Window: {d}ms\n", .{rate_config.window_ms});
 }

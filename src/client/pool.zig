@@ -82,12 +82,12 @@ pub const PoolStats = struct {
 };
 
 /// HTTP connection pool.
+/// Connections are individually heap-allocated for pointer stability.
 pub const ConnectionPool = struct {
     allocator: Allocator,
     io: Io,
     config: PoolConfig,
-    connections: std.ArrayListUnmanaged(Connection) = .empty,
-    hosts_owned: std.ArrayListUnmanaged([]u8) = .empty,
+    connections: std.ArrayListUnmanaged(*Connection) = .empty,
     mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
@@ -108,47 +108,48 @@ pub const ConnectionPool = struct {
 
     /// Releases all pool resources.
     pub fn deinit(self: *Self) void {
-        for (self.connections.items) |*conn| {
+        for (self.connections.items) |conn| {
             conn.close();
+            self.allocator.free(conn.host);
+            self.allocator.destroy(conn);
         }
         self.connections.deinit(self.allocator);
-
-        for (self.hosts_owned.items) |host| {
-            self.allocator.free(host);
-        }
-        self.hosts_owned.deinit(self.allocator);
     }
 
     /// Gets or creates a connection to the specified host.
-    /// The returned pointer is stable while the connection is in use (acquired).
+    /// The returned pointer is stable for the lifetime of the connection.
     pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Connection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        for (self.connections.items) |*conn| {
-            if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
-                if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
-                    conn.acquire();
-                    return conn;
+            for (self.connections.items) |conn| {
+                if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
+                    if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
+                        conn.acquire();
+                        return conn;
+                    }
                 }
             }
+
+            if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
+
+            var host_count: u32 = 0;
+            for (self.connections.items) |conn| {
+                if (std.mem.eql(u8, conn.host, host) and conn.port == port) host_count += 1;
+            }
+            if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
         }
 
-        if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
-
-        var host_count: u32 = 0;
-        for (self.connections.items) |conn| {
-            if (std.mem.eql(u8, conn.host, host) and conn.port == port) host_count += 1;
-        }
-        if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
-
+        // Create the connection without holding the mutex (DNS + TCP connect may block).
         return self.createConnection(host, port);
     }
 
-    /// Creates a new connection.
+    /// Creates a new connection. Performs I/O without holding the pool mutex,
+    /// then briefly locks to insert the new connection.
     fn createConnection(self: *Self, host: []const u8, port: u16) !*Connection {
         const host_owned = try self.allocator.dupe(u8, host);
-        try self.hosts_owned.append(self.allocator, host_owned);
+        errdefer self.allocator.free(host_owned);
 
         const addr = try Address.resolve(self.io, host, port);
 
@@ -157,16 +158,22 @@ pub const ConnectionPool = struct {
 
         const now = std.time.milliTimestamp();
 
-        try self.connections.append(self.allocator, .{
+        const conn = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(conn);
+        conn.* = .{
             .socket = socket,
             .host = host_owned,
             .port = port,
             .in_use = true,
             .created_at = now,
             .last_used = now,
-        });
+        };
 
-        return &self.connections.items[self.connections.items.len - 1];
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.connections.append(self.allocator, conn);
+
+        return conn;
     }
 
     /// Releases a connection back to the pool.
@@ -186,24 +193,14 @@ pub const ConnectionPool = struct {
     fn cleanupLocked(self: *Self) void {
         var i: usize = 0;
         while (i < self.connections.items.len) {
-            const conn = &self.connections.items[i];
+            const conn = self.connections.items[i];
             if (conn.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
-                self.freeHostString(conn.host);
                 conn.close();
+                self.allocator.free(conn.host);
+                self.allocator.destroy(conn);
                 _ = self.connections.swapRemove(i);
             } else {
                 i += 1;
-            }
-        }
-    }
-
-    /// Frees a host string from the owned list.
-    fn freeHostString(self: *Self, host: []const u8) void {
-        for (self.hosts_owned.items, 0..) |owned, j| {
-            if (owned.ptr == host.ptr) {
-                self.allocator.free(owned);
-                _ = self.hosts_owned.swapRemove(j);
-                return;
             }
         }
     }
