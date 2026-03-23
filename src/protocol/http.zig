@@ -617,7 +617,7 @@ pub fn isH2cUpgradeRequest(headers: *const Headers) bool {
         return false;
     }
 
-    return headers.get("HTTP2-Settings") != null;
+    return headers.get(HeaderName.HTTP2_SETTINGS) != null;
 }
 
 /// Determines the highest supported HTTP version based on ALPN negotiation string.
@@ -740,7 +740,7 @@ test "isH2cUpgradeRequest detects valid h2c headers" {
 
     try headers.set(HeaderName.UPGRADE, "h2c");
     try headers.set(HeaderName.CONNECTION, "Upgrade, HTTP2-Settings");
-    try headers.set("HTTP2-Settings", "AAMAAABkAAQCAAAAAAIAAAAA");
+    try headers.set(HeaderName.HTTP2_SETTINGS, "AAMAAABkAAQCAAAAAAIAAAAA");
 
     try std.testing.expect(isH2cUpgradeRequest(&headers));
 }

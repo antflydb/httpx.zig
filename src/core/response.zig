@@ -240,12 +240,15 @@ pub const ResponseBuilder = struct {
     /// Builds the final response.
     pub fn build(self: *Self) !Response {
         var response = Response.init(self.allocator, self.status_code);
+        errdefer response.deinit();
 
-        for (self.headers.entries.items) |h| {
-            try response.headers.append(h.name, h.value);
-        }
+        // Transfer header ownership directly instead of copying each entry.
+        response.headers.deinit();
+        response.headers.entries = self.headers.entries;
+        self.headers.entries = .empty;
 
         if (self.body_data) |b| {
+            const body_len = b.len;
             if (self.body_owned) {
                 // Transfer ownership instead of copying.
                 response.body = b;
@@ -257,7 +260,7 @@ pub const ResponseBuilder = struct {
             response.body_owned = true;
 
             if (!response.headers.isChunked()) {
-                try response.headers.setContentLength(b.len);
+                try response.headers.setContentLength(body_len);
             }
         }
 

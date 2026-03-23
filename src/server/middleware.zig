@@ -42,41 +42,6 @@ pub fn cors(config: CorsConfig) Middleware {
     return .{
         .name = "cors",
         .handler = struct {
-            fn writeCommaList(buf: []u8, items: []const []const u8) []const u8 {
-                var pos: usize = 0;
-                for (items, 0..) |item, i| {
-                    if (i > 0) {
-                        if (pos + 2 <= buf.len) {
-                            buf[pos] = ',';
-                            buf[pos + 1] = ' ';
-                            pos += 2;
-                        }
-                    }
-                    const end = @min(pos + item.len, buf.len);
-                    @memcpy(buf[pos..end], item[0 .. end - pos]);
-                    pos = end;
-                }
-                return buf[0..pos];
-            }
-
-            fn writeMethodList(buf: []u8, methods: []const types.Method) []const u8 {
-                var pos: usize = 0;
-                for (methods, 0..) |m, i| {
-                    const name = m.toString();
-                    if (i > 0) {
-                        if (pos + 2 <= buf.len) {
-                            buf[pos] = ',';
-                            buf[pos + 1] = ' ';
-                            pos += 2;
-                        }
-                    }
-                    const end = @min(pos + name.len, buf.len);
-                    @memcpy(buf[pos..end], name[0 .. end - pos]);
-                    pos = end;
-                }
-                return buf[0..pos];
-            }
-
             fn allowedOrigin(ctx: *Context, cfg: CorsConfig) []const u8 {
                 const req_origin = ctx.header("Origin") orelse return cfg.allowed_origins[0];
                 for (cfg.allowed_origins) |o| {
@@ -87,20 +52,35 @@ pub fn cors(config: CorsConfig) Middleware {
                 return cfg.allowed_origins[0];
             }
 
+            fn methodNames(methods: []const types.Method) []const []const u8 {
+                // Methods are comptime-known slices; build a static list of their string names.
+                // Max 9 standard HTTP methods.
+                const S = struct {
+                    var names: [16][]const u8 = undefined;
+                };
+                for (methods, 0..) |m, i| {
+                    S.names[i] = m.toString();
+                }
+                return S.names[0..methods.len];
+            }
+
             fn handler(ctx: *Context, next: Next) anyerror!Response {
                 const origin = allowedOrigin(ctx, config);
                 try ctx.setHeader("Access-Control-Allow-Origin", origin);
                 try ctx.setHeader("Vary", "Origin");
 
-                var methods_buf: [256]u8 = undefined;
-                try ctx.setHeader("Access-Control-Allow-Methods", writeMethodList(&methods_buf, config.allowed_methods));
+                const methods_str = try common.joinStrings(ctx.allocator, methodNames(config.allowed_methods), ", ");
+                defer ctx.allocator.free(methods_str);
+                try ctx.setHeader("Access-Control-Allow-Methods", methods_str);
 
-                var headers_buf: [512]u8 = undefined;
-                try ctx.setHeader("Access-Control-Allow-Headers", writeCommaList(&headers_buf, config.allowed_headers));
+                const headers_str = try common.joinStrings(ctx.allocator, config.allowed_headers, ", ");
+                defer ctx.allocator.free(headers_str);
+                try ctx.setHeader("Access-Control-Allow-Headers", headers_str);
 
                 if (config.exposed_headers.len > 0) {
-                    var exposed_buf: [512]u8 = undefined;
-                    try ctx.setHeader("Access-Control-Expose-Headers", writeCommaList(&exposed_buf, config.exposed_headers));
+                    const exposed_str = try common.joinStrings(ctx.allocator, config.exposed_headers, ", ");
+                    defer ctx.allocator.free(exposed_str);
+                    try ctx.setHeader("Access-Control-Expose-Headers", exposed_str);
                 }
 
                 if (config.allow_credentials) {

@@ -198,7 +198,8 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.follow_redirects orelse self.config.follow_redirects;
+        const should_follow = reqOpts.follow_redirects orelse
+            (self.config.follow_redirects and self.config.redirect_policy.follow_redirects);
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
                 response.deinit();

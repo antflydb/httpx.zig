@@ -210,7 +210,7 @@ pub const Context = struct {
         if (trailers) |trailer_headers| {
             const trailer_names = try trailerHeaderNames(self.allocator, trailer_headers);
             defer self.allocator.free(trailer_names);
-            _ = try self.response.header("Trailer", trailer_names);
+            _ = try self.response.header(HeaderName.TRAILER, trailer_names);
         }
         _ = self.response.body(encoded);
         return self.response.build();
@@ -625,7 +625,7 @@ pub const Server = struct {
             try writer.writeAll("OPTIONS");
         }
 
-        try headers.set("Allow", allow.items);
+        try headers.set(HeaderName.ALLOW, allow.items);
     }
 
     const mw_exec_state_key = "__mw_exec_state";
@@ -697,18 +697,11 @@ fn isEncodedDot(path: []const u8, i: usize) bool {
 }
 
 fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    const writer = arrayListWriter(&out, allocator);
-
-    var first = true;
-    for (headers.entries.items) |h| {
-        if (!first) try writer.writeAll(", ");
-        first = false;
-        try writer.writeAll(h.name);
-    }
-
-    return out.toOwnedSlice(allocator);
+    const items = headers.entries.items;
+    const names = try allocator.alloc([]const u8, items.len);
+    defer allocator.free(names);
+    for (items, 0..) |h, i| names[i] = h.name;
+    return common.joinStrings(allocator, names, ", ");
 }
 
 test "Server initialization" {

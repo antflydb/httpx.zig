@@ -8,8 +8,13 @@ const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
 /// Monotonic millisecond timestamp for connection health and deadline tracking.
 pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
-        // mach_absolute_time returns nanoseconds on Apple Silicon.
-        return @intCast(std.c.mach_absolute_time() / std.time.ns_per_ms);
+        // mach_absolute_time returns ticks; convert via timebase info.
+        // On Apple Silicon numer/denom == 1/1, on Intel it differs.
+        var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
+        std.c.mach_timebase_info(&info);
+        const ticks = std.c.mach_absolute_time();
+        const ns: u64 = ticks * info.numer / info.denom;
+        return @intCast(ns / std.time.ns_per_ms);
     } else {
         var ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);

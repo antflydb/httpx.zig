@@ -56,6 +56,9 @@ pub const HeaderName = struct {
     pub const X_CONTENT_TYPE_OPTIONS = "X-Content-Type-Options";
     pub const X_FRAME_OPTIONS = "X-Frame-Options";
     pub const X_XSS_PROTECTION = "X-XSS-Protection";
+    pub const ALLOW = "Allow";
+    pub const TRAILER = "Trailer";
+    pub const HTTP2_SETTINGS = "HTTP2-Settings";
 };
 
 /// Represents a single HTTP header entry.
