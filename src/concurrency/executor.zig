@@ -157,18 +157,23 @@ pub const Executor = struct {
 };
 
 /// Future representing a pending result.
+/// Uses a condition variable for efficient, non-polling wait.
 pub fn Future(comptime T: type) type {
     return struct {
         result: ?T = null,
         error_val: ?anyerror = null,
         completed: bool = false,
+        mutex: Thread.Mutex = .{},
+        cond: Thread.Condition = .{},
 
         const Self = @This();
 
-        /// Waits for the future to complete.
+        /// Waits for the future to complete (blocks the calling thread).
         pub fn wait(self: *Self) !T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             while (!self.completed) {
-                std.time.sleep(1_000_000);
+                self.cond.wait(&self.mutex);
             }
             if (self.error_val) |err| {
                 return err;
@@ -176,16 +181,38 @@ pub fn Future(comptime T: type) type {
             return self.result.?;
         }
 
-        /// Returns the result if available.
-        pub fn get(self: *const Self) ?T {
+        /// Completes the future with a value.
+        pub fn complete(self: *Self, value: T) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.result = value;
+            self.completed = true;
+            self.cond.signal();
+        }
+
+        /// Completes the future with an error.
+        pub fn completeWithError(self: *Self, err: anyerror) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.error_val = err;
+            self.completed = true;
+            self.cond.signal();
+        }
+
+        /// Returns the result if available (non-blocking).
+        pub fn get(self: *Self) ?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             if (self.completed and self.error_val == null) {
                 return self.result;
             }
             return null;
         }
 
-        /// Returns true if the future is completed.
-        pub fn isDone(self: *const Self) bool {
+        /// Returns true if the future is completed (non-blocking).
+        pub fn isDone(self: *Self) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             return self.completed;
         }
     };
@@ -224,8 +251,7 @@ test "Future" {
     try std.testing.expect(!future.isDone());
     try std.testing.expect(future.get() == null);
 
-    future.result = 42;
-    future.completed = true;
+    future.complete(42);
 
     try std.testing.expect(future.isDone());
     try std.testing.expectEqual(@as(i32, 42), future.get().?);

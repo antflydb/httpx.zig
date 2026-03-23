@@ -233,9 +233,7 @@ pub const Client = struct {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
-                        const ns = delay_ms * std.time.ns_per_ms;
-                        const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-                        _ = std.c.nanosleep(&ts, null);
+                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .monotonic) catch {};
                     }
                     continue;
                 }
@@ -247,9 +245,7 @@ pub const Client = struct {
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
                 if (delay_ms > 0) {
-                    const ns = delay_ms * std.time.ns_per_ms;
-                    const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-                    _ = std.c.nanosleep(&ts, null);
+                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .monotonic) catch {};
                 }
                 continue;
             }
