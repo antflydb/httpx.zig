@@ -149,11 +149,22 @@ pub const Context = struct {
 
     /// Sends a file response.
     pub fn file(self: *Self, path: []const u8) !Response {
+        // Reject path traversal attempts.
+        if (mem.indexOf(u8, path, "..") != null) {
+            return self.status(403).text("Forbidden");
+        }
+
         const f = std.fs.cwd().openFile(path, .{}) catch return self.status(404).text("Not Found");
         defer f.close();
 
         const stat = try f.stat();
+        const max_file_size: u64 = 100 * 1024 * 1024; // 100 MB
+        if (stat.size > max_file_size) {
+            return self.status(413).text("File Too Large");
+        }
+
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
+        defer self.allocator.free(content);
         _ = try f.readAll(content);
 
         _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
@@ -377,13 +388,20 @@ pub const Server = struct {
             var buffer: [8192]u8 = undefined;
             var parser = Parser.init(self.allocator);
             defer parser.deinit();
+            parser.max_body_size = self.config.max_body_size;
 
             while (!parser.isComplete()) {
                 const n = try sock.recv(&buffer);
                 if (n == 0) return;
-                _ = try parser.feed(buffer[0..n]);
-                if (parser.getBody().len > self.config.max_body_size) {
-                    try self.sendError(&sock, 413);
+                _ = parser.feed(buffer[0..n]) catch |err| switch (err) {
+                    error.BodyTooLarge => {
+                        try self.sendError(&sock, 413);
+                        return;
+                    },
+                    else => return err,
+                };
+                if (parser.isError()) {
+                    try self.sendError(&sock, 400);
                     return;
                 }
             }

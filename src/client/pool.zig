@@ -88,6 +88,7 @@ pub const ConnectionPool = struct {
     config: PoolConfig,
     connections: std.ArrayListUnmanaged(Connection) = .empty,
     hosts_owned: std.ArrayListUnmanaged([]u8) = .empty,
+    mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 
@@ -119,7 +120,11 @@ pub const ConnectionPool = struct {
     }
 
     /// Gets or creates a connection to the specified host.
+    /// The returned pointer is stable while the connection is in use (acquired).
     pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         for (self.connections.items) |*conn| {
             if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
                 if (conn.isHealthy(self.config.idle_timeout_ms) and conn.requests_made < self.config.max_requests_per_connection) {
@@ -166,12 +171,19 @@ pub const ConnectionPool = struct {
 
     /// Releases a connection back to the pool.
     pub fn releaseConnection(self: *Self, conn: *Connection) void {
-        _ = self;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         conn.release();
     }
 
     /// Removes idle connections that have exceeded the timeout.
     pub fn cleanup(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cleanupLocked();
+    }
+
+    fn cleanupLocked(self: *Self) void {
         var i: usize = 0;
         while (i < self.connections.items.len) {
             const conn = &self.connections.items[i];

@@ -168,6 +168,7 @@ pub const ResponseBuilder = struct {
     status_code: u16 = 200,
     headers: Headers,
     body_data: ?[]const u8 = null,
+    body_owned: bool = false,
 
     const Self = @This();
 
@@ -181,7 +182,18 @@ pub const ResponseBuilder = struct {
 
     /// Releases builder resources.
     pub fn deinit(self: *Self) void {
+        self.freeOwnedBody();
         self.headers.deinit();
+    }
+
+    fn freeOwnedBody(self: *Self) void {
+        if (self.body_owned) {
+            if (self.body_data) |b| {
+                self.allocator.free(b);
+            }
+            self.body_owned = false;
+            self.body_data = null;
+        }
     }
 
     /// Sets the status code.
@@ -198,6 +210,7 @@ pub const ResponseBuilder = struct {
 
     /// Sets the response body.
     pub fn body(self: *Self, data: []const u8) *Self {
+        self.freeOwnedBody();
         self.body_data = data;
         return self;
     }
@@ -205,8 +218,10 @@ pub const ResponseBuilder = struct {
     /// Sets a JSON body with appropriate Content-Type.
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
+        self.freeOwnedBody();
         const serialized = try stringifyJsonAlloc(self.allocator, value, .{});
         self.body_data = serialized;
+        self.body_owned = true;
         return self;
     }
 

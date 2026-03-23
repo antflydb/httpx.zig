@@ -31,6 +31,7 @@ pub const Handler = *const fn (*@import("server.zig").Context) anyerror!@import(
 const Route = struct {
     method: types.Method,
     pattern: []const u8,
+    pattern_owned: bool = false,
     segments: []const Segment,
     handler: Handler,
 };
@@ -58,6 +59,9 @@ pub const Router = struct {
     pub fn deinit(self: *Self) void {
         for (self.routes.items) |route| {
             self.allocator.free(route.segments);
+            if (route.pattern_owned) {
+                self.allocator.free(route.pattern);
+            }
         }
         self.routes.deinit(self.allocator);
     }
@@ -68,6 +72,20 @@ pub const Router = struct {
         try self.routes.append(self.allocator, .{
             .method = method,
             .pattern = pattern,
+            .segments = segments,
+            .handler = handler,
+        });
+    }
+
+    /// Adds a route with an owned (duped) pattern string.
+    fn addOwned(self: *Self, method: types.Method, pattern: []const u8, handler: Handler) !void {
+        const owned = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(owned);
+        const segments = try self.parsePattern(owned);
+        try self.routes.append(self.allocator, .{
+            .method = method,
+            .pattern = owned,
+            .pattern_owned = true,
             .segments = segments,
             .handler = handler,
         });
@@ -201,7 +219,7 @@ pub const RouteGroup = struct {
         try full_path.appendSlice(self.router.allocator, self.prefix);
         try full_path.appendSlice(self.router.allocator, path);
 
-        try self.router.add(method, full_path.items, handler);
+        try self.router.addOwned(method, full_path.items, handler);
     }
 
     /// Adds a GET route.

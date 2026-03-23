@@ -605,11 +605,27 @@ pub const DecodedHeader = struct {
     value: []u8,
 };
 
-/// Decodes a header block using HPACK.
+/// Limits for HPACK header decoding.
+pub const DecodeHeadersOptions = struct {
+    max_headers: usize = 256,
+    max_decoded_size: usize = 256 * 1024, // 256 KB
+};
+
+/// Decodes a header block using HPACK with default limits.
 pub fn decodeHeaders(
     ctx: *HpackContext,
     data: []const u8,
     allocator: Allocator,
+) ![]DecodedHeader {
+    return decodeHeadersWithOptions(ctx, data, allocator, .{});
+}
+
+/// Decodes a header block using HPACK with configurable limits.
+pub fn decodeHeadersWithOptions(
+    ctx: *HpackContext,
+    data: []const u8,
+    allocator: Allocator,
+    options: DecodeHeadersOptions,
 ) ![]DecodedHeader {
     var headers = std.ArrayListUnmanaged(DecodedHeader).empty;
     errdefer {
@@ -621,8 +637,11 @@ pub fn decodeHeaders(
     }
 
     var offset: usize = 0;
+    var total_decoded_size: usize = 0;
 
     while (offset < data.len) {
+        if (headers.items.len >= options.max_headers) return error.TooManyHeaders;
+
         const first = data[offset];
 
         if (first & 0x80 != 0) {
@@ -631,6 +650,8 @@ pub fn decodeHeaders(
             offset += idx_result.len;
 
             const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
+            total_decoded_size += entry.name.len + entry.value.len;
+            if (total_decoded_size > options.max_decoded_size) return error.HeaderBlockTooLarge;
             try headers.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
@@ -654,6 +675,12 @@ pub fn decodeHeaders(
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
+            total_decoded_size += name.len + value_result.value.len;
+            if (total_decoded_size > options.max_decoded_size) {
+                allocator.free(name);
+                allocator.free(value_result.value);
+                return error.HeaderBlockTooLarge;
+            }
             try ctx.dynamic_table.add(name, value_result.value);
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
@@ -681,6 +708,12 @@ pub fn decodeHeaders(
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
+            total_decoded_size += name.len + value_result.value.len;
+            if (total_decoded_size > options.max_decoded_size) {
+                allocator.free(name);
+                allocator.free(value_result.value);
+                return error.HeaderBlockTooLarge;
+            }
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         }
     }

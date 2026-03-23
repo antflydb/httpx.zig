@@ -58,6 +58,8 @@ pub const Http1Connection = struct {
     writer: std.io.AnyWriter,
     version: types.Version = .HTTP_1_1,
     keep_alive: bool = true,
+    max_response_body_size: usize = 100 * 1024 * 1024, // 100 MB
+    max_headers: usize = 256,
 
     const Self = @This();
 
@@ -108,9 +110,13 @@ pub const Http1Connection = struct {
         var response = Response.init(self.allocator, status_code);
         errdefer response.deinit();
 
+        var header_count: usize = 0;
         while (true) {
             const header_line = try self.readLine(&line_buf);
             if (header_line.len == 0) break;
+
+            header_count += 1;
+            if (header_count > self.max_headers) return error.TooManyHeaders;
 
             if (mem.indexOf(u8, header_line, ":")) |sep| {
                 const name = mem.trim(u8, header_line[0..sep], " \t");
@@ -144,7 +150,9 @@ pub const Http1Connection = struct {
 
     /// Reads a fixed number of bytes from the stream.
     fn readFixedBody(self: *Self, length: u64) ![]u8 {
+        if (length > self.max_response_body_size) return error.ResponseBodyTooLarge;
         const body = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(body);
         var read: usize = 0;
         while (read < length) {
             const n = try self.reader.read(body[read..]);
@@ -157,13 +165,18 @@ pub const Http1Connection = struct {
     /// Decodes a chunked transfer encoded body.
     fn readChunkedBody(self: *Self) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(self.allocator);
         var line_buf: [256]u8 = undefined;
+        var total_size: usize = 0;
 
         while (true) {
             const size_line = try self.readLine(&line_buf);
             const chunk_size = try std.fmt.parseInt(usize, size_line, 16);
 
             if (chunk_size == 0) break;
+
+            total_size += chunk_size;
+            if (total_size > self.max_response_body_size) return error.ResponseBodyTooLarge;
 
             const chunk = try self.allocator.alloc(u8, chunk_size);
             defer self.allocator.free(chunk);
@@ -186,7 +199,9 @@ pub const Http1Connection = struct {
     /// Reads all remaining data until the connection is closed by the peer.
     fn readUntilClose(self: *Self) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(self.allocator);
         var buf: [4096]u8 = undefined;
+        var total_size: usize = 0;
 
         while (true) {
             const n = self.reader.read(&buf) catch |err| switch (err) {
@@ -194,6 +209,8 @@ pub const Http1Connection = struct {
                 else => return err,
             };
             if (n == 0) break;
+            total_size += n;
+            if (total_size > self.max_response_body_size) return error.ResponseBodyTooLarge;
             try result.appendSlice(self.allocator, buf[0..n]);
         }
 
