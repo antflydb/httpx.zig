@@ -116,10 +116,7 @@ pub const Response = struct {
         try resp.headers.set(HeaderName.CONTENT_TYPE, "text/plain; charset=utf-8");
         resp.body = try allocator.dupe(u8, text_body);
         resp.body_owned = true;
-
-        var len_buf: [32]u8 = undefined;
-        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{text_body.len}) catch unreachable;
-        try resp.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+        try resp.headers.setContentLength(text_body.len);
         return resp;
     }
 
@@ -131,9 +128,7 @@ pub const Response = struct {
         resp.body_owned = true;
 
         if (resp.body) |b| {
-            var len_buf: [32]u8 = undefined;
-            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{b.len}) catch unreachable;
-            try resp.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+            try resp.headers.setContentLength(b.len);
         }
         return resp;
     }
@@ -255,9 +250,7 @@ pub const ResponseBuilder = struct {
             response.body_owned = true;
 
             if (!response.headers.isChunked()) {
-                var len_buf: [32]u8 = undefined;
-                const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{b.len}) catch unreachable;
-                try response.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+                try response.headers.setContentLength(b.len);
             }
         }
 

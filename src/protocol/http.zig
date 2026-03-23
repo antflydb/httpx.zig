@@ -58,7 +58,7 @@ pub const Http1Connection = struct {
     writer: std.io.AnyWriter,
     version: types.Version = .HTTP_1_1,
     keep_alive: bool = true,
-    max_response_body_size: usize = 100 * 1024 * 1024, // 100 MB
+    max_response_body_size: usize = types.default_max_body_size,
     max_headers: usize = 256,
 
     const Self = @This();
@@ -79,25 +79,9 @@ pub const Http1Connection = struct {
     }
 
     /// Serializes and writes the request to the underlying connection.
+    /// Delegates to Request.serialize to ensure a single serialization path.
     fn writeRequest(self: *Self, req: *const Request) !void {
-        const method_str = req.method.toString();
-        const path = req.uri.path;
-        const version_str = req.version.toString();
-
-        try self.writer.print("{s} {s}", .{ method_str, path });
-        if (req.uri.query) |q| {
-            try self.writer.print("?{s}", .{q});
-        }
-        try self.writer.print(" {s}\r\n", .{version_str});
-
-        for (req.headers.entries.items) |h| {
-            try self.writer.print("{s}: {s}\r\n", .{ h.name, h.value });
-        }
-        try self.writer.writeAll("\r\n");
-
-        if (req.body) |body| {
-            try self.writer.writeAll(body);
-        }
+        try req.serialize(self.writer);
     }
 
     /// parse and construct the response object from the network stream.
@@ -178,17 +162,15 @@ pub const Http1Connection = struct {
             total_size += chunk_size;
             if (total_size > self.max_response_body_size) return error.ResponseBodyTooLarge;
 
-            const chunk = try self.allocator.alloc(u8, chunk_size);
-            defer self.allocator.free(chunk);
+            const start = result.items.len;
+            try result.resize(self.allocator, start + chunk_size);
 
             var read: usize = 0;
             while (read < chunk_size) {
-                const n = try self.reader.read(chunk[read..]);
+                const n = try self.reader.read(result.items[start + read .. start + chunk_size]);
                 if (n == 0) return error.UnexpectedEof;
                 read += n;
             }
-
-            try result.appendSlice(self.allocator, chunk);
             _ = try self.readLine(&line_buf);
         }
 
@@ -346,14 +328,7 @@ pub const Http2Connection = struct {
 
     const Self = @This();
 
-    pub const Http2ConnectionSettings = struct {
-        header_table_size: u32 = 4096,
-        enable_push: bool = true,
-        max_concurrent_streams: u32 = 100,
-        initial_window_size: u32 = 65535,
-        max_frame_size: u32 = 16384,
-        max_header_list_size: u32 = 8192,
-    };
+    pub const Http2ConnectionSettings = types.Http2Settings;
 
     pub const Frame = struct {
         header: Http2FrameHeader,
@@ -465,7 +440,8 @@ pub fn applySettingsPayload(settings: *Http2Connection.Http2ConnectionSettings, 
         const id = readU16BE(payload[i..][0..2]);
         const value = readU32BE(payload[i..][2..6]);
 
-        switch (@as(Http2Settings, @enumFromInt(id))) {
+        const setting = std.enums.fromInt(Http2Settings, id) orelse continue;
+        switch (setting) {
             .header_table_size => settings.header_table_size = value,
             .enable_push => settings.enable_push = (value != 0),
             .max_concurrent_streams => settings.max_concurrent_streams = value,
@@ -477,23 +453,19 @@ pub fn applySettingsPayload(settings: *Http2Connection.Http2ConnectionSettings, 
 }
 
 fn writeU16BE(buf: *[6]u8, v: u16) void {
-    buf[0] = @intCast((v >> 8) & 0xFF);
-    buf[1] = @intCast(v & 0xFF);
+    buf[0..2].* = std.mem.toBytes(std.mem.nativeTo(u16, v, .big));
 }
 
-fn readU16BE(buf: []const u8) u16 {
-    return (@as(u16, buf[0]) << 8) | buf[1];
+fn readU16BE(buf: *const [2]u8) u16 {
+    return std.mem.readInt(u16, buf, .big);
 }
 
-fn writeU32BE(buf: []u8, v: u32) void {
-    buf[0] = @intCast((v >> 24) & 0xFF);
-    buf[1] = @intCast((v >> 16) & 0xFF);
-    buf[2] = @intCast((v >> 8) & 0xFF);
-    buf[3] = @intCast(v & 0xFF);
+fn writeU32BE(buf: *[4]u8, v: u32) void {
+    buf.* = std.mem.toBytes(std.mem.nativeTo(u32, v, .big));
 }
 
-fn readU32BE(buf: []const u8) u32 {
-    return (@as(u32, buf[0]) << 24) | (@as(u32, buf[1]) << 16) | (@as(u32, buf[2]) << 8) | buf[3];
+fn readU32BE(buf: *const [4]u8) u32 {
+    return std.mem.readInt(u32, buf, .big);
 }
 
 /// HTTP/3 frame types as defined in RFC 9114.

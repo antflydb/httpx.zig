@@ -26,36 +26,6 @@ pub const Middleware = struct {
 /// Next function to call the next middleware.
 pub const Next = *const fn (*Context) anyerror!Response;
 
-/// Middleware chain executor.
-pub const MiddlewareChain = struct {
-    middlewares: []const Middleware,
-    final_handler: *const fn (*Context) anyerror!Response,
-    current: usize = 0,
-
-    const Self = @This();
-    const chain_state_key = "__middleware_chain_state";
-
-    /// Executes the middleware chain.
-    pub fn execute(self: *Self, ctx: *Context) anyerror!Response {
-        try ctx.data.put(chain_state_key, .{ .ptr = @ptrCast(self) });
-        defer _ = ctx.data.remove(chain_state_key);
-        return next(ctx);
-    }
-
-    fn next(ctx: *Context) anyerror!Response {
-        const entry = ctx.data.get(chain_state_key) orelse return error.MissingMiddlewareChainState;
-        const chain: *Self = @ptrCast(@alignCast(entry.ptr));
-
-        if (chain.current < chain.middlewares.len) {
-            const mw = chain.middlewares[chain.current];
-            chain.current += 1;
-            return mw.handler(ctx, next);
-        }
-
-        return chain.final_handler(ctx);
-    }
-};
-
 /// CORS configuration.
 pub const CorsConfig = struct {
     allowed_origins: []const []const u8 = &[_][]const u8{"*"},
@@ -188,13 +158,19 @@ pub fn helmet() Middleware {
 }
 
 /// Creates request ID middleware.
+/// Generates a unique hex ID per request using a monotonic counter.
 pub fn requestId() Middleware {
     return .{
         .name = "request_id",
         .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                try ctx.setHeader("X-Request-ID", "generated-id");
-                return next(ctx);
+            var counter = std.atomic.Value(u64).init(0);
+
+            fn handler(ctx: *Context, next_handler: Next) anyerror!Response {
+                const id = counter.fetchAdd(1, .monotonic);
+                var buf: [16]u8 = undefined;
+                const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{id}) catch unreachable;
+                try ctx.setHeader("X-Request-ID", hex);
+                return next_handler(ctx);
             }
         }.handler,
     };

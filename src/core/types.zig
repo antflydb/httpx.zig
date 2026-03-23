@@ -364,6 +364,9 @@ pub const RedirectPolicy = struct {
     }
 };
 
+/// Default maximum body/response size (100 MB).
+pub const default_max_body_size: usize = 100 * 1024 * 1024;
+
 /// HTTP/2 specific settings as defined in RFC 7540.
 pub const Http2Settings = struct {
     header_table_size: u32 = 4096,

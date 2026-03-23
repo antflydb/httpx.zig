@@ -190,6 +190,13 @@ pub const Headers = struct {
         return new_headers;
     }
 
+    /// Sets the Content-Length header from a numeric value.
+    pub fn setContentLength(self: *Self, len: usize) !void {
+        var buf: [32]u8 = undefined;
+        const str = std.fmt.bufPrint(&buf, "{d}", .{len}) catch unreachable;
+        try self.set(HeaderName.CONTENT_LENGTH, str);
+    }
+
     /// Parses Content-Length header value.
     pub fn getContentLength(self: *const Self) ?u64 {
         const value = self.get(HeaderName.CONTENT_LENGTH) orelse return null;
@@ -233,13 +240,7 @@ pub const Headers = struct {
 };
 
 /// Case-insensitive string comparison for ASCII.
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
+const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
 
 /// Returns true if `header_value` contains `token` as a comma-separated,
 /// whitespace-trimmed, case-insensitive token per RFC 7230 §3.2.6.

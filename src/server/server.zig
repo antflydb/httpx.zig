@@ -51,7 +51,7 @@ pub const ServerConfig = struct {
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
     max_headers: usize = 100,
-    max_file_size: usize = 100 * 1024 * 1024,
+    max_file_size: usize = types.default_max_body_size,
     request_timeout_ms: u64 = 30_000,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
@@ -66,7 +66,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(DataEntry),
-    max_file_size: usize = 100 * 1024 * 1024,
+    max_file_size: usize = types.default_max_body_size,
 
     /// Entry in the context data map with an optional destructor for cleanup.
     pub const DataEntry = struct {
@@ -435,6 +435,11 @@ pub const Server = struct {
         var sock = socket;
         defer sock.close();
 
+        var parser = Parser.init(self.allocator);
+        defer parser.deinit();
+        parser.max_body_size = self.config.max_body_size;
+        parser.max_headers = self.config.max_headers;
+
         var first_request = true;
         while (self.running) {
             const timeout_ms = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
@@ -443,10 +448,7 @@ pub const Server = struct {
             }
 
             var buffer: [8192]u8 = undefined;
-            var parser = Parser.init(self.allocator);
-            defer parser.deinit();
-            parser.max_body_size = self.config.max_body_size;
-            parser.max_headers = self.config.max_headers;
+            parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
             // trickles bytes just fast enough to avoid per-recv timeouts.
@@ -597,9 +599,7 @@ pub const Server = struct {
         if (response.headers.isChunked()) return;
 
         const body_len: usize = if (response.body) |b| b.len else 0;
-        var len_buf: [32]u8 = undefined;
-        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body_len}) catch unreachable;
-        try response.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+        try response.headers.setContentLength(body_len);
     }
 
     /// Sets the `Allow` header for automatic OPTIONS and 405 responses.

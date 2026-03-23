@@ -83,10 +83,7 @@ pub const Request = struct {
         }
         self.body = try self.allocator.dupe(u8, body);
         self.body_owned = true;
-
-        var len_buf: [32]u8 = undefined;
-        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
-        try self.headers.set(HeaderName.CONTENT_LENGTH, len_str);
+        try self.headers.setContentLength(body.len);
     }
 
     /// Sets the request body as JSON with appropriate headers.

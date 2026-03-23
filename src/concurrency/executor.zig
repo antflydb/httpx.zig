@@ -95,9 +95,21 @@ pub const Executor = struct {
         self.running = true;
 
         self.threads = try self.allocator.alloc(Thread, self.config.num_threads);
+        var spawned: usize = 0;
+        errdefer {
+            // On partial spawn failure, join already-started threads and free.
+            self.mutex.lock();
+            self.running = false;
+            self.cond.broadcast();
+            self.mutex.unlock();
+            for (self.threads[0..spawned]) |thread| thread.join();
+            self.allocator.free(self.threads);
+            self.threads = &.{};
+        }
 
         for (self.threads) |*thread| {
             thread.* = try Thread.spawn(.{}, workerLoop, .{self});
+            spawned += 1;
         }
     }
 

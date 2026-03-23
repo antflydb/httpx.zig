@@ -41,7 +41,7 @@ pub const ClientConfig = struct {
     redirect_policy: types.RedirectPolicy = .{},
     default_headers: ?[]const [2][]const u8 = null,
     user_agent: []const u8 = meta.default_user_agent,
-    max_response_size: usize = 100 * 1024 * 1024,
+    max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     follow_redirects: bool = true,
     verify_ssl: bool = true,
@@ -454,7 +454,7 @@ pub const Client = struct {
         parser.headers = Headers.init(parser.allocator);
 
         if (parser.getBody().len > 0) {
-            res.body = try parser.allocator.dupe(u8, parser.getBody());
+            res.body = try parser.body_buffer.toOwnedSlice(parser.allocator);
             res.body_owned = true;
         }
 
