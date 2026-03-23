@@ -14,6 +14,8 @@ const Io = std.Io;
 
 const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
+const TlsConfig = @import("../tls/tls.zig").TlsConfig;
+const TlsSession = @import("../tls/tls.zig").TlsSession;
 
 /// Monotonic millisecond timestamp for connection health tracking.
 fn milliTimestamp() i64 {
@@ -110,6 +112,7 @@ pub const ConnectionPool = struct {
     config: PoolConfig,
     connections: std.ArrayListUnmanaged(*Connection) = .empty,
     mutex: Io.Mutex = Io.Mutex.init,
+    last_cleanup: i64 = 0,
 
     const Self = @This();
 
@@ -143,6 +146,13 @@ pub const ConnectionPool = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
+
+            // Periodic cleanup: evict stale/broken connections.
+            const now = milliTimestamp();
+            if (now - self.last_cleanup > self.config.health_check_interval_ms) {
+                self.cleanupLocked();
+                self.last_cleanup = now;
+            }
 
             for (self.connections.items) |conn| {
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
@@ -217,6 +227,12 @@ pub const ConnectionPool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         conn.release();
+        // Opportunistic cleanup on release.
+        const now = milliTimestamp();
+        if (now - self.last_cleanup > self.config.health_check_interval_ms) {
+            self.cleanupLocked();
+            self.last_cleanup = now;
+        }
     }
 
     /// Removes a specific connection from the pool and frees its resources.
@@ -297,6 +313,287 @@ pub const ConnectionPool = struct {
     }
 };
 
+/// A pooled TLS connection bundle.
+///
+/// Heap-allocated for pointer stability: `TlsSession` stores internal pointers
+/// to its `SocketIoReader`/`SocketIoWriter`, which in turn reference the `Socket`
+/// via `@fieldParentPtr`.  Moving the struct in memory would invalidate those
+/// pointers, so every entry lives at a stable heap address.
+pub const TlsConnection = struct {
+    socket: Socket,
+    session: TlsSession,
+    host: []const u8,
+    port: u16,
+    in_use: bool = false,
+    broken: bool = false,
+    created_at: i64,
+    last_used: i64,
+    requests_made: u32 = 0,
+
+    const Self = @This();
+
+    /// Marks the connection as in use.
+    pub fn acquire(self: *Self) void {
+        self.in_use = true;
+        self.last_used = milliTimestamp();
+    }
+
+    /// Releases the connection back to the pool.
+    pub fn release(self: *Self) void {
+        self.in_use = false;
+        self.last_used = milliTimestamp();
+        self.requests_made += 1;
+    }
+
+    /// Returns true if the connection is healthy and reusable.
+    pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
+        if (self.in_use) return false;
+        if (self.broken) return false;
+        if (!self.session.connected) return false;
+        const idle_time = milliTimestamp() - self.last_used;
+        return idle_time < max_idle_ms;
+    }
+
+    /// Marks this connection as broken so it will not be reused.
+    pub fn markBroken(self: *Self) void {
+        self.broken = true;
+    }
+
+    /// Returns true if this connection should be evicted from the pool.
+    pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests: u32) bool {
+        if (self.in_use) return false;
+        if (self.broken) return true;
+        if (!self.session.connected) return true;
+        if (self.requests_made >= max_requests) return true;
+        const idle_time = milliTimestamp() - self.last_used;
+        return idle_time >= idle_timeout_ms;
+    }
+
+    /// Tears down TLS session and closes the underlying socket.
+    pub fn close(self: *Self) void {
+        self.session.deinit();
+        self.socket.close();
+    }
+};
+
+/// TLS connection pool.
+///
+/// Manages a set of heap-allocated `TlsConnection` entries keyed by
+/// (host, port).  Each entry owns a live TCP socket with a completed TLS
+/// handshake, so subsequent HTTPS requests to the same origin skip both
+/// TCP connect and TLS negotiation.
+pub const TlsPool = struct {
+    allocator: Allocator,
+    io: Io,
+    config: PoolConfig,
+    verify_ssl: bool = true,
+    connections: std.ArrayListUnmanaged(*TlsConnection) = .empty,
+    mutex: Io.Mutex = Io.Mutex.init,
+    last_cleanup: i64 = 0,
+
+    const Self = @This();
+
+    /// Creates a TLS connection pool with the given configuration.
+    pub fn initWithConfig(allocator: Allocator, io: Io, config: PoolConfig, verify_ssl: bool) Self {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .verify_ssl = verify_ssl,
+        };
+    }
+
+    /// Releases all pool resources.
+    pub fn deinit(self: *Self) void {
+        for (self.connections.items) |entry| {
+            entry.close();
+            self.allocator.free(entry.host);
+            self.allocator.destroy(entry);
+        }
+        self.connections.deinit(self.allocator);
+    }
+
+    /// Gets an idle TLS connection for `(host, port)`, or creates a new one.
+    ///
+    /// The returned `*TlsConnection` is heap-allocated and marked in-use.
+    /// Callers must call `releaseConnection` or `evictConnection` when done.
+    pub fn getConnection(self: *Self, host: []const u8, port: u16) !*TlsConnection {
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            // Periodic cleanup of stale entries.
+            const now = milliTimestamp();
+            if (now - self.last_cleanup > self.config.health_check_interval_ms) {
+                self.cleanupLocked();
+                self.last_cleanup = now;
+            }
+
+            for (self.connections.items) |entry| {
+                if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
+                    if (entry.isHealthy(self.config.idle_timeout_ms) and
+                        entry.requests_made < self.config.max_requests_per_connection)
+                    {
+                        entry.acquire();
+                        return entry;
+                    }
+                }
+            }
+
+            if (self.totalCount() >= self.config.max_connections) return PoolError.PoolExhausted;
+
+            var host_count: u32 = 0;
+            for (self.connections.items) |entry| {
+                if (std.mem.eql(u8, entry.host, host) and entry.port == port) host_count += 1;
+            }
+            if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+        }
+
+        // Create outside the mutex — DNS, TCP connect, and TLS handshake may block.
+        return self.createConnection(host, port);
+    }
+
+    /// Creates a new TLS connection: DNS resolve, TCP connect, TLS handshake.
+    fn createConnection(self: *Self, host: []const u8, port: u16) !*TlsConnection {
+        const host_owned = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_owned);
+
+        const entry = try self.allocator.create(TlsConnection);
+        errdefer self.allocator.destroy(entry);
+
+        // Resolve and connect the TCP socket.
+        const addr = try Address.resolve(self.io, host, port);
+        entry.socket = try Socket.connect(addr, self.io);
+        errdefer entry.socket.close();
+
+        // Initialize the TLS session.  The session's handshake method stores
+        // internal pointers to entry.socket (via SocketIoReader/Writer stored
+        // in entry.session.net_in/net_out), so the entry must already live at
+        // its final heap address — which it does, because we created it above.
+        const tls_cfg = if (self.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        entry.session = TlsSession.init(tls_cfg, self.io);
+        errdefer entry.session.deinit();
+
+        entry.session.attachSocket(&entry.socket);
+        try entry.session.handshake(host);
+
+        const now = milliTimestamp();
+        entry.host = host_owned;
+        entry.port = port;
+        entry.in_use = true;
+        entry.broken = false;
+        entry.created_at = now;
+        entry.last_used = now;
+        entry.requests_made = 0;
+
+        // Insert into the pool under the mutex.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.connections.items.len >= self.config.max_connections) {
+            return PoolError.PoolExhausted;
+        }
+        var recheck_host_count: u32 = 0;
+        for (self.connections.items) |c| {
+            if (std.mem.eql(u8, c.host, host) and c.port == port) recheck_host_count += 1;
+        }
+        if (recheck_host_count >= self.config.max_per_host) {
+            return PoolError.PoolExhaustedForHost;
+        }
+
+        try self.connections.append(self.allocator, entry);
+        return entry;
+    }
+
+    /// Releases a TLS connection back to the pool for reuse.
+    pub fn releaseConnection(self: *Self, entry: *TlsConnection) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        entry.release();
+        const now = milliTimestamp();
+        if (now - self.last_cleanup > self.config.health_check_interval_ms) {
+            self.cleanupLocked();
+            self.last_cleanup = now;
+        }
+    }
+
+    /// Removes a TLS connection from the pool and frees all its resources.
+    pub fn evictConnection(self: *Self, entry: *TlsConnection) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        for (self.connections.items, 0..) |c, i| {
+            if (c == entry) {
+                _ = self.connections.swapRemove(i);
+                break;
+            }
+        }
+
+        entry.close();
+        self.allocator.free(entry.host);
+        self.allocator.destroy(entry);
+    }
+
+    /// Removes stale/broken TLS connections.
+    pub fn cleanup(self: *Self) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.cleanupLocked();
+    }
+
+    fn cleanupLocked(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.connections.items.len) {
+            const entry = self.connections.items[i];
+            if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection)) {
+                entry.close();
+                self.allocator.free(entry.host);
+                self.allocator.destroy(entry);
+                _ = self.connections.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Returns the number of active TLS connections.
+    pub fn activeCount(self: *const Self) usize {
+        var count: usize = 0;
+        for (self.connections.items) |entry| {
+            if (entry.in_use) count += 1;
+        }
+        return count;
+    }
+
+    /// Returns the total number of TLS connections.
+    pub fn totalCount(self: *const Self) usize {
+        return self.connections.items.len;
+    }
+
+    /// Returns the number of idle TLS connections.
+    pub fn idleCount(self: *const Self) usize {
+        return self.totalCount() - self.activeCount();
+    }
+
+    /// Returns the number of TLS connections for a specific host/port pair.
+    pub fn hostConnectionCount(self: *const Self, host: []const u8, port: u16) usize {
+        var count: usize = 0;
+        for (self.connections.items) |entry| {
+            if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Returns a snapshot of total/active/idle pool counts.
+    pub fn stats(self: *const Self) PoolStats {
+        const total = self.totalCount();
+        const active = self.activeCount();
+        return .{ .total = total, .active = active, .idle = total - active };
+    }
+};
+
 test "ConnectionPool initialization" {
     const allocator = std.testing.allocator;
     var pool_inst = ConnectionPool.init(allocator, std.testing.io);
@@ -361,4 +658,58 @@ test "ConnectionPool mutex prevents data races" {
     pool_inst.cleanup();
     const s = pool_inst.stats();
     try std.testing.expectEqual(@as(usize, 0), s.total);
+}
+
+test "TlsConnection health check basics" {
+    const now = milliTimestamp();
+    // We cannot construct a real TlsConnection without a network peer, so
+    // test the health-check logic by inspecting flag combinations on a
+    // zero-initialized stub (socket/session fields are not touched by the
+    // health predicates).
+    var entry: TlsConnection = undefined;
+    entry.in_use = false;
+    entry.broken = false;
+    entry.session.connected = true;
+    entry.last_used = now;
+    entry.requests_made = 0;
+    entry.created_at = now;
+
+    // Healthy idle connection.
+    try std.testing.expect(entry.isHealthy(60_000));
+
+    // In-use connection is not considered healthy (for pool reuse).
+    entry.in_use = true;
+    try std.testing.expect(!entry.isHealthy(60_000));
+    entry.in_use = false;
+
+    // Broken connection.
+    entry.broken = true;
+    try std.testing.expect(!entry.isHealthy(60_000));
+    entry.broken = false;
+
+    // Disconnected TLS session.
+    entry.session.connected = false;
+    try std.testing.expect(!entry.isHealthy(60_000));
+}
+
+test "TlsPool initialization and stats" {
+    const allocator = std.testing.allocator;
+    var tls_pool = TlsPool.initWithConfig(allocator, std.testing.io, .{}, true);
+    defer tls_pool.deinit();
+
+    const s = tls_pool.stats();
+    try std.testing.expectEqual(@as(usize, 0), s.total);
+    try std.testing.expectEqual(@as(usize, 0), s.active);
+    try std.testing.expectEqual(@as(usize, 0), s.idle);
+    try std.testing.expectEqual(@as(usize, 0), tls_pool.hostConnectionCount("example.com", 443));
+}
+
+test "TlsPool cleanup on empty pool" {
+    const allocator = std.testing.allocator;
+    var tls_pool = TlsPool.initWithConfig(allocator, std.testing.io, .{}, true);
+    defer tls_pool.deinit();
+
+    // Should not panic on an empty pool.
+    tls_pool.cleanup();
+    try std.testing.expectEqual(@as(usize, 0), tls_pool.totalCount());
 }

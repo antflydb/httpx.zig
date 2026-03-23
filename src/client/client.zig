@@ -29,7 +29,10 @@ const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const ConnectionPool = @import("pool.zig").ConnectionPool;
+const TlsPool = @import("pool.zig").TlsPool;
+const TlsConnection = @import("pool.zig").TlsConnection;
 const common = @import("../util/common.zig");
+const flate = std.compress.flate;
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
@@ -82,6 +85,7 @@ pub const Client = struct {
     cookies: std.StringHashMapUnmanaged([]const u8) = .{},
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
+    tls_pool: TlsPool,
 
     const Self = @This();
 
@@ -92,14 +96,16 @@ pub const Client = struct {
 
     /// Creates a new HTTP client with custom configuration.
     pub fn initWithConfig(allocator: Allocator, io: Io, config: ClientConfig) Self {
+        const pool_cfg = @import("pool.zig").PoolConfig{
+            .max_connections = config.pool_max_connections,
+            .max_per_host = config.pool_max_per_host,
+        };
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
-            .pool = ConnectionPool.initWithConfig(allocator, io, .{
-                .max_connections = config.pool_max_connections,
-                .max_per_host = config.pool_max_per_host,
-            }),
+            .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg),
+            .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, config.verify_ssl),
         };
     }
 
@@ -113,6 +119,7 @@ pub const Client = struct {
         }
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
+        self.tls_pool.deinit();
     }
 
     /// Adds an interceptor to the client.
@@ -165,6 +172,11 @@ pub const Client = struct {
 
         if (reqOpts.json) |json_body| {
             try req.setJson(json_body);
+        }
+
+        // Request compressed responses unless the caller already set Accept-Encoding.
+        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
+            try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
         try self.attachCookies(&req);
@@ -262,7 +274,39 @@ pub const Client = struct {
         defer self.allocator.free(request_data);
 
         if (req.uri.isTls()) {
-            // TLS pooling requires keeping a live TLS session; not implemented yet.
+            if (self.config.keep_alive) {
+                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var ok = false;
+                defer {
+                    if (ok) {
+                        self.tls_pool.releaseConnection(tls_conn);
+                    } else {
+                        self.tls_pool.evictConnection(tls_conn);
+                    }
+                }
+
+                if (timeout_ms > 0) {
+                    try tls_conn.socket.setRecvTimeout(timeout_ms);
+                }
+                if (write_timeout_ms > 0) {
+                    try tls_conn.socket.setSendTimeout(write_timeout_ms);
+                }
+
+                const w = try tls_conn.session.getWriter();
+                try w.writeAll(request_data);
+
+                const r = try tls_conn.session.getReader();
+                var res = try self.readResponseFromIo(r);
+
+                if (!res.headers.isKeepAlive(.HTTP_1_1)) {
+                    ok = false;
+                } else {
+                    ok = true;
+                }
+                return res;
+            }
+
+            // Non-pooled TLS fallback (keep_alive disabled).
             const addr = try Address.resolve(self.io, host, port);
 
             var socket = try Socket.connect(addr, self.io);
@@ -439,7 +483,6 @@ pub const Client = struct {
     }
 
     fn responseFromParser(self: *Self, parser: *Parser) !Response {
-        _ = self;
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -454,7 +497,63 @@ pub const Client = struct {
             res.body_owned = true;
         }
 
+        // Transparently decompress gzip/deflate responses.
+        if (res.body) |compressed_body| {
+            if (res.headers.get(HeaderName.CONTENT_ENCODING)) |enc| {
+                const container: ?flate.Container =
+                    if (std.ascii.eqlIgnoreCase(enc, "gzip")) .gzip
+                    else if (std.ascii.eqlIgnoreCase(enc, "deflate")) .zlib
+                    else null;
+
+                if (container) |ctr| {
+                    if (self.decompressBody(compressed_body, ctr)) |decompressed| {
+                        if (res.body_owned) {
+                            res.allocator.free(compressed_body);
+                        }
+                        res.body = decompressed;
+                        res.body_owned = true;
+                        // Body is now plain; remove encoding/length so callers
+                        // see the uncompressed view.
+                        _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+                        _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
+                    } else |_| {
+                        // Decompression failed — return the raw body as-is.
+                    }
+                }
+            }
+        }
+
         return res;
+    }
+
+    /// Decompress a gzip or deflate (zlib) body that is already fully in memory.
+    fn decompressBody(self: *Self, body: []const u8, container: flate.Container) ![]u8 {
+        // Build a SliceIoReader over the compressed bytes.
+        var reader_buf: [4096]u8 = undefined;
+        var slice_reader = SliceIoReader.init(body, &reader_buf);
+
+        // Decompress buffer must be at least flate.max_window_len (65536).
+        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
+        defer self.allocator.free(decompress_buf);
+
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
+
+        // Read all decompressed output into a growable list.
+        var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(self.allocator);
+
+        var read_buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            var iov = [_][]u8{read_buf[0..]};
+            const n = decompressor.reader.readVec(&iov) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return error.DecompressionFailed,
+            };
+            if (n == 0) break;
+            try result.appendSlice(self.allocator, read_buf[0..n]);
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
@@ -627,6 +726,90 @@ pub const Client = struct {
     pub fn options(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
         return self.httpOptions(url, reqOpts);
     }
+};
+
+/// Adapter that exposes a `std.Io.Reader` backed by a `[]const u8` slice.
+///
+/// Used to feed in-memory compressed bytes to `std.compress.flate.Decompress`.
+const SliceIoReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    reader_iface: Io.Reader,
+
+    fn init(data: []const u8, buffer: []u8) SliceIoReader {
+        return .{
+            .data = data,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *SliceIoReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        if (bufs.len == 0) return 0;
+        const buf = bufs[0];
+        const remaining = p.data[p.pos..];
+        if (remaining.len == 0) return error.EndOfStream;
+        const n = @min(buf.len, remaining.len);
+        @memcpy(buf[0..n], remaining[0..n]);
+        p.pos += n;
+        return n;
+    }
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
+            var iov = [_][]u8{r.buffer[0..max_to_read]};
+            const n = readVec(r, &iov) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+
+            try w.writeAll(r.buffer[0..n]);
+            total += n;
+        }
+
+        return total;
+    }
+
+    fn discard(r: *Io.Reader, limit: Io.Limit) error{ EndOfStream, ReadFailed }!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
+            var iov = [_][]u8{r.buffer[0..max_to_read]};
+            const n = readVec(r, &iov) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            total += n;
+        }
+
+        return total;
+    }
+
+    fn rebase(_: *Io.Reader, _: usize) Io.Reader.RebaseError!void {}
+
+    const vtable: Io.Reader.VTable = .{
+        .stream = stream,
+        .discard = discard,
+        .readVec = readVec,
+        .rebase = rebase,
+    };
 };
 
 /// Parses an HTTP response from raw data.
@@ -830,4 +1013,99 @@ test "Client config limits are customizable" {
 
     try std.testing.expectEqual(@as(usize, 1024), client.config.max_response_size);
     try std.testing.expectEqual(@as(usize, 32), client.config.max_response_headers);
+}
+
+test "SliceIoReader reads slice data" {
+    const data = "hello, world!";
+    var buf: [64]u8 = undefined;
+    var reader = SliceIoReader.init(data, &buf);
+
+    var out: [64]u8 = undefined;
+    var iov = [_][]u8{out[0..]};
+    const n = try reader.reader_iface.readVec(&iov);
+    try std.testing.expectEqualStrings(data, out[0..n]);
+
+    // Second read should return EndOfStream.
+    var iov2 = [_][]u8{out[0..]};
+    try std.testing.expectError(error.EndOfStream, reader.reader_iface.readVec(&iov2));
+}
+
+test "decompressBody gzip" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    // "Hello, compressed world!" gzip-compressed.
+    const gzip_data = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x09, 0x5f, 0xc1, 0x69,
+        0x00, 0x03, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
+        0x51, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d,
+        0x2e, 0x4e, 0x4d, 0x51, 0x28, 0xcf, 0x2f, 0xca,
+        0x49, 0x51, 0x04, 0x00, 0x05, 0xbd, 0x53, 0x6e,
+        0x18, 0x00, 0x00, 0x00,
+    };
+
+    const result = try client.decompressBody(&gzip_data, .gzip);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Hello, compressed world!", result);
+}
+
+test "decompressBody deflate (zlib)" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    // "Hello, compressed world!" zlib-compressed.
+    const zlib_data = [_]u8{
+        0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
+        0x51, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d,
+        0x2e, 0x4e, 0x4d, 0x51, 0x28, 0xcf, 0x2f, 0xca,
+        0x49, 0x51, 0x04, 0x00, 0x6e, 0xb1, 0x08, 0xdf,
+    };
+
+    const result = try client.decompressBody(&zlib_data, .zlib);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Hello, compressed world!", result);
+}
+
+test "responseFromParser decompresses gzip body" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    // Build a raw HTTP response with gzip Content-Encoding.
+    const gzip_body = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x09, 0x5f, 0xc1, 0x69,
+        0x00, 0x03, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
+        0x51, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d,
+        0x2e, 0x4e, 0x4d, 0x51, 0x28, 0xcf, 0x2f, 0xca,
+        0x49, 0x51, 0x04, 0x00, 0x05, 0xbd, 0x53, 0x6e,
+        0x18, 0x00, 0x00, 0x00,
+    };
+
+    var header_buf: [256]u8 = undefined;
+    const header_str = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n", .{gzip_body.len}) catch unreachable;
+
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(allocator);
+    try raw.appendSlice(allocator, header_str);
+    try raw.appendSlice(allocator, &gzip_body);
+
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+    _ = try parser.feed(raw.items);
+    parser.finishEof();
+    try std.testing.expect(parser.isComplete());
+
+    var response = try client.responseFromParser(&parser);
+    defer response.deinit();
+
+    // Body should be decompressed.
+    try std.testing.expectEqualStrings("Hello, compressed world!", response.body.?);
+    // Content-Encoding header should be removed.
+    try std.testing.expect(response.headers.get(HeaderName.CONTENT_ENCODING) == null);
+    // Content-Length should be removed (no longer matches).
+    try std.testing.expect(response.headers.get(HeaderName.CONTENT_LENGTH) == null);
 }
