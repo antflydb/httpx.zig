@@ -243,6 +243,7 @@ pub const Server = struct {
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
     running: bool = false,
+    connections: Io.Group = Io.Group.init,
 
     const Self = @This();
 
@@ -343,6 +344,9 @@ pub const Server = struct {
     }
 
     /// Starts the server and begins accepting connections.
+    /// Uses Io.Group.concurrent to spawn a fiber per connection when
+    /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
+    /// Falls back to synchronous handling if concurrency is unavailable.
     pub fn listen(self: *Self) !void {
         const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
@@ -361,19 +365,36 @@ pub const Server = struct {
                 continue;
             };
 
-            self.handleConnection(conn.socket) catch |err| {
-                std.debug.print("Handler error: {}\n", .{err});
+            // Spawn a lightweight fiber to handle this connection concurrently.
+            // If the Io backend doesn't support concurrency, fall back to sync.
+            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, conn.socket }) catch {
+                self.handleConnection(conn.socket) catch |err| {
+                    std.debug.print("Handler error: {}\n", .{err});
+                };
             };
         }
+
+        // Wait for all in-flight connections to finish before returning.
+        self.connections.await(self.io) catch {};
     }
 
     /// Stops the server.
     pub fn stop(self: *Self) void {
         self.running = false;
+        // Cancel all in-flight connection fibers.
+        self.connections.cancel(self.io);
         if (self.listener) |*l| {
             l.deinit();
             self.listener = null;
         }
+    }
+
+    /// Fiber entry point for concurrent connection handling.
+    /// Signature returns `Io.Cancelable!void` as required by Group.concurrent.
+    fn handleConnectionFiber(self: *Self, socket: Socket) Io.Cancelable!void {
+        self.handleConnection(socket) catch |err| {
+            std.debug.print("Handler error: {}\n", .{err});
+        };
     }
 
     /// Handles a single connection.

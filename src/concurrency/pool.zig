@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
+const Io = std.Io;
 
 const Client = @import("../client/client.zig").Client;
 const Response = @import("../core/response.zig").Response;
@@ -105,46 +105,48 @@ pub const BatchBuilder = struct {
     }
 };
 
-/// Executes all requests and waits for all to complete.
+/// Executes all requests concurrently using Io fibers and waits for
+/// all to complete. Falls back to sequential execution if the Io
+/// backend does not support concurrency.
 pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
     var results = try allocator.alloc(RequestResult, specs.len);
     errdefer allocator.free(results);
 
     if (specs.len == 0) return results;
 
-    const WorkerCtx = struct {
-        client: *Client,
-        spec: RequestSpec,
-        out: *RequestResult,
-
-        fn run(self: *@This()) void {
-            self.out.* = executeSpec(self.client, self.spec);
-        }
-    };
-
-    var threads = try allocator.alloc(Thread, specs.len);
-    defer allocator.free(threads);
-
-    var ctxs = try allocator.alloc(WorkerCtx, specs.len);
-    defer allocator.free(ctxs);
-
-    var spawned: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) {
-            threads[i].join();
-        }
-    }
+    // Try fiber-based concurrency first.
+    var group = Io.Group.init;
+    var used_fibers = false;
 
     for (specs, 0..) |spec, i| {
-        ctxs[i] = .{ .client = client, .spec = spec, .out = &results[i] };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
-        spawned += 1;
+        group.concurrent(client.io, executeSpecFiber, .{ client, spec, &results[i] }) catch {
+            // Concurrency unavailable — fall back to threads for remaining.
+            allThreaded(client, specs[i..], results[i..]);
+            if (used_fibers) {
+                group.await(client.io) catch {};
+            }
+            return results;
+        };
+        used_fibers = true;
     }
 
-    for (threads[0..spawned]) |t| t.join();
-
+    group.await(client.io) catch {};
     return results;
+}
+
+fn executeSpecFiber(client: *Client, spec: RequestSpec, out: *RequestResult) Io.Cancelable!void {
+    out.* = executeSpec(client, spec);
+}
+
+fn raceSpecFiber(client: *Client, spec: RequestSpec, out: *RequestResult, winner_idx: *std.atomic.Value(usize), idx: usize) Io.Cancelable!void {
+    out.* = executeSpec(client, spec);
+    _ = winner_idx.cmpxchgStrong(std.math.maxInt(usize), idx, .acq_rel, .acquire);
+}
+
+fn allThreaded(client: *Client, specs: []const RequestSpec, results: []RequestResult) void {
+    for (specs, 0..) |spec, i| {
+        results[i] = executeSpec(client, spec);
+    }
 }
 
 /// Executes all requests and returns results for each one.
@@ -155,171 +157,99 @@ pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestS
     return all(allocator, client, specs);
 }
 
-/// Executes all requests and returns the first successful response.
+/// Executes all requests concurrently and returns the first successful response.
+/// Uses Io fibers when available, falls back to sequential execution.
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response {
-    _ = allocator;
-
     if (specs.len == 0) return null;
 
-    // NOTE: This function assumes `client` (and its allocator) are safe to use
-    // concurrently. If you pass a non-thread-safe allocator, behavior is undefined.
-    const WorkerCtx = struct {
-        client: *Client,
-        spec: RequestSpec,
-        winner: *std.atomic.Value(bool),
-        result: *?Response,
-        mutex: *Thread.Mutex,
-        cond: *Thread.Condition,
-        remaining: *std.atomic.Value(usize),
-
-        fn run(self: *@This()) void {
-            var rr = executeSpec(self.client, self.spec);
-            defer rr.deinit();
-
-            if (rr == .success and rr.success.status.isSuccess()) {
-                if (!self.winner.swap(true, .acq_rel)) {
-                    self.mutex.lock();
-                    self.result.* = rr.success;
-                    // transfer ownership to caller
-                    rr = .{ .err = error.UnusedResult };
-                    self.cond.signal();
-                    self.mutex.unlock();
-                }
-            }
-
-            const prev = self.remaining.fetchSub(1, .acq_rel);
-            if (prev == 1) {
-                self.mutex.lock();
-                self.cond.signal();
-                self.mutex.unlock();
-            }
-        }
-    };
-
-    var winner = std.atomic.Value(bool).init(false);
-    var remaining = std.atomic.Value(usize).init(specs.len);
-    var mutex = Thread.Mutex{};
-    var cond = Thread.Condition{};
-    var result: ?Response = null;
-
-    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
-    defer std.heap.page_allocator.free(threads);
-
-    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
-    defer std.heap.page_allocator.free(ctxs);
-
-    var spawned: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) threads[i].join();
-        if (result) |*r| r.deinit();
+    var results = try allocator.alloc(RequestResult, specs.len);
+    defer {
+        for (results) |*r| r.deinit();
+        allocator.free(results);
     }
+    for (results) |*r| r.* = .{ .err = error.Pending };
+
+    // Try fiber-based concurrency first.
+    var group = Io.Group.init;
+    var used_fibers = false;
 
     for (specs, 0..) |spec, i| {
-        ctxs[i] = .{
-            .client = client,
-            .spec = spec,
-            .winner = &winner,
-            .result = &result,
-            .mutex = &mutex,
-            .cond = &cond,
-            .remaining = &remaining,
+        group.concurrent(client.io, executeSpecFiber, .{ client, spec, &results[i] }) catch {
+            // Concurrency unavailable — run remaining sequentially.
+            allThreaded(client, specs[i..], results[i..]);
+            if (used_fibers) {
+                group.await(client.io) catch {};
+            }
+            break;
         };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
-        spawned += 1;
+        used_fibers = true;
     }
 
-    // Wait until a success is found or all workers complete.
-    mutex.lock();
-    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
-        cond.wait(&mutex);
+    if (used_fibers) {
+        group.await(client.io) catch {};
     }
-    mutex.unlock();
 
-    for (threads[0..spawned]) |t| t.join();
-
-    return result;
+    // Return first successful response, transferring ownership to caller.
+    for (results) |*r| {
+        switch (r.*) {
+            .success => |resp| {
+                if (resp.status.isSuccess()) {
+                    r.* = .{ .err = error.OwnershipTransferred };
+                    return resp;
+                }
+            },
+            .err => {},
+        }
+    }
+    return null;
 }
 
-/// Executes all requests and returns the first to complete.
+/// Executes all requests concurrently and returns the first to complete.
+/// Uses Io fibers when available, falls back to sequential execution.
+/// The winner is determined by an atomic compare-and-swap on a shared index.
 pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
-    _ = allocator;
-
     if (specs.len == 0) return .{ .err = error.NoRequests };
 
-    const WorkerCtx = struct {
-        client: *Client,
-        spec: RequestSpec,
-        winner: *std.atomic.Value(bool),
-        result: *RequestResult,
-        mutex: *Thread.Mutex,
-        cond: *Thread.Condition,
-        remaining: *std.atomic.Value(usize),
+    const no_winner = std.math.maxInt(usize);
 
-        fn run(self: *@This()) void {
-            var rr = executeSpec(self.client, self.spec);
-
-            if (!self.winner.swap(true, .acq_rel)) {
-                self.mutex.lock();
-                self.result.* = rr;
-                self.cond.signal();
-                self.mutex.unlock();
-                // ownership transferred to caller
-                rr = .{ .err = error.UnusedResult };
-            }
-
-            rr.deinit();
-
-            const prev = self.remaining.fetchSub(1, .acq_rel);
-            if (prev == 1) {
-                self.mutex.lock();
-                self.cond.signal();
-                self.mutex.unlock();
-            }
-        }
-    };
-
-    var winner = std.atomic.Value(bool).init(false);
-    var remaining = std.atomic.Value(usize).init(specs.len);
-    var mutex = Thread.Mutex{};
-    var cond = Thread.Condition{};
-    var result: RequestResult = .{ .err = error.NoRequests };
-
-    var threads = try std.heap.page_allocator.alloc(Thread, specs.len);
-    defer std.heap.page_allocator.free(threads);
-
-    var ctxs = try std.heap.page_allocator.alloc(WorkerCtx, specs.len);
-    defer std.heap.page_allocator.free(ctxs);
-
-    var spawned: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < spawned) : (i += 1) threads[i].join();
-        result.deinit();
+    var results = try allocator.alloc(RequestResult, specs.len);
+    defer {
+        for (results) |*r| r.deinit();
+        allocator.free(results);
     }
+    for (results) |*r| r.* = .{ .err = error.Pending };
+
+    var winner_idx = std.atomic.Value(usize).init(no_winner);
+
+    // Try fiber-based concurrency first.
+    var group = Io.Group.init;
+    var used_fibers = false;
 
     for (specs, 0..) |spec, i| {
-        ctxs[i] = .{
-            .client = client,
-            .spec = spec,
-            .winner = &winner,
-            .result = &result,
-            .mutex = &mutex,
-            .cond = &cond,
-            .remaining = &remaining,
+        group.concurrent(client.io, raceSpecFiber, .{ client, spec, &results[i], &winner_idx, i }) catch {
+            // Concurrency unavailable — run remaining sequentially.
+            for (specs[i..], i..) |s, j| {
+                results[j] = executeSpec(client, s);
+                _ = winner_idx.cmpxchgStrong(no_winner, j, .acq_rel, .acquire);
+            }
+            if (used_fibers) {
+                group.await(client.io) catch {};
+            }
+            break;
         };
-        threads[i] = try Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]});
-        spawned += 1;
+        used_fibers = true;
     }
 
-    mutex.lock();
-    while (!winner.load(.acquire) and remaining.load(.acquire) != 0) {
-        cond.wait(&mutex);
+    if (used_fibers) {
+        group.await(client.io) catch {};
     }
-    mutex.unlock();
 
-    for (threads[0..spawned]) |t| t.join();
+    const win = winner_idx.load(.acquire);
+    if (win == no_winner) return .{ .err = error.NoRequests };
 
+    // Transfer ownership of the winner to the caller.
+    const result = results[win];
+    results[win] = .{ .err = error.OwnershipTransferred };
     return result;
 }
 
@@ -385,4 +315,22 @@ test "allSettled empty" {
     const results = try allSettled(allocator, &client, &.{});
     defer allocator.free(results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "any empty" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    const result = try any(allocator, &client, &.{});
+    try std.testing.expect(result == null);
+}
+
+test "race empty" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+
+    const result = race(allocator, &client, &.{});
+    try std.testing.expect(result == .err);
 }
