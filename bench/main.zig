@@ -21,13 +21,13 @@ fn runBenchmark(name: []const u8, cfg: BenchConfig, func: *const fn () void) voi
     var total_ns: u128 = 0;
 
     for (0..cfg.rounds) |_| {
-        const start = std.time.nanoTimestamp();
+        const start = std.c.mach_absolute_time();
         for (0..cfg.iterations) |_| {
             func();
         }
-        const end = std.time.nanoTimestamp();
+        const end = std.c.mach_absolute_time();
 
-        const elapsed_ns = @as(u64, @intCast(end - start));
+        const elapsed_ns = end - start;
         min_ns = @min(min_ns, elapsed_ns);
         max_ns = @max(max_ns, elapsed_ns);
         total_ns += elapsed_ns;
@@ -144,9 +144,7 @@ fn benchVarIntEncoding() void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    bench_allocator = gpa.allocator();
+    bench_allocator = std.heap.page_allocator;
 
     std.debug.print("=== httpx.zig Benchmarks ===\n\n", .{});
     std.debug.print("Host: {s}-{s} ({s})\n\n", .{

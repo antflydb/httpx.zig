@@ -49,7 +49,7 @@ pub const Socket = struct {
 
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
-        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 0) catch return error.SendFailed;
+        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch return error.SendFailed;
     }
 
     /// Sends all data, blocking until complete.
@@ -243,7 +243,7 @@ pub const SocketIoWriter = struct {
         return n;
     }
 
-    fn sendFile(w: *Io.Writer, file_reader: *std.fs.File.Reader, limit: Io.Limit) Io.Writer.FileAllError!usize {
+    fn sendFile(w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
         const p = parent(w);
 
         var total: usize = 0;
@@ -253,7 +253,7 @@ pub const SocketIoWriter = struct {
             const chunk_len = @min(w.buffer.len, remaining);
             if (chunk_len == 0) break;
 
-            const n_read = file_reader.file.read(w.buffer[0..chunk_len]) catch return error.ReadFailed;
+            const n_read = file_reader.file.readStreaming(file_reader.io, &.{w.buffer[0..chunk_len]}) catch return error.ReadFailed;
             if (n_read == 0) break;
 
             p.socket.sendAll(w.buffer[0..n_read]) catch return error.WriteFailed;

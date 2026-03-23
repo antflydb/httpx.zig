@@ -8,11 +8,24 @@
 //! - Idle connection timeout and cleanup
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
+
+/// Monotonic millisecond timestamp for connection health tracking.
+fn milliTimestamp() i64 {
+    if (builtin.os.tag == .macos) {
+        // mach_absolute_time returns nanoseconds on Apple Silicon.
+        return @intCast(std.c.mach_absolute_time() / std.time.ns_per_ms);
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+    }
+}
 
 pub const PoolError = error{
     PoolExhausted,
@@ -34,20 +47,20 @@ pub const Connection = struct {
     /// Marks the connection as in use.
     pub fn acquire(self: *Self) void {
         self.in_use = true;
-        self.last_used = std.time.milliTimestamp();
+        self.last_used = milliTimestamp();
     }
 
     /// Releases the connection back to the pool.
     pub fn release(self: *Self) void {
         self.in_use = false;
-        self.last_used = std.time.milliTimestamp();
+        self.last_used = milliTimestamp();
         self.requests_made += 1;
     }
 
     /// Returns true if the connection is healthy and reusable.
     pub fn isHealthy(self: *const Self, max_idle_ms: i64) bool {
         if (self.in_use) return false;
-        const idle_time = std.time.milliTimestamp() - self.last_used;
+        const idle_time = milliTimestamp() - self.last_used;
         return idle_time < max_idle_ms;
     }
 
@@ -55,7 +68,7 @@ pub const Connection = struct {
     pub fn shouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests_per_connection: u32) bool {
         if (self.in_use) return false;
         if (self.requests_made >= max_requests_per_connection) return true;
-        const idle_time = std.time.milliTimestamp() - self.last_used;
+        const idle_time = milliTimestamp() - self.last_used;
         return idle_time >= idle_timeout_ms;
     }
 
@@ -88,7 +101,7 @@ pub const ConnectionPool = struct {
     io: Io,
     config: PoolConfig,
     connections: std.ArrayListUnmanaged(*Connection) = .empty,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = Io.Mutex.init,
 
     const Self = @This();
 
@@ -120,8 +133,8 @@ pub const ConnectionPool = struct {
     /// The returned pointer is stable for the lifetime of the connection.
     pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Connection {
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             for (self.connections.items) |conn| {
                 if (std.mem.eql(u8, conn.host, host) and conn.port == port) {
@@ -156,7 +169,7 @@ pub const ConnectionPool = struct {
         var socket = try Socket.connect(addr, self.io);
         errdefer socket.close();
 
-        const now = std.time.milliTimestamp();
+        const now = milliTimestamp();
 
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
@@ -169,8 +182,8 @@ pub const ConnectionPool = struct {
             .last_used = now,
         };
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.connections.append(self.allocator, conn);
 
         return conn;
@@ -178,15 +191,15 @@ pub const ConnectionPool = struct {
 
     /// Releases a connection back to the pool.
     pub fn releaseConnection(self: *Self, conn: *Connection) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         conn.release();
     }
 
     /// Removes idle connections that have exceeded the timeout.
     pub fn cleanup(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.cleanupLocked();
     }
 
@@ -274,8 +287,8 @@ test "Connection health check" {
         .socket = try Socket.connect(bound_addr, io),
         .host = "localhost",
         .port = 8080,
-        .created_at = std.time.milliTimestamp(),
-        .last_used = std.time.milliTimestamp(),
+        .created_at = milliTimestamp(),
+        .last_used = milliTimestamp(),
     };
     defer conn.socket.close();
 

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const builtin = @import("builtin");
 const Socket = @import("../net/socket.zig").Socket;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
@@ -98,6 +99,7 @@ pub const TlsConfig = struct {
 /// TLS session state.
 pub const TlsSession = struct {
     allocator: Allocator,
+    io: Io,
     config: TlsConfig,
     negotiated_protocol: ?[]const u8 = null,
     peer_certificate: ?[]const u8 = null,
@@ -117,9 +119,10 @@ pub const TlsSession = struct {
     const Self = @This();
 
     /// Creates a new TLS session with the given configuration.
-    pub fn init(config: TlsConfig) Self {
+    pub fn init(config: TlsConfig, io: Io) Self {
         return .{
             .allocator = config.allocator,
+            .io = io,
             .config = config,
         };
     }
@@ -179,11 +182,17 @@ pub const TlsSession = struct {
         if (verify) {
             var bundle: std.crypto.Certificate.Bundle = .{};
             errdefer bundle.deinit(self.allocator);
-            try bundle.rescan(self.allocator);
+            try bundle.rescan(self.allocator, self.io, Io.Timestamp.now(self.io, .real));
             self.ca_bundle = bundle;
         }
 
         const sni_host = self.config.server_name orelse hostname;
+
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        self.io.randomSecure(&entropy) catch return error.EntropyUnavailable;
+
+        const now_ns = Io.Timestamp.now(self.io, .real).nanoseconds;
+        const now_secs: i64 = @intCast(@divFloor(now_ns, 1_000_000_000));
 
         const client = try tls.Client.init(&self.net_in.?.reader_iface, &self.net_out.?.writer_iface, .{
             .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
@@ -192,6 +201,8 @@ pub const TlsSession = struct {
             .allow_truncation_attacks = false,
             .write_buffer = self.tls_write_buf.?,
             .read_buffer = self.tls_read_buf.?,
+            .entropy = &entropy,
+            .realtime_now_seconds = now_secs,
             .alert = null,
         });
 
@@ -327,7 +338,7 @@ test "TlsConfig insecure" {
 test "TlsSession initialization" {
     const allocator = std.testing.allocator;
     const config = TlsConfig.init(allocator);
-    var session = TlsSession.init(config);
+    var session = TlsSession.init(config, std.testing.io);
     defer session.deinit();
 
     try std.testing.expect(!session.connected);

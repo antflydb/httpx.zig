@@ -2,11 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 fn linkPlatformLibs(compile: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    // libc is needed on all platforms: std.Thread.Mutex uses pthreads,
+    // and timing/sleep use C functions (nanosleep, mach_absolute_time).
+    compile.root_module.link_libc = true;
     if (target.result.os.tag == .windows) {
         // Winsock symbols are provided by these system libraries on Windows.
         compile.root_module.linkSystemLibrary("ws2_32", .{});
         compile.root_module.linkSystemLibrary("mswsock", .{});
-        compile.root_module.link_libc = true;
     }
 }
 
@@ -134,6 +136,24 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    const bench_conc_exe = b.addExecutable(.{
+        .name = "bench-concurrency",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/concurrency.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_conc_exe.root_module.addImport("httpx", httpx_module);
+    linkPlatformLibs(bench_conc_exe, target);
+
+    const install_bench_conc = b.addInstallArtifact(bench_conc_exe, .{});
+    const run_bench_conc = b.addRunArtifact(bench_conc_exe);
+    run_bench_conc.step.dependOn(&install_bench_conc.step);
+
+    const bench_conc_step = b.step("bench-concurrency", "Run concurrency benchmarks");
+    bench_conc_step.dependOn(&run_bench_conc.step);
 
     // Cross-compilation targets to verify support
     const cross_targets = [_]std.Target.Query{

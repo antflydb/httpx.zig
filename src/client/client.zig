@@ -79,7 +79,7 @@ pub const Client = struct {
     config: ClientConfig,
     interceptors: std.ArrayListUnmanaged(Interceptor) = .empty,
     cookies: std.StringHashMapUnmanaged([]const u8) = .{},
-    cookie_mutex: std.Thread.Mutex = .{},
+    cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
 
     const Self = @This();
@@ -217,7 +217,11 @@ pub const Client = struct {
                 if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries) {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                    if (delay_ms > 0) {
+                        const ns = delay_ms * std.time.ns_per_ms;
+                        const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+                        _ = std.c.nanosleep(&ts, null);
+                    }
                     continue;
                 }
                 return err;
@@ -227,7 +231,11 @@ pub const Client = struct {
                 res.deinit();
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
-                if (delay_ms > 0) std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                if (delay_ms > 0) {
+                    const ns = delay_ms * std.time.ns_per_ms;
+                    const ts = std.c.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+                    _ = std.c.nanosleep(&ts, null);
+                }
                 continue;
             }
 
@@ -301,7 +309,7 @@ pub const Client = struct {
     fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, request_data: []const u8) !Response {
         const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
 
-        var session = TlsSession.init(tls_cfg);
+        var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
         try session.handshake(host);
@@ -402,8 +410,8 @@ pub const Client = struct {
     }
 
     fn attachCookies(self: *Self, req: *Request) !void {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         if (self.cookies.count() == 0) return;
 
         var list = std.ArrayListUnmanaged(u8).empty;
@@ -424,8 +432,8 @@ pub const Client = struct {
     }
 
     fn storeCookies(self: *Self, res: *const Response) !void {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         const values = try res.headers.getAll(HeaderName.SET_COOKIE, self.allocator);
         defer self.allocator.free(values);
 
@@ -451,22 +459,22 @@ pub const Client = struct {
 
     /// Adds or replaces a cookie in the in-memory client cookie jar.
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8) !void {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         return self.setCookieLocked(name, value);
     }
 
     /// Returns a cookie value from the in-memory cookie jar.
     pub fn getCookie(self: *Self, name: []const u8) ?[]const u8 {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         return self.cookies.get(name);
     }
 
     /// Removes a cookie from the in-memory cookie jar.
     pub fn removeCookie(self: *Self, name: []const u8) bool {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         if (self.cookies.fetchRemove(name)) |removed| {
             self.allocator.free(removed.key);
             self.allocator.free(removed.value);
@@ -477,8 +485,8 @@ pub const Client = struct {
 
     /// Clears all cookies from the in-memory cookie jar.
     pub fn clearCookies(self: *Self) void {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         var it = self.cookies.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -489,15 +497,15 @@ pub const Client = struct {
 
     /// Returns true if a cookie with the given name exists in the jar.
     pub fn hasCookie(self: *Self, name: []const u8) bool {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         return self.cookies.contains(name);
     }
 
     /// Returns the number of cookies currently stored in the jar.
     pub fn cookieCount(self: *Self) usize {
-        self.cookie_mutex.lock();
-        defer self.cookie_mutex.unlock();
+        self.cookie_mutex.lockUncancelable(self.io);
+        defer self.cookie_mutex.unlock(self.io);
         return self.cookies.count();
     }
 
