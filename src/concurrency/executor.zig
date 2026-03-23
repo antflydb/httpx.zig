@@ -157,12 +157,13 @@ pub const Executor = struct {
 };
 
 /// Future representing a pending result.
-/// Uses a condition variable for efficient, non-polling wait.
+/// Uses a condition variable for blocking wait and an atomic flag for
+/// lock-free polling via `isDone()` and `get()`.
 pub fn Future(comptime T: type) type {
     return struct {
         result: ?T = null,
         error_val: ?anyerror = null,
-        completed: bool = false,
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         mutex: Thread.Mutex = .{},
         cond: Thread.Condition = .{},
 
@@ -170,9 +171,14 @@ pub fn Future(comptime T: type) type {
 
         /// Waits for the future to complete (blocks the calling thread).
         pub fn wait(self: *Self) !T {
+            // Fast path: already done.
+            if (self.completed.load(.acquire)) {
+                if (self.error_val) |err| return err;
+                return self.result.?;
+            }
             self.mutex.lock();
             defer self.mutex.unlock();
-            while (!self.completed) {
+            while (!self.completed.load(.acquire)) {
                 self.cond.wait(&self.mutex);
             }
             if (self.error_val) |err| {
@@ -186,7 +192,7 @@ pub fn Future(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.result = value;
-            self.completed = true;
+            self.completed.store(true, .release);
             self.cond.signal();
         }
 
@@ -195,25 +201,20 @@ pub fn Future(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.error_val = err;
-            self.completed = true;
+            self.completed.store(true, .release);
             self.cond.signal();
         }
 
-        /// Returns the result if available (non-blocking).
+        /// Returns the result if available (non-blocking, lock-free).
         pub fn get(self: *Self) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.completed and self.error_val == null) {
-                return self.result;
-            }
-            return null;
+            if (!self.completed.load(.acquire)) return null;
+            if (self.error_val != null) return null;
+            return self.result;
         }
 
-        /// Returns true if the future is completed (non-blocking).
+        /// Returns true if the future is completed (non-blocking, lock-free).
         pub fn isDone(self: *Self) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            return self.completed;
+            return self.completed.load(.acquire);
         }
     };
 }

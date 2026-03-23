@@ -29,6 +29,39 @@ pub const PoolError = error{
 // Connection entry types
 // ---------------------------------------------------------------------------
 
+/// Shared methods for pooled connection types.
+fn ConnectionMixin(comptime Self: type) type {
+    return struct {
+        pub fn acquire(self: *Self, now: i64) void {
+            self.in_use = true;
+            self.last_used = now;
+        }
+
+        pub fn release(self: *Self, now: i64) void {
+            self.in_use = false;
+            self.last_used = now;
+            self.requests_made += 1;
+        }
+
+        pub fn markBroken(self: *Self) void {
+            self.broken = true;
+        }
+
+        pub fn baseIsHealthy(self: *const Self, max_idle_ms: i64, now: i64) bool {
+            if (self.in_use) return false;
+            if (self.broken) return false;
+            return (now - self.last_used) < max_idle_ms;
+        }
+
+        pub fn baseShouldEvict(self: *const Self, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
+            if (self.in_use) return false;
+            if (self.broken) return true;
+            if (self.requests_made >= max_requests) return true;
+            return (now - self.last_used) >= idle_timeout_ms;
+        }
+    };
+}
+
 /// Pooled TCP connection.
 pub const Connection = struct {
     socket: Socket,
@@ -40,32 +73,17 @@ pub const Connection = struct {
     last_used: i64,
     requests_made: u32 = 0,
 
-    pub fn acquire(self: *Connection, now: i64) void {
-        self.in_use = true;
-        self.last_used = now;
-    }
-
-    pub fn release(self: *Connection, now: i64) void {
-        self.in_use = false;
-        self.last_used = now;
-        self.requests_made += 1;
-    }
+    const mixin = ConnectionMixin(Connection);
+    pub const acquire = mixin.acquire;
+    pub const release = mixin.release;
+    pub const markBroken = mixin.markBroken;
 
     pub fn isHealthy(self: *const Connection, max_idle_ms: i64, now: i64) bool {
-        if (self.in_use) return false;
-        if (self.broken) return false;
-        return (now - self.last_used) < max_idle_ms;
-    }
-
-    pub fn markBroken(self: *Connection) void {
-        self.broken = true;
+        return mixin.baseIsHealthy(self, max_idle_ms, now);
     }
 
     pub fn shouldEvict(self: *const Connection, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
-        if (self.in_use) return false;
-        if (self.broken) return true;
-        if (self.requests_made >= max_requests) return true;
-        return (now - self.last_used) >= idle_timeout_ms;
+        return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
     }
 
     pub fn close(self: *Connection) void {
@@ -117,34 +135,19 @@ pub const TlsConnection = struct {
     last_used: i64,
     requests_made: u32 = 0,
 
-    pub fn acquire(self: *TlsConnection, now: i64) void {
-        self.in_use = true;
-        self.last_used = now;
-    }
-
-    pub fn release(self: *TlsConnection, now: i64) void {
-        self.in_use = false;
-        self.last_used = now;
-        self.requests_made += 1;
-    }
+    const mixin = ConnectionMixin(TlsConnection);
+    pub const acquire = mixin.acquire;
+    pub const release = mixin.release;
+    pub const markBroken = mixin.markBroken;
 
     pub fn isHealthy(self: *const TlsConnection, max_idle_ms: i64, now: i64) bool {
-        if (self.in_use) return false;
-        if (self.broken) return false;
         if (!self.session.connected) return false;
-        return (now - self.last_used) < max_idle_ms;
-    }
-
-    pub fn markBroken(self: *TlsConnection) void {
-        self.broken = true;
+        return mixin.baseIsHealthy(self, max_idle_ms, now);
     }
 
     pub fn shouldEvict(self: *const TlsConnection, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
-        if (self.in_use) return false;
-        if (self.broken) return true;
-        if (!self.session.connected) return true;
-        if (self.requests_made >= max_requests) return true;
-        return (now - self.last_used) >= idle_timeout_ms;
+        if (!self.in_use and !self.session.connected) return true;
+        return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
     }
 
     pub fn close(self: *TlsConnection) void {
@@ -229,6 +232,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         config: PoolConfig,
         context: Context,
         connections: std.ArrayListUnmanaged(*Entry) = .empty,
+        active_count: usize = 0,
         mutex: Io.Mutex = Io.Mutex.init,
         last_cleanup: i64 = 0,
 
@@ -281,12 +285,13 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                             entry.requests_made < self.config.max_requests_per_connection)
                         {
                             entry.acquire(now);
+                            self.active_count += 1;
                             return entry;
                         }
                     }
                 }
 
-                if (self.totalCountLocked() >= self.config.max_connections) return PoolError.PoolExhausted;
+                if (self.connections.items.len >= self.config.max_connections) return PoolError.PoolExhausted;
 
                 var host_count: u32 = 0;
                 for (self.connections.items) |entry| {
@@ -327,6 +332,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             }
 
             try self.connections.append(self.allocator, entry);
+            self.active_count += 1;
             return entry;
         }
 
@@ -336,6 +342,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             defer self.mutex.unlock(self.io);
             const now = milliTimestamp();
             entry.release(now);
+            self.active_count -= 1;
             // Opportunistic cleanup on release.
             if (now - self.last_cleanup > self.config.health_check_interval_ms) {
                 self.cleanupLocked(now);
@@ -355,6 +362,8 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     break;
                 }
             }
+
+            if (entry.in_use) self.active_count -= 1;
 
             entry.close();
             self.allocator.free(entry.host);
@@ -383,40 +392,25 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             }
         }
 
-        /// Returns the number of in-use connections (must hold mutex or be single-threaded).
-        fn activeCountLocked(self: *const Self) usize {
-            var count: usize = 0;
-            for (self.connections.items) |entry| {
-                if (entry.in_use) count += 1;
-            }
-            return count;
-        }
-
-        /// Returns the total number of connections (active + idle).
-        /// Must hold mutex or be called from a single-threaded context.
-        fn totalCountLocked(self: *const Self) usize {
-            return self.connections.items.len;
-        }
-
         /// Returns the number of in-use connections.
         pub fn activeCount(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            return self.activeCountLocked();
+            return self.active_count;
         }
 
         /// Returns the total number of connections (active + idle).
         pub fn totalCount(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            return self.totalCountLocked();
+            return self.connections.items.len;
         }
 
         /// Returns the number of idle connections.
         pub fn idleCount(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            return self.totalCountLocked() - self.activeCountLocked();
+            return self.connections.items.len - self.active_count;
         }
 
         /// Returns the number of connections for a specific host/port pair.
@@ -436,8 +430,8 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         pub fn stats(self: *Self) PoolStats {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const total = self.totalCountLocked();
-            const active = self.activeCountLocked();
+            const total = self.connections.items.len;
+            const active = self.active_count;
             return .{ .total = total, .active = active, .idle = total - active };
         }
     };
