@@ -245,6 +245,7 @@ pub const Server = struct {
     listener: ?TcpListener = null,
     running: bool = false,
     connections: Io.Group = Io.Group.init,
+    conn_semaphore: Io.Semaphore = .{},
 
     const Self = @This();
 
@@ -265,6 +266,7 @@ pub const Server = struct {
             .io = io,
             .config = cfg,
             .router = Router.init(allocator),
+            .conn_semaphore = .{ .permits = cfg.max_connections },
         };
     }
 
@@ -366,6 +368,9 @@ pub const Server = struct {
                 continue;
             };
 
+            // Block accept loop when at max concurrent connections.
+            self.conn_semaphore.waitUncancelable(self.io);
+
             // Spawn a lightweight fiber to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
             self.connections.concurrent(self.io, handleConnectionFiber, .{ self, conn.socket }) catch {
@@ -400,6 +405,7 @@ pub const Server = struct {
 
     /// Handles a single connection.
     fn handleConnection(self: *Self, socket: Socket) !void {
+        defer self.conn_semaphore.post(self.io);
         var sock = socket;
         defer sock.close();
 
