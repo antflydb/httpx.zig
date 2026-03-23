@@ -56,16 +56,20 @@ fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
 }
 
-fn printRow(batch: usize, seq_ns: u64, fiber_ns: u64) void {
+fn printRow(batch: usize, seq_ns: u64, thread_ns: u64, fiber_ns: u64) void {
     const seq_ms = nsToMs(seq_ns);
+    const thread_ms = nsToMs(thread_ns);
     const fiber_ms = nsToMs(fiber_ns);
-    const speedup = if (fiber_ms > 0.001) seq_ms / fiber_ms else 0.0;
+    const thread_speedup = if (thread_ms > 0.001) seq_ms / thread_ms else 0.0;
+    const fiber_speedup = if (fiber_ms > 0.001) seq_ms / fiber_ms else 0.0;
 
-    std.debug.print("  {d: <6} {d: >10.2}ms  {d: >10.2}ms  {d: >7.2}x\n", .{
+    std.debug.print("  {d: <6} {d: >10.2}ms  {d: >10.2}ms {d: >6.2}x  {d: >10.2}ms {d: >6.2}x\n", .{
         batch,
         seq_ms,
+        thread_ms,
+        thread_speedup,
         fiber_ms,
-        speedup,
+        fiber_speedup,
     });
 }
 
@@ -87,6 +91,53 @@ fn benchAll(allocator: Allocator, client: *httpx.Client, specs: []const httpx.Re
     const results = httpx.concurrency.all(allocator, client, specs) catch return nowNs() - start;
     for (results) |*r| r.deinit();
     allocator.free(results);
+    return nowNs() - start;
+}
+
+/// OS-thread-based all() for comparison with fiber version.
+fn benchAllThreads(allocator: Allocator, client: *httpx.Client, specs: []const httpx.RequestSpec) u64 {
+    const WorkerCtx = struct {
+        client: *httpx.Client,
+        spec: httpx.RequestSpec,
+        out: *httpx.RequestResult,
+
+        fn run(self: *@This()) void {
+            const result = self.client.request(self.spec.method, self.spec.url, .{
+                .body = self.spec.body,
+                .headers = self.spec.headers,
+            });
+            self.out.* = if (result) |response| .{ .success = response } else |err| .{ .err = err };
+        }
+    };
+
+    const start = nowNs();
+
+    const results = allocator.alloc(httpx.RequestResult, specs.len) catch return 0;
+    defer {
+        for (results) |*r| r.deinit();
+        allocator.free(results);
+    }
+
+    const threads = allocator.alloc(Thread, specs.len) catch return 0;
+    defer allocator.free(threads);
+    const ctxs = allocator.alloc(WorkerCtx, specs.len) catch return 0;
+    defer allocator.free(ctxs);
+
+    var spawned: usize = 0;
+    for (specs, 0..) |spec, i| {
+        ctxs[i] = .{ .client = client, .spec = spec, .out = &results[i] };
+        threads[i] = Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[i]}) catch {
+            // Fallback: run remaining sequentially
+            for (specs[i..], i..) |s, j| {
+                const r = client.request(s.method, s.url, .{ .body = s.body, .headers = s.headers });
+                results[j] = if (r) |resp| .{ .success = resp } else |err| .{ .err = err };
+            }
+            break;
+        };
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+
     return nowNs() - start;
 }
 
@@ -182,11 +233,11 @@ pub fn main() !void {
     }
     std.debug.print(" done.\n\n", .{});
 
-    // -- pool.all(): sequential vs fiber --
+    // -- pool.all(): sequential vs threads vs fibers --
     {
-        std.debug.print("pool.all() — sequential vs fiber (best of {d} rounds):\n", .{ROUNDS});
-        std.debug.print("  {s: <6} {s: >12}  {s: >12}  {s: >8}\n", .{ "batch", "sequential", "fiber", "speedup" });
-        std.debug.print("  {s:-<46}\n", .{""});
+        std.debug.print("pool.all() — sequential vs OS threads vs Io fibers (best of {d} rounds):\n", .{ROUNDS});
+        std.debug.print("  {s: <6} {s: >12}  {s: >12} {s: >7}  {s: >12} {s: >7}\n", .{ "batch", "sequential", "threads", "speedup", "fibers", "speedup" });
+        std.debug.print("  {s:-<68}\n", .{""});
 
         const batch_sizes = [_]usize{ 1, 5, 10, 25, 50 };
         for (batch_sizes) |n| {
@@ -194,9 +245,10 @@ pub fn main() !void {
             for (specs) |*s| s.* = .{ .url = url };
 
             const seq_ns = bestOfSeq(&client, url, n);
+            const thread_ns = bestOf(benchAllThreads, allocator, &client, specs);
             const fiber_ns = bestOf(benchAll, allocator, &client, specs);
 
-            printRow(n, seq_ns, fiber_ns);
+            printRow(n, seq_ns, thread_ns, fiber_ns);
         }
     }
 
