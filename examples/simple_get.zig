@@ -12,7 +12,7 @@ pub fn main() !void {
 
     std.debug.print("=== Simple GET Request Example ===\n\n", .{});
 
-    var client = httpx.Client.init(allocator);
+    var client = httpx.Client.init(allocator, std.io.default);
     defer client.deinit();
 
     std.debug.print("Creating GET request to httpbin.org...\n", .{});
@@ -23,7 +23,7 @@ pub fn main() !void {
     try request.headers.set("Accept", "application/json");
     try request.headers.set("User-Agent", "httpx.zig/1.0");
 
-    const serialized = try httpx.formatRequest(&request, allocator);
+    const serialized = try request.toSlice(allocator);
     defer allocator.free(serialized);
 
     std.debug.print("\nRequest:\n", .{});

@@ -27,7 +27,7 @@ pub fn main() !void {
 
     std.debug.print("=== Simple GET Request + JSON Deserialization ===\n\n", .{});
 
-    var client = httpx.Client.init(allocator);
+    var client = httpx.Client.init(allocator, std.io.default);
     defer client.deinit();
 
     std.debug.print("Making GET request to https://httpbin.org/get...\n", .{});

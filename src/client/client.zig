@@ -432,13 +432,14 @@ pub const Client = struct {
         const Source = @TypeOf(source);
         if (Source == *Socket) {
             return source.recv(buf);
-        } else {
-            // Io.Reader (TLS path)
+        } else if (Source == *std.Io.Reader) {
             var iov = [_][]u8{buf};
             return source.readVec(&iov) catch |err| switch (err) {
                 error.EndOfStream => @as(usize, 0),
                 else => err,
             };
+        } else {
+            @compileError("recvFrom: unsupported source type " ++ @typeName(Source));
         }
     }
 
@@ -493,11 +494,12 @@ pub const Client = struct {
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Stack-allocate the decompression window. Each fiber has its own stack,
-        // so this is safe for concurrent decompression without heap allocation.
-        var decompress_buf: [flate.max_window_len]u8 = undefined;
+        // Heap-allocate the decompression window (64KB). Stack allocation would
+        // blow fiber stacks (~84KB total with other buffers in this call chain).
+        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
+        defer self.allocator.free(decompress_buf);
 
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, &decompress_buf);
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
 
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;

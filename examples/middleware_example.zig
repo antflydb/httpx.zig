@@ -16,7 +16,7 @@ pub fn main() !void {
 
     std.debug.print("=== Middleware Example ===\n\n", .{});
 
-    var server = httpx.Server.init(allocator);
+    var server = httpx.Server.init(allocator, std.io.default);
     defer server.deinit();
 
     try server.use(httpx.logger());

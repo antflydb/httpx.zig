@@ -26,7 +26,7 @@ pub fn main() !void {
     try request.setJson(json_body);
     try request.headers.set("Accept", "application/json");
 
-    const serialized = try httpx.formatRequest(&request, allocator);
+    const serialized = try request.toSlice(allocator);
     defer allocator.free(serialized);
 
     std.debug.print("Request:\n", .{});

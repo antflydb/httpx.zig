@@ -15,6 +15,7 @@ const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter
 const Context = @import("server.zig").Context;
 const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
+const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 
 /// Middleware function type.
 pub const Middleware = struct {
@@ -32,16 +33,17 @@ pub const MiddlewareChain = struct {
     current: usize = 0,
 
     const Self = @This();
+    const chain_state_key = "__middleware_chain_state";
 
     /// Executes the middleware chain.
     pub fn execute(self: *Self, ctx: *Context) anyerror!Response {
-        try ctx.data.put("__middleware_chain_state", .{ .ptr = @ptrCast(self) });
-        defer _ = ctx.data.remove("__middleware_chain_state");
+        try ctx.data.put(chain_state_key, .{ .ptr = @ptrCast(self) });
+        defer _ = ctx.data.remove(chain_state_key);
         return next(ctx);
     }
 
     fn next(ctx: *Context) anyerror!Response {
-        const entry = ctx.data.get("__middleware_chain_state") orelse return error.MissingMiddlewareChainState;
+        const entry = ctx.data.get(chain_state_key) orelse return error.MissingMiddlewareChainState;
         const chain: *Self = @ptrCast(@alignCast(entry.ptr));
 
         if (chain.current < chain.middlewares.len) {
@@ -146,9 +148,9 @@ pub fn logger() Middleware {
         .name = "logger",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                const start = std.time.milliTimestamp();
+                const start = milliTimestamp();
                 const response = try next(ctx);
-                const duration = std.time.milliTimestamp() - start;
+                const duration = milliTimestamp() - start;
 
                 std.debug.print("{s} {s} - {d}ms\n", .{
                     ctx.request.method.toString(),

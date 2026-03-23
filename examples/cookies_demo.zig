@@ -12,7 +12,7 @@ pub fn main() !void {
 
     std.debug.print("=== Cookie Jar Demo ===\n\n", .{});
 
-    var client = httpx.Client.init(allocator);
+    var client = httpx.Client.init(allocator, std.io.default);
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
@@ -29,14 +29,14 @@ pub fn main() !void {
     defer req.deinit();
 
     if (client.getCookie("session")) |session| {
-        var cookie_buf = std.ArrayListUnmanaged(u8){};
+        var cookie_buf = std.ArrayListUnmanaged(u8).empty;
         defer cookie_buf.deinit(allocator);
         const writer = cookie_buf.writer(allocator);
         try writer.print("session={s}", .{session});
         try req.headers.set(httpx.HeaderName.COOKIE, cookie_buf.items);
     }
 
-    const wire = try httpx.formatRequest(&req, allocator);
+    const wire = try req.toSlice(allocator);
     defer allocator.free(wire);
 
     std.debug.print("\nSerialized request with Cookie header:\n{s}\n", .{wire});

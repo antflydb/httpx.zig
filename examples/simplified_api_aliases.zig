@@ -13,17 +13,17 @@ pub fn main() !void {
     std.debug.print("=== Simplified API Aliases Demo ===\n\n", .{});
 
     // Top-level fetch alias (creates and deinitializes a temporary client).
-    var resp_a = try httpx.fetch(allocator, "https://httpbin.org/get");
+    var resp_a = try httpx.fetch(allocator, std.io.default, "https://httpbin.org/get");
     defer resp_a.deinit();
     std.debug.print("fetch status: {d}\n", .{resp_a.status.code});
 
     // Top-level send alias with explicit method and options.
-    var resp_b = try httpx.send(allocator, .GET, "https://httpbin.org/headers", .{});
+    var resp_b = try httpx.send(allocator, std.io.default, .GET, "https://httpbin.org/headers", .{});
     defer resp_b.deinit();
     std.debug.print("send status: {d}\n", .{resp_b.status.code});
 
     // Client aliases.
-    var client: httpx.HttpClient = httpx.HttpClient.init(allocator);
+    var client: httpx.HttpClient = httpx.HttpClient.init(allocator, std.io.default);
     defer client.deinit();
 
     var resp_c = try client.fetch("https://httpbin.org/anything", .{});

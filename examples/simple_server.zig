@@ -30,7 +30,7 @@ pub fn main() !void {
 
     std.debug.print("=== Simple HTTP Server Example ===\n\n", .{});
 
-    var server = httpx.Server.initWithConfig(allocator, .{
+    var server = httpx.Server.initWithConfig(allocator, std.io.default, .{
         .host = "127.0.0.1",
         .port = 8080,
         .max_connections = 1000,

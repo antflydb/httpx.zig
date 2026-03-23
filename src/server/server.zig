@@ -269,7 +269,7 @@ pub const Server = struct {
     listener: ?TcpListener = null,
     running: bool = false,
     connections: Io.Group = Io.Group.init,
-    conn_semaphore: Io.Semaphore = .{},
+    conn_semaphore: Io.Semaphore,
 
     const Self = @This();
 
@@ -387,13 +387,15 @@ pub const Server = struct {
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
         while (self.running) {
+            // Block accept loop when at max concurrent connections.
+            // Gate before accept so we don't hold open sockets while waiting.
+            self.conn_semaphore.waitUncancelable(self.io);
+
             const conn = self.listener.?.accept() catch |err| {
+                self.conn_semaphore.post(self.io);
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
-
-            // Block accept loop when at max concurrent connections.
-            self.conn_semaphore.waitUncancelable(self.io);
 
             // Spawn a lightweight fiber to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
@@ -568,7 +570,9 @@ pub const Server = struct {
 
             try self.ensureContentLengthHeader(&response);
 
-            try response.serialize(sock.writer());
+            var bw = std.io.bufferedWriter(sock.writer());
+            try response.serialize(bw.writer().any());
+            try bw.flush();
 
             if (!keep_alive) return;
             first_request = false;
@@ -582,7 +586,9 @@ pub const Server = struct {
 
         try self.ensureContentLengthHeader(&resp);
 
-        try resp.serialize(socket.writer());
+        var bw = std.io.bufferedWriter(socket.writer());
+        try resp.serialize(bw.writer().any());
+        try bw.flush();
     }
 
     fn ensureContentLengthHeader(self: *Self, response: *Response) !void {
@@ -620,6 +626,8 @@ pub const Server = struct {
         try headers.set("Allow", allow.items);
     }
 
+    const mw_exec_state_key = "__mw_exec_state";
+
     const MiddlewareExecState = struct {
         server: *Self,
         route_handler: Handler,
@@ -631,14 +639,14 @@ pub const Server = struct {
             .server = self,
             .route_handler = route_handler,
         };
-        try ctx.data.put("__mw_exec_state", .{ .ptr = @ptrCast(&state) });
-        defer _ = ctx.data.remove("__mw_exec_state");
+        try ctx.data.put(mw_exec_state_key, .{ .ptr = @ptrCast(&state) });
+        defer _ = ctx.data.remove(mw_exec_state_key);
 
         return middlewareNext(ctx);
     }
 
     fn middlewareNext(ctx: *Context) anyerror!Response {
-        const entry = ctx.data.get("__mw_exec_state") orelse return error.MissingMiddlewareState;
+        const entry = ctx.data.get(mw_exec_state_key) orelse return error.MissingMiddlewareState;
         const state: *MiddlewareExecState = @ptrCast(@alignCast(entry.ptr));
 
         if (state.index < state.server.middleware.items.len) {

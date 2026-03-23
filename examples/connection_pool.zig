@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
+const common = httpx.common;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -12,12 +13,12 @@ pub fn main() !void {
 
     std.debug.print("=== Connection Pool Example ===\n\n", .{});
 
-    var pool = httpx.pool.ConnectionPool.initWithConfig(allocator, .{
+    var pool = httpx.pool.ConnectionPool.initWithConfig(allocator, std.io.default, .{
         .max_connections = 20,
         .max_per_host = 5,
         .idle_timeout_ms = 60_000,
         .max_requests_per_connection = 1000,
-    });
+    }, {});
     defer pool.deinit();
 
     std.debug.print("Pool Configuration:\n", .{});
@@ -32,15 +33,16 @@ pub fn main() !void {
     std.debug.print("  Idle connections: {d}\n", .{pool.idleCount()});
 
     std.debug.print("\nConnection health checking:\n", .{});
+    const now = common.milliTimestamp();
     const conn = httpx.pool.Connection{
         .socket = undefined,
         .host = "api.example.com",
         .port = 443,
-        .created_at = std.time.milliTimestamp(),
-        .last_used = std.time.milliTimestamp(),
+        .created_at = now,
+        .last_used = now,
     };
     std.debug.print("  Connection to {s}:{d}\n", .{ conn.host, conn.port });
-    std.debug.print("  Is healthy (60s timeout): {}\n", .{conn.isHealthy(60_000)});
+    std.debug.print("  Is healthy (60s timeout): {}\n", .{conn.isHealthy(60_000, now)});
 
     std.debug.print("\nDemo complete!\n", .{});
 }

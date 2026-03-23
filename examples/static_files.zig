@@ -162,7 +162,7 @@ pub fn main() !void {
 
     const port = try demoPort(allocator);
 
-    var server = httpx.Server.initWithConfig(allocator, .{
+    var server = httpx.Server.initWithConfig(allocator, std.io.default, .{
         .host = "127.0.0.1",
         .port = port,
         .keep_alive = false,
