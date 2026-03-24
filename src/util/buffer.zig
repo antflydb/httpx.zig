@@ -35,25 +35,31 @@ pub const RingBuffer = struct {
     pub fn writeBytes(self: *Self, bytes: []const u8) !usize {
         const space = self.data.len - self.count;
         const to_write = @min(bytes.len, space);
+        const src = bytes[0..to_write];
 
-        for (bytes[0..to_write]) |byte| {
-            self.data[self.write_pos] = byte;
-            self.write_pos = (self.write_pos + 1) % self.data.len;
-            self.count += 1;
+        // Up to two memcpy calls: one to end of ring, one from start.
+        const first = @min(to_write, self.data.len - self.write_pos);
+        @memcpy(self.data[self.write_pos..][0..first], src[0..first]);
+        if (first < to_write) {
+            @memcpy(self.data[0 .. to_write - first], src[first..to_write]);
         }
+        self.write_pos = (self.write_pos + to_write) % self.data.len;
+        self.count += to_write;
 
         return to_write;
     }
 
     /// Reads bytes from the buffer into the provided slice.
-    pub fn readBytes(self: *Self, buffer: []u8) usize {
-        const to_read = @min(buffer.len, self.count);
+    pub fn readBytes(self: *Self, buf: []u8) usize {
+        const to_read = @min(buf.len, self.count);
 
-        for (buffer[0..to_read]) |*b| {
-            b.* = self.data[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % self.data.len;
-            self.count -= 1;
+        const first = @min(to_read, self.data.len - self.read_pos);
+        @memcpy(buf[0..first], self.data[self.read_pos..][0..first]);
+        if (first < to_read) {
+            @memcpy(buf[first..to_read], self.data[0 .. to_read - first]);
         }
+        self.read_pos = (self.read_pos + to_read) % self.data.len;
+        self.count -= to_read;
 
         return to_read;
     }
