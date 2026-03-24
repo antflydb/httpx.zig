@@ -136,9 +136,7 @@ pub const Executor = struct {
                 self.mutex.unlock();
                 break;
             }
-            const idx = self.tasks.items.len - 1;
-            const task = self.tasks.items[idx];
-            self.tasks.items.len = idx;
+            const task = self.tasks.pop();
             self.mutex.unlock();
 
             task.func(task.context);
@@ -156,9 +154,7 @@ pub const Executor = struct {
                 break;
             }
 
-            const idx = self.tasks.items.len - 1;
-            const task = self.tasks.items[idx];
-            self.tasks.items.len = idx;
+            const task = self.tasks.pop();
             self.mutex.unlock();
 
             task.func(task.context);

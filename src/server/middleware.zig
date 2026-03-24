@@ -102,20 +102,20 @@ pub fn cors(comptime config: CorsConfig) Middleware {
 
             fn handler(ctx: *Context, next: *Next) anyerror!Response {
                 const origin = allowedOrigin(ctx);
-                try ctx.setHeader("Access-Control-Allow-Origin", origin);
+                try ctx.setHeader(HeaderName.ACCESS_CONTROL_ALLOW_ORIGIN, origin);
                 try ctx.setHeader(HeaderName.VARY, "Origin");
-                try ctx.setHeader("Access-Control-Allow-Methods", methods_str);
-                try ctx.setHeader("Access-Control-Allow-Headers", headers_str);
+                try ctx.setHeader(HeaderName.ACCESS_CONTROL_ALLOW_METHODS, methods_str);
+                try ctx.setHeader(HeaderName.ACCESS_CONTROL_ALLOW_HEADERS, headers_str);
 
                 if (config.exposed_headers.len > 0) {
-                    try ctx.setHeader("Access-Control-Expose-Headers", exposed_str);
+                    try ctx.setHeader(HeaderName.ACCESS_CONTROL_EXPOSE_HEADERS, exposed_str);
                 }
 
                 if (config.allow_credentials) {
-                    try ctx.setHeader("Access-Control-Allow-Credentials", "true");
+                    try ctx.setHeader(HeaderName.ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
                 }
 
-                try ctx.setHeader("Access-Control-Max-Age", max_age_str);
+                try ctx.setHeader(HeaderName.ACCESS_CONTROL_MAX_AGE, max_age_str);
 
                 if (ctx.request.method == .OPTIONS) {
                     return ctx.status(204).text("");
@@ -165,7 +165,7 @@ pub fn helmet() Middleware {
                 try ctx.setHeader(HeaderName.X_CONTENT_TYPE_OPTIONS, "nosniff");
                 try ctx.setHeader(HeaderName.X_FRAME_OPTIONS, "SAMEORIGIN");
                 try ctx.setHeader(HeaderName.X_XSS_PROTECTION, "0");
-                try ctx.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+                try ctx.setHeader(HeaderName.REFERRER_POLICY, "strict-origin-when-cross-origin");
                 return next.call(ctx);
             }
         }.handler,
@@ -184,7 +184,7 @@ pub fn requestId() Middleware {
                 const id = counter.fetchAdd(1, .monotonic);
                 var buf: [16]u8 = undefined;
                 const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{id}) catch unreachable;
-                try ctx.setHeader("X-Request-ID", hex);
+                try ctx.setHeader(HeaderName.X_REQUEST_ID, hex);
                 return next_handler.call(ctx);
             }
         }.handler,

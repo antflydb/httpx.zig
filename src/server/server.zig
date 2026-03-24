@@ -178,7 +178,10 @@ pub const Context = struct {
     /// On error the value is freed.
     fn appendOwnedSetCookie(self: *Self, value: []u8) !void {
         errdefer self.allocator.free(value);
+        // Validate the fully-composed value (covers options.path, .domain, etc.)
+        if (containsCrLf(value)) return error.HeaderContainsCrLf;
         const owned_name = try self.allocator.dupe(u8, HeaderName.SET_COOKIE);
+        errdefer self.allocator.free(owned_name);
         try self.response.headers.entries.append(self.allocator, .{
             .name = owned_name,
             .value = value,
@@ -470,18 +473,19 @@ pub const Server = struct {
         parser.max_headers = self.config.max_headers;
 
         var first_request = true;
+        // Set initial timeout once; only update when transitioning to keep-alive.
+        if (self.config.request_timeout_ms > 0) {
+            try sock.setRecvTimeout(self.config.request_timeout_ms);
+        }
         while (self.running) {
-            const timeout_ms = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
-            if (timeout_ms > 0) {
-                try sock.setRecvTimeout(timeout_ms);
-            }
 
             var buffer: [8192]u8 = undefined;
             parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
             // trickles bytes just fast enough to avoid per-recv timeouts.
-            const deadline_ms: i64 = if (timeout_ms > 0) milliTimestamp() + @as(i64, @intCast(timeout_ms)) else 0;
+            const active_timeout = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
+            const deadline_ms: i64 = if (active_timeout > 0) milliTimestamp() + @as(i64, @intCast(active_timeout)) else 0;
 
             while (!parser.isComplete()) {
                 if (deadline_ms > 0 and milliTimestamp() >= deadline_ms) {
@@ -605,7 +609,15 @@ pub const Server = struct {
             try sendBuffered(&sock, &response);
 
             if (!keep_alive) return;
-            first_request = false;
+            if (first_request) {
+                first_request = false;
+                // Transition to keep-alive timeout (only one setsockopt call).
+                if (self.config.keep_alive_timeout_ms != self.config.request_timeout_ms and
+                    self.config.keep_alive_timeout_ms > 0)
+                {
+                    try sock.setRecvTimeout(self.config.keep_alive_timeout_ms);
+                }
+            }
         }
     }
 

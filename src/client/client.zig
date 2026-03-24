@@ -571,6 +571,9 @@ pub const Client = struct {
     }
 
     fn storeCookies(self: *Self, res: *const Response) !void {
+        // Fast path: skip lock + scan if no Set-Cookie header exists.
+        if (!res.headers.contains(HeaderName.SET_COOKIE)) return;
+
         self.cookie_mutex.lockUncancelable(self.io);
         defer self.cookie_mutex.unlock(self.io);
 
@@ -581,13 +584,13 @@ pub const Client = struct {
         }
     }
 
+    const containsCrLf = @import("../core/headers.zig").containsCrLf;
+
     /// Returns true if a cookie name or value contains characters that could
     /// enable header injection (CR, LF) or malform the Cookie header (;).
     fn isSafeCookieToken(s: []const u8) bool {
-        for (s) |c| {
-            if (c == '\r' or c == '\n' or c == ';') return false;
-        }
-        return true;
+        if (containsCrLf(s)) return false;
+        return std.mem.indexOfScalar(u8, s, ';') == null;
     }
 
     fn setCookieLocked(self: *Self, name: []const u8, value: []const u8) !void {
@@ -606,8 +609,8 @@ pub const Client = struct {
         }
 
         // New entry path.
-        // Cap check: only enforce for genuinely new cookies.
-        if (self.cookies.count() - 1 >= self.config.max_cookies) {
+        // count() includes the newly reserved slot, so > max means already full.
+        if (self.cookies.count() > self.config.max_cookies) {
             // Undo the slot reservation.
             self.cookies.removeByPtr(gop.key_ptr);
             return;

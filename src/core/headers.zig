@@ -60,6 +60,14 @@ pub const HeaderName = struct {
     pub const ALLOW = "Allow";
     pub const TRAILER = "Trailer";
     pub const HTTP2_SETTINGS = "HTTP2-Settings";
+    pub const ACCESS_CONTROL_ALLOW_ORIGIN = "Access-Control-Allow-Origin";
+    pub const ACCESS_CONTROL_ALLOW_METHODS = "Access-Control-Allow-Methods";
+    pub const ACCESS_CONTROL_ALLOW_HEADERS = "Access-Control-Allow-Headers";
+    pub const ACCESS_CONTROL_EXPOSE_HEADERS = "Access-Control-Expose-Headers";
+    pub const ACCESS_CONTROL_ALLOW_CREDENTIALS = "Access-Control-Allow-Credentials";
+    pub const ACCESS_CONTROL_MAX_AGE = "Access-Control-Max-Age";
+    pub const REFERRER_POLICY = "Referrer-Policy";
+    pub const X_REQUEST_ID = "X-Request-ID";
 };
 
 /// Represents a single HTTP header entry.
