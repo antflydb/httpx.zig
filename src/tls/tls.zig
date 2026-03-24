@@ -101,8 +101,6 @@ pub const TlsSession = struct {
     allocator: Allocator,
     io: Io,
     config: TlsConfig,
-    negotiated_protocol: ?[]const u8 = null,
-    peer_certificate: ?[]const u8 = null,
     connected: bool = false,
     socket: ?*Socket = null,
 
@@ -214,7 +212,6 @@ pub const TlsSession = struct {
 
         self.client = client;
         self.connected = true;
-        self.negotiated_protocol = null;
     }
 
     /// Reads decrypted data from the session.
@@ -244,24 +241,6 @@ pub const TlsSession = struct {
     pub fn getWriter(self: *Self) !*std.Io.Writer {
         const c = if (self.client) |*c| c else return error.NotConnected;
         return &c.writer;
-    }
-
-    /// Returns the negotiated ALPN protocol.
-    pub fn getAlpnProtocol(self: *const Self) ?[]const u8 {
-        return self.negotiated_protocol;
-    }
-
-    /// Returns true if HTTP/2 was negotiated.
-    pub fn isHttp2(self: *const Self) bool {
-        if (self.negotiated_protocol) |proto| {
-            return std.mem.eql(u8, proto, "h2");
-        }
-        return false;
-    }
-
-    /// Returns the peer's certificate in DER format.
-    pub fn getPeerCertificate(self: *const Self) ?[]const u8 {
-        return self.peer_certificate;
     }
 
     /// Closes the TLS session and releases all resources.

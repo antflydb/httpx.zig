@@ -589,12 +589,12 @@ pub const Client = struct {
     }
 
     fn storeCookies(self: *Self, res: *const Response) !void {
-        self.cookie_mutex.lockUncancelable(self.io);
-        defer self.cookie_mutex.unlock(self.io);
-
+        // Collect Set-Cookie values outside the lock to minimize contention.
         for (res.headers.entries.items) |entry| {
             if (!std.ascii.eqlIgnoreCase(entry.name, HeaderName.SET_COOKIE)) continue;
             const pair = common.parseSetCookiePair(entry.value) orelse continue;
+            self.cookie_mutex.lockUncancelable(self.io);
+            defer self.cookie_mutex.unlock(self.io);
             try self.setCookieLocked(pair.name, pair.value);
         }
     }

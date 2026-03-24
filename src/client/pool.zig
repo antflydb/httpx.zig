@@ -468,30 +468,23 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             }
             // Remove empty buckets to prevent unbounded map growth from
             // connections to many distinct hosts over the pool's lifetime.
-            // Collect keys first — removing during iteration is undefined behavior.
-            // Use a stack buffer and loop in passes if more than 64 empty buckets exist.
-            while (true) {
-                var key_buf: [64][]const u8 = undefined;
-                var key_count: usize = 0;
+            // Collect all empty keys first — removing during iteration is UB.
+            var empty_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer empty_keys.deinit(self.allocator);
+            {
                 var remove_it = self.host_map.iterator();
                 while (remove_it.next()) |entry| {
                     if (entry.value_ptr.items.len == 0) {
-                        if (key_count < key_buf.len) {
-                            key_buf[key_count] = entry.key_ptr.*;
-                            key_count += 1;
-                        }
+                        empty_keys.append(self.allocator, entry.key_ptr.*) catch break;
                     }
                 }
-                if (key_count == 0) break;
-                for (key_buf[0..key_count]) |key| {
-                    if (self.host_map.fetchRemove(key)) |removed| {
-                        var list = removed.value;
-                        list.deinit(self.allocator);
-                        self.allocator.free(removed.key);
-                    }
+            }
+            for (empty_keys.items) |key| {
+                if (self.host_map.fetchRemove(key)) |removed| {
+                    var list = removed.value;
+                    list.deinit(self.allocator);
+                    self.allocator.free(removed.key);
                 }
-                // If we filled the buffer, there may be more — loop again.
-                if (key_count < key_buf.len) break;
             }
         }
 

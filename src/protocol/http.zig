@@ -4,9 +4,12 @@
 //!
 //! This module focuses on protocol wire-format framing/types and helpers:
 //!
-//! - HTTP/1.x: request/response formatting utilities.
+//! - HTTP/1.x: chunked transfer encoding helpers.
 //! - HTTP/2: frame header + SETTINGS payload helpers, and basic frame IO.
 //! - HTTP/3: QUIC varint + HTTP/3 frame header helpers.
+//!
+//! Note: HTTP/1.1 request/response serialization lives in core/request.zig
+//! and core/response.zig (Request.serialize / Response.serialize).
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
