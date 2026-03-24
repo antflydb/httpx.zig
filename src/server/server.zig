@@ -149,14 +149,21 @@ pub const Context = struct {
     }
 
     /// Appends a Set-Cookie header with common cookie attributes.
+    /// Returns error.HeaderContainsCrLf if the name or value contains CR or LF.
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8, options: CookieOptions) !void {
+        if (mem.indexOfScalar(u8, name, '\r') != null or mem.indexOfScalar(u8, name, '\n') != null or
+            mem.indexOfScalar(u8, value, '\r') != null or mem.indexOfScalar(u8, value, '\n') != null)
+            return error.HeaderContainsCrLf;
         const set_cookie = try common.buildSetCookieHeader(self.allocator, name, value, options);
         defer self.allocator.free(set_cookie);
         try self.response.headers.append(HeaderName.SET_COOKIE, set_cookie);
     }
 
     /// Appends a Set-Cookie header that removes a cookie via Max-Age=0.
+    /// Returns error.HeaderContainsCrLf if the name contains CR or LF.
     pub fn removeCookie(self: *Self, name: []const u8, options: CookieOptions) !void {
+        if (mem.indexOfScalar(u8, name, '\r') != null or mem.indexOfScalar(u8, name, '\n') != null)
+            return error.HeaderContainsCrLf;
         var remove_options = options;
         remove_options.max_age = 0;
         const remove_value = try common.buildSetCookieHeader(self.allocator, name, "", remove_options);

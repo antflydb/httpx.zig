@@ -9,20 +9,20 @@ pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
         // mach_absolute_time returns ticks; convert via timebase info.
         // On Apple Silicon numer/denom == 1/1, on Intel it differs.
-        // Thread-safe init via atomics to avoid TOCTOU on numer/denom.
+        // Thread-safe init: pack both numer and denom into a single u64 atomic
+        // so readers either see both or neither (no torn read).
         const cached = struct {
-            var numer: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-            var denom: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+            var timebase: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
         };
-        var numer = cached.numer.load(.acquire);
-        if (numer == 0) {
+        var p = cached.timebase.load(.acquire);
+        if (p == 0) {
             var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
             std.c.mach_timebase_info(&info);
-            cached.denom.store(info.denom, .release);
-            cached.numer.store(info.numer, .release);
-            numer = info.numer;
+            p = @as(u64, info.numer) << 32 | @as(u64, info.denom);
+            cached.timebase.store(p, .release);
         }
-        const denom = cached.denom.load(.acquire);
+        const numer: u32 = @intCast(p >> 32);
+        const denom: u32 = @intCast(p & 0xFFFFFFFF);
         const ticks = std.c.mach_absolute_time();
         const ns: u64 = ticks * numer / denom;
         return @intCast(ns / std.time.ns_per_ms);

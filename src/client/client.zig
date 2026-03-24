@@ -413,7 +413,10 @@ pub const Client = struct {
                     informational_count += 1;
                     if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
-                    total_read = leftover;
+                    // Reset byte counter for the real response. Leftover bytes
+                    // from this recv will be re-consumed without another recv,
+                    // so they don't need to be counted here.
+                    total_read = 0;
                     continue;
                 }
             }
@@ -594,22 +597,26 @@ pub const Client = struct {
         const gop = try self.cookies.getOrPut(self.allocator, name);
 
         if (gop.found_existing) {
-            // Replace value, free old one. Key can stay as-is.
+            // Allocate new value BEFORE freeing old to avoid dangling pointer on OOM.
+            const new_value = try self.allocator.dupe(u8, value);
             self.allocator.free(gop.value_ptr.*);
-        } else {
-            // Cap check: only enforce for genuinely new cookies.
-            if (self.cookies.count() - 1 >= self.config.max_cookies) {
-                // Undo the slot reservation.
-                self.cookies.removeByPtr(gop.key_ptr);
-                return;
-            }
-            gop.key_ptr.* = try self.allocator.dupe(u8, name);
-            errdefer {
-                // If the value dupe below fails, undo the partial insertion
-                // so the map doesn't hold a key with an uninitialized value.
-                self.allocator.free(gop.key_ptr.*);
-                self.cookies.removeByPtr(gop.key_ptr);
-            }
+            gop.value_ptr.* = new_value;
+            return;
+        }
+
+        // New entry path.
+        // Cap check: only enforce for genuinely new cookies.
+        if (self.cookies.count() - 1 >= self.config.max_cookies) {
+            // Undo the slot reservation.
+            self.cookies.removeByPtr(gop.key_ptr);
+            return;
+        }
+        gop.key_ptr.* = try self.allocator.dupe(u8, name);
+        errdefer {
+            // If the value dupe below fails, undo the partial insertion
+            // so the map doesn't hold a key with an uninitialized value.
+            self.allocator.free(gop.key_ptr.*);
+            self.cookies.removeByPtr(gop.key_ptr);
         }
 
         gop.value_ptr.* = try self.allocator.dupe(u8, value);

@@ -205,27 +205,31 @@ pub const ContentType = enum {
     }
 
     /// Parses a MIME type string into a ContentType enum.
+    /// Handles parameters (e.g. "application/json; charset=utf-8") by
+    /// extracting the base type before the semicolon.
     pub fn fromString(str: []const u8) ?ContentType {
-        const types = [_]struct { name: []const u8, ct: ContentType }{
-            .{ .name = "text/plain", .ct = .text_plain },
-            .{ .name = "text/html", .ct = .text_html },
-            .{ .name = "text/css", .ct = .text_css },
-            .{ .name = "text/javascript", .ct = .text_javascript },
-            .{ .name = "application/json", .ct = .application_json },
-            .{ .name = "application/xml", .ct = .application_xml },
-            .{ .name = "application/octet-stream", .ct = .application_octet_stream },
-            .{ .name = "application/x-www-form-urlencoded", .ct = .application_form_urlencoded },
-            .{ .name = "multipart/form-data", .ct = .multipart_form_data },
-            .{ .name = "image/png", .ct = .image_png },
-            .{ .name = "image/jpeg", .ct = .image_jpeg },
-            .{ .name = "image/gif", .ct = .image_gif },
-            .{ .name = "image/webp", .ct = .image_webp },
-            .{ .name = "image/svg+xml", .ct = .image_svg },
-        };
-        for (types) |t| {
-            if (std.mem.startsWith(u8, str, t.name)) return t.ct;
-        }
-        return null;
+        const map = std.StaticStringMap(ContentType).initComptime(.{
+            .{ "text/plain", .text_plain },
+            .{ "text/html", .text_html },
+            .{ "text/css", .text_css },
+            .{ "text/javascript", .text_javascript },
+            .{ "application/json", .application_json },
+            .{ "application/xml", .application_xml },
+            .{ "application/octet-stream", .application_octet_stream },
+            .{ "application/x-www-form-urlencoded", .application_form_urlencoded },
+            .{ "multipart/form-data", .multipart_form_data },
+            .{ "image/png", .image_png },
+            .{ "image/jpeg", .image_jpeg },
+            .{ "image/gif", .image_gif },
+            .{ "image/webp", .image_webp },
+            .{ "image/svg+xml", .image_svg },
+        });
+        // Strip parameters (e.g. "; charset=utf-8") before lookup.
+        const base = if (std.mem.indexOfScalar(u8, str, ';')) |i|
+            std.mem.trim(u8, str[0..i], " \t")
+        else
+            str;
+        return map.get(base);
     }
 };
 

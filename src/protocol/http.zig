@@ -24,21 +24,8 @@ const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
 
 /// HTTP protocol version negotiation result.
-pub const NegotiatedProtocol = enum {
-    http_1_0,
-    http_1_1,
-    http_2,
-    http_3,
-
-    pub fn toVersion(self: NegotiatedProtocol) types.Version {
-        return switch (self) {
-            .http_1_0 => .HTTP_1_0,
-            .http_1_1 => .HTTP_1_1,
-            .http_2 => .HTTP_2,
-            .http_3 => .HTTP_3,
-        };
-    }
-};
+/// Alias for `types.Version` — kept for backward compatibility.
+pub const NegotiatedProtocol = types.Version;
 
 /// Standard Application-Layer Protocol Negotiation (ALPN) identifiers.
 ///
@@ -355,13 +342,13 @@ pub fn isH2cUpgradeRequest(headers: *const Headers) bool {
 }
 
 /// Determines the highest supported HTTP version based on ALPN negotiation string.
-pub fn negotiateVersion(alpn: ?[]const u8) NegotiatedProtocol {
+pub fn negotiateVersion(alpn: ?[]const u8) types.Version {
     if (alpn) |protocol| {
-        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_3)) return .http_3;
-        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_2)) return .http_2;
-        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_1_1)) return .http_1_1;
+        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_3)) return .HTTP_3;
+        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_2)) return .HTTP_2;
+        if (mem.eql(u8, protocol, AlpnProtocol.HTTP_1_1)) return .HTTP_1_1;
     }
-    return .http_1_1;
+    return .HTTP_1_1;
 }
 
 test "HTTP/2 frame header serialization" {
@@ -380,10 +367,10 @@ test "HTTP/2 frame header serialization" {
 }
 
 test "Protocol negotiation" {
-    try std.testing.expectEqual(NegotiatedProtocol.http_2, negotiateVersion("h2"));
-    try std.testing.expectEqual(NegotiatedProtocol.http_3, negotiateVersion("h3"));
-    try std.testing.expectEqual(NegotiatedProtocol.http_1_1, negotiateVersion("http/1.1"));
-    try std.testing.expectEqual(NegotiatedProtocol.http_1_1, negotiateVersion(null));
+    try std.testing.expectEqual(types.Version.HTTP_2, negotiateVersion("h2"));
+    try std.testing.expectEqual(types.Version.HTTP_3, negotiateVersion("h3"));
+    try std.testing.expectEqual(types.Version.HTTP_1_1, negotiateVersion("http/1.1"));
+    try std.testing.expectEqual(types.Version.HTTP_1_1, negotiateVersion(null));
 }
 
 test "VarInt encoding" {

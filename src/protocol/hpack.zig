@@ -175,7 +175,7 @@ pub const DynamicTable = struct {
     fn evictOne(self: *Self) void {
         if (self.entries.items.len == 0) return;
         const entry = self.entries.orderedRemove(0);
-        self.current_size -= entry.name.len + entry.value.len + 32;
+        self.current_size -= entry.size();
         self.allocator.free(entry.name);
         self.allocator.free(entry.value);
     }

@@ -356,9 +356,10 @@ pub fn parseHeadersFramePayload(
         offset += 5;
     }
 
-    // Remaining is HPACK block (minus padding)
+    // Remaining is HPACK block (minus padding).
+    // Bounds-check before subtraction to prevent usize underflow.
+    if (pad_length > payload.len - offset) return error.InvalidFrame;
     const header_block_len = payload.len - offset - pad_length;
-    if (header_block_len > payload.len - offset) return error.InvalidFrame;
 
     const headers = try hpack.decodeHeaders(
         &stream_manager.hpack_ctx,

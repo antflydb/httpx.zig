@@ -140,6 +140,7 @@ pub const Headers = struct {
             if (!has_duplicates) {
                 // Fast path: single existing entry — update value in-place.
                 const owned_value = try self.allocator.dupe(u8, value);
+                errdefer self.allocator.free(owned_value);
                 const entry = &self.entries.items[idx];
                 if (entry.owned) {
                     self.allocator.free(entry.value);
