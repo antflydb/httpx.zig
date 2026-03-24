@@ -166,6 +166,11 @@ pub const Parser = struct {
         return self.error_reason;
     }
 
+    /// Maximum retained buffer capacity after reset. Buffers that grew beyond
+    /// this threshold (e.g. due to a single large request) are released to
+    /// prevent permanent per-connection memory inflation on keep-alive connections.
+    const max_retained_capacity: usize = 64 * 1024;
+
     /// Resets the parser for reuse.
     pub fn reset(self: *Self) void {
         self.state = .start;
@@ -177,8 +182,20 @@ pub const Parser = struct {
         }
         self.status_code = null;
         self.headers.clear();
-        self.body_buffer.clearRetainingCapacity();
-        self.line_buffer.clearRetainingCapacity();
+        // Release oversized buffers to prevent permanent memory inflation
+        // from occasional large requests on long-lived keep-alive connections.
+        if (self.body_buffer.capacity > max_retained_capacity) {
+            self.body_buffer.deinit(self.allocator);
+            self.body_buffer = .empty;
+        } else {
+            self.body_buffer.clearRetainingCapacity();
+        }
+        if (self.line_buffer.capacity > max_retained_capacity) {
+            self.line_buffer.deinit(self.allocator);
+            self.line_buffer = .empty;
+        } else {
+            self.line_buffer.clearRetainingCapacity();
+        }
         self.content_length = null;
         self.chunked = false;
         self.current_chunk_size = 0;

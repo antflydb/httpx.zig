@@ -213,6 +213,51 @@ pub const SocketIoReader = struct {
     };
 };
 
+/// Adapter that exposes a `std.Io.Reader` backed by a `[]const u8` slice.
+///
+/// Used to feed in-memory data (e.g. compressed bytes) to APIs that require
+/// an `Io.Reader`, such as `std.compress.flate.Decompress`.
+pub const SliceIoReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    reader_iface: Io.Reader,
+
+    pub fn init(data: []const u8, buffer: []u8) SliceIoReader {
+        return .{
+            .data = data,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *SliceIoReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        if (bufs.len == 0) return 0;
+        const buf = bufs[0];
+        const remaining = p.data[p.pos..];
+        if (remaining.len == 0) return error.EndOfStream;
+        const n = @min(buf.len, remaining.len);
+        @memcpy(buf[0..n], remaining[0..n]);
+        p.pos += n;
+        return n;
+    }
+
+    const vtable: Io.Reader.VTable = .{
+        .stream = IoReaderHelpers.stream,
+        .discard = IoReaderHelpers.discard,
+        .readVec = readVec,
+        .rebase = IoReaderHelpers.rebase,
+    };
+};
+
 /// Adapter that exposes a `std.Io.Writer` backed by a connected `Socket`.
 ///
 /// This is primarily used to integrate with `std.crypto.tls.Client`.

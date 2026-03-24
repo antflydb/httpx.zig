@@ -24,6 +24,7 @@ const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
+const SliceIoReader = @import("../net/socket.zig").SliceIoReader;
 const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
@@ -278,92 +279,73 @@ pub const Client = struct {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
-                    if (ok) {
-                        self.tls_pool.releaseConnection(tls_conn);
-                    } else {
-                        self.tls_pool.evictConnection(tls_conn);
-                    }
+                    if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms);
-
-                const w = try tls_conn.session.getWriter();
-                try req.serialize(w);
-
-                const r = try tls_conn.session.getReader();
-                var res = try self.readResponse(r);
-
-                if (!res.headers.isKeepAlive(.HTTP_1_1)) {
-                    ok = false;
-                } else {
-                    ok = true;
-                }
-                return res;
+                return self.executeOnTls(&tls_conn.session, req, &ok);
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
             const addr = try Address.resolve(self.io, host, port);
-
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
-
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
-
-            return self.executeTlsHttp(&socket, host, req);
+            return self.executeOnNewTls(&socket, host, req);
         }
 
         if (self.config.keep_alive) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
-                if (ok) {
-                    self.pool.releaseConnection(conn);
-                } else {
-                    self.pool.evictConnection(conn);
-                }
+                if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
-
-            var bw = std.io.bufferedWriter(conn.socket.writer());
-            try req.serialize(bw.writer().any());
-            try bw.flush();
-            var res = try self.readResponse(&conn.socket);
-            if (!res.headers.isKeepAlive(.HTTP_1_1)) {
-                // Non-keepalive response: evict the connection after this request.
-                ok = false;
-            } else {
-                ok = true;
-            }
-            return res;
+            return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
         const addr = try Address.resolve(self.io, host, port);
-
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
-
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+        return self.executeOnSocket(&socket, req, null);
+    }
 
+    /// Sends request and reads response over a plain TCP socket.
+    /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
+    fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
         var bw = std.io.bufferedWriter(socket.writer());
         try req.serialize(bw.writer().any());
         try bw.flush();
-        return self.readResponse(&socket);
+        var res = try self.readResponse(socket);
+        if (keep_alive_out) |out| {
+            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+        }
+        return res;
     }
 
-    fn executeTlsHttp(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
-        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+    /// Sends request and reads response over an established TLS session.
+    /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
+    fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
+        const w = try session.getWriter();
+        try req.serialize(w);
+        const r = try session.getReader();
+        var res = try self.readResponse(r);
+        if (keep_alive_out) |out| {
+            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+        }
+        return res;
+    }
 
+    /// Creates a new TLS session on a socket and executes a request.
+    fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
+        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
         try session.handshake(host);
-
-        const w = try session.getWriter();
-        try req.serialize(w);
-
-        const r = try session.getReader();
-        return self.readResponse(r);
+        return self.executeOnTls(&session, req, null);
     }
 
     /// Unified response reader parameterized on the read source.
@@ -710,51 +692,6 @@ pub const Client = struct {
     }
 };
 
-/// Adapter that exposes a `std.Io.Reader` backed by a `[]const u8` slice.
-///
-/// Used to feed in-memory compressed bytes to `std.compress.flate.Decompress`.
-const SliceIoReader = struct {
-    data: []const u8,
-    pos: usize = 0,
-    reader_iface: Io.Reader,
-
-    const IoReaderHelpers = @import("../net/socket.zig").IoReaderHelpers;
-
-    fn init(data: []const u8, buffer: []u8) SliceIoReader {
-        return .{
-            .data = data,
-            .reader_iface = .{
-                .vtable = &vtable,
-                .buffer = buffer,
-                .seek = 0,
-                .end = 0,
-            },
-        };
-    }
-
-    fn parent(r: *Io.Reader) *SliceIoReader {
-        return @fieldParentPtr("reader_iface", r);
-    }
-
-    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
-        const p = parent(r);
-        if (bufs.len == 0) return 0;
-        const buf = bufs[0];
-        const remaining = p.data[p.pos..];
-        if (remaining.len == 0) return error.EndOfStream;
-        const n = @min(buf.len, remaining.len);
-        @memcpy(buf[0..n], remaining[0..n]);
-        p.pos += n;
-        return n;
-    }
-
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
-};
 
 test "Client initialization" {
     const allocator = std.testing.allocator;

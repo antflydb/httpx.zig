@@ -30,6 +30,7 @@ pub const Request = struct {
     body_owned: bool = false,
     custom_method: ?[]const u8 = null,
     query_owned: bool = false,
+    query_builder: ?std.ArrayListUnmanaged(u8) = null,
     context: ?*anyopaque = null,
 
     const Self = @This();
@@ -68,7 +69,9 @@ pub const Request = struct {
                 self.allocator.free(b);
             }
         }
-        if (self.query_owned) {
+        if (self.query_builder) |*builder| {
+            builder.deinit(self.allocator);
+        } else if (self.query_owned) {
             if (self.uri.query) |q| {
                 self.allocator.free(q);
             }
@@ -101,26 +104,39 @@ pub const Request = struct {
     /// Appends a URL query parameter to the request URI.
     ///
     /// The key and value are percent-encoded before being added.
+    /// Uses an append-based approach to avoid O(N²) copying when adding
+    /// multiple parameters sequentially.
     pub fn addQueryParam(self: *Self, key: []const u8, value: []const u8) !void {
         const enc_key = try PercentEncoding.encode(self.allocator, key);
         defer self.allocator.free(enc_key);
         const enc_value = try PercentEncoding.encode(self.allocator, value);
         defer self.allocator.free(enc_value);
 
-        const previous = self.uri.query;
-        const next_query = if (previous) |q|
-            try std.fmt.allocPrint(self.allocator, "{s}&{s}={s}", .{ q, enc_key, enc_value })
-        else
-            try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ enc_key, enc_value });
-
-        if (self.query_owned) {
-            if (previous) |q| {
-                self.allocator.free(q);
+        if (self.query_builder == null) {
+            self.query_builder = .empty;
+            // Seed the builder with any pre-existing query string.
+            if (self.uri.query) |q| {
+                try self.query_builder.?.appendSlice(self.allocator, q);
             }
         }
 
-        self.uri.query = next_query;
-        self.query_owned = true;
+        var builder = &self.query_builder.?;
+        if (builder.items.len > 0) {
+            try builder.append(self.allocator, '&');
+        }
+        try builder.appendSlice(self.allocator, enc_key);
+        try builder.append(self.allocator, '=');
+        try builder.appendSlice(self.allocator, enc_value);
+
+        // Free the previous owned query string if any.
+        if (self.query_owned) {
+            if (self.uri.query) |q| {
+                self.allocator.free(q);
+            }
+        }
+        // Point the URI query at the builder's live buffer.
+        self.uri.query = builder.items;
+        self.query_owned = false; // Builder owns the memory now.
     }
 
     /// Returns the host from the URI.

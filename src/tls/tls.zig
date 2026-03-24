@@ -128,8 +128,11 @@ pub const TlsSession = struct {
     }
 
     /// Releases session resources.
+    /// Sends a TLS close_notify alert before tearing down, so the peer can
+    /// distinguish a clean close from a truncation attack.
     pub fn deinit(self: *Self) void {
-        if (self.client != null) {
+        if (self.client) |*c| {
+            c.end() catch {};
             self.client = null;
         }
 
@@ -261,8 +264,11 @@ pub const TlsSession = struct {
         return self.peer_certificate;
     }
 
-    /// Closes the TLS session.
+    /// Closes the TLS session, sending a close_notify alert.
     pub fn close(self: *Self) void {
+        if (self.client) |*c| {
+            c.end() catch {};
+        }
         self.connected = false;
         self.client = null;
     }

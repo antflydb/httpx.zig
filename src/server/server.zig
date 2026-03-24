@@ -232,7 +232,7 @@ pub const Context = struct {
     /// Sends chunked transfer-encoded payload with optional trailers.
     pub fn chunked(self: *Self, data: []const u8, trailers: ?*const Headers) !Response {
         const encoded = try http.encodeChunkedBody(data, trailers, self.allocator);
-        defer self.allocator.free(encoded);
+        errdefer self.allocator.free(encoded);
 
         _ = try self.response.header(HeaderName.TRANSFER_ENCODING, "chunked");
         if (trailers) |trailer_headers| {
@@ -240,7 +240,9 @@ pub const Context = struct {
             defer self.allocator.free(trailer_names);
             _ = try self.response.header(HeaderName.TRAILER, trailer_names);
         }
-        _ = self.response.body(encoded);
+        // Transfer ownership to the builder to avoid a second allocation in build().
+        self.response.body_data = encoded;
+        self.response.body_owned = true;
         return self.response.build();
     }
 
