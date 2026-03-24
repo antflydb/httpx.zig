@@ -378,6 +378,7 @@ pub const Client = struct {
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
         var leftover: usize = 0;
+        var informational_count: u8 = 0;
 
         while (true) {
             while (!parser.isComplete()) {
@@ -405,8 +406,12 @@ pub const Client = struct {
             if (!parser.isComplete()) return error.InvalidResponse;
 
             // Skip 1xx informational responses (e.g. 100 Continue).
+            // Cap at 20 to prevent a malicious server from keeping the connection
+            // occupied indefinitely with an unbounded stream of 1xx responses.
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
+                    informational_count += 1;
+                    if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
                     total_read = leftover;
                     continue;
@@ -492,7 +497,10 @@ pub const Client = struct {
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(self.allocator);
+        // Pre-allocate using compressed size as a lower-bound hint to reduce reallocs.
+        try result.ensureTotalCapacity(self.allocator, body.len);
 
+        const max_decompressed = self.config.max_response_size;
         var read_buf: [16 * 1024]u8 = undefined;
         while (true) {
             var iov = [_][]u8{read_buf[0..]};
@@ -501,6 +509,7 @@ pub const Client = struct {
                 else => return error.DecompressionFailed,
             };
             if (n == 0) break;
+            if (result.items.len + n > max_decompressed) return error.ResponseTooLarge;
             try result.appendSlice(self.allocator, read_buf[0..n]);
         }
 
@@ -582,23 +591,22 @@ pub const Client = struct {
         // or malform the Cookie header (semicolon in value).
         if (!isSafeCookieToken(name) or !isSafeCookieToken(value)) return;
 
-        const was_present = if (self.cookies.fetchRemove(name)) |removed| blk: {
-            self.allocator.free(removed.key);
-            self.allocator.free(removed.value);
-            break :blk true;
-        } else false;
+        const gop = try self.cookies.getOrPut(self.allocator, name);
 
-        // Cap check: only enforce for genuinely new cookies (replacements are fine).
-        if (!was_present and self.cookies.count() >= self.config.max_cookies) {
-            return; // silently drop — don't fail the request over a cookie limit
+        if (gop.found_existing) {
+            // Replace value, free old one. Key can stay as-is.
+            self.allocator.free(gop.value_ptr.*);
+        } else {
+            // Cap check: only enforce for genuinely new cookies.
+            if (self.cookies.count() - 1 >= self.config.max_cookies) {
+                // Undo the slot reservation.
+                self.cookies.removeByPtr(gop.key_ptr);
+                return;
+            }
+            gop.key_ptr.* = try self.allocator.dupe(u8, name);
         }
 
-        const owned_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned_name);
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-
-        try self.cookies.put(self.allocator, owned_name, owned_value);
+        gop.value_ptr.* = try self.allocator.dupe(u8, value);
     }
 
     /// Adds or replaces a cookie in the in-memory client cookie jar.

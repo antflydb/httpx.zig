@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mem = std.mem;
 const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
-
 /// Monotonic millisecond timestamp for connection health and deadline tracking.
 pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
@@ -32,18 +31,6 @@ pub fn milliTimestamp() i64 {
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
         return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
     }
-}
-
-/// Joins string slices with `sep`, writing into a heap-allocated buffer.
-pub fn joinStrings(allocator: std.mem.Allocator, items: []const []const u8, sep: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    const writer = arrayListWriter(&out, allocator);
-    for (items, 0..) |item, i| {
-        if (i > 0) try writer.writeAll(sep);
-        try writer.writeAll(item);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.

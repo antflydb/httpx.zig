@@ -725,7 +725,7 @@ fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
     const names = try allocator.alloc([]const u8, items.len);
     defer allocator.free(names);
     for (items, 0..) |h, i| names[i] = h.name;
-    return common.joinStrings(allocator, names, ", ");
+    return std.mem.join(allocator, ", ", names);
 }
 
 test "Server initialization" {

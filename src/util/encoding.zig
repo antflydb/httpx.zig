@@ -13,81 +13,31 @@ const Allocator = std.mem.Allocator;
 
 /// Base64 encoding and decoding per RFC 4648.
 pub const Base64 = struct {
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const url_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const standard = std.base64.standard;
+    const url_safe = std.base64.url_safe_no_pad;
 
     /// Encodes data to standard Base64.
     pub fn encode(allocator: Allocator, data: []const u8) ![]u8 {
-        const len = ((data.len + 2) / 3) * 4;
-        var result = try allocator.alloc(u8, len);
-        var i: usize = 0;
-        var j: usize = 0;
-
-        while (i < data.len) {
-            const b0 = data[i];
-            const b1 = if (i + 1 < data.len) data[i + 1] else 0;
-            const b2 = if (i + 2 < data.len) data[i + 2] else 0;
-
-            result[j] = alphabet[b0 >> 2];
-            result[j + 1] = alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
-            result[j + 2] = if (i + 1 < data.len) alphabet[((b1 & 0x0F) << 2) | (b2 >> 6)] else '=';
-            result[j + 3] = if (i + 2 < data.len) alphabet[b2 & 0x3F] else '=';
-
-            i += 3;
-            j += 4;
-        }
-
+        const len = standard.Encoder.calcSize(data.len);
+        const result = try allocator.alloc(u8, len);
+        _ = standard.Encoder.encode(result, data);
         return result;
     }
 
     /// Decodes Base64 data.
     pub fn decode(allocator: Allocator, data: []const u8) ![]u8 {
-        if (data.len == 0) return allocator.alloc(u8, 0);
-        if (data.len % 4 != 0) return error.InvalidBase64;
-
-        var padding: usize = 0;
-        if (data[data.len - 1] == '=') padding += 1;
-        if (data[data.len - 2] == '=') padding += 1;
-
-        const out_len = (data.len / 4) * 3 - padding;
-        var result = try allocator.alloc(u8, out_len);
-        var i: usize = 0;
-        var j: usize = 0;
-
-        while (i < data.len) {
-            const c0 = indexOf(alphabet, data[i]) orelse return error.InvalidBase64;
-            const c1 = indexOf(alphabet, data[i + 1]) orelse return error.InvalidBase64;
-            const c2 = if (data[i + 2] == '=') @as(u6, 0) else indexOf(alphabet, data[i + 2]) orelse return error.InvalidBase64;
-            const c3 = if (data[i + 3] == '=') @as(u6, 0) else indexOf(alphabet, data[i + 3]) orelse return error.InvalidBase64;
-
-            if (j < out_len) result[j] = (@as(u8, c0) << 2) | (@as(u8, c1) >> 4);
-            if (j + 1 < out_len) result[j + 1] = (@as(u8, c1) << 4) | (@as(u8, c2) >> 2);
-            if (j + 2 < out_len) result[j + 2] = (@as(u8, c2) << 6) | @as(u8, c3);
-
-            i += 4;
-            j += 3;
-        }
-
+        const len = standard.Decoder.calcSizeForSlice(data) catch return error.InvalidBase64;
+        const result = try allocator.alloc(u8, len);
+        standard.Decoder.decode(result, data) catch return error.InvalidBase64;
         return result;
     }
 
     /// Encodes to URL-safe Base64 (no padding).
     pub fn encodeUrl(allocator: Allocator, data: []const u8) ![]u8 {
-        const result = try encode(allocator, data);
-        for (result) |*c| {
-            if (c.* == '+') c.* = '-';
-            if (c.* == '/') c.* = '_';
-        }
-        var end = result.len;
-        while (end > 0 and result[end - 1] == '=') end -= 1;
-        return allocator.realloc(result, end);
-    }
-
-    fn indexOf(chars: []const u8, c: u8) ?u6 {
-        for (chars, 0..) |ch, i| {
-            if (ch == c) return @intCast(i);
-        }
-        return null;
+        const len = url_safe.Encoder.calcSize(data.len);
+        const result = try allocator.alloc(u8, len);
+        _ = url_safe.Encoder.encode(result, data);
+        return result;
     }
 };
 
@@ -97,7 +47,7 @@ pub const Hex = struct {
 
     /// Encodes data to lowercase hexadecimal.
     pub fn encode(allocator: Allocator, data: []const u8) ![]u8 {
-        var result = try allocator.alloc(u8, data.len * 2);
+        const result = try allocator.alloc(u8, data.len * 2);
         for (data, 0..) |byte, i| {
             result[i * 2] = hex_chars[byte >> 4];
             result[i * 2 + 1] = hex_chars[byte & 0x0F];
@@ -109,7 +59,7 @@ pub const Hex = struct {
     pub fn decode(allocator: Allocator, data: []const u8) ![]u8 {
         if (data.len % 2 != 0) return error.InvalidHex;
 
-        var result = try allocator.alloc(u8, data.len / 2);
+        const result = try allocator.alloc(u8, data.len / 2);
         var i: usize = 0;
         while (i < data.len) {
             const high = hexValue(data[i]) orelse return error.InvalidHex;
@@ -130,7 +80,14 @@ pub const Hex = struct {
 
 /// URL percent-encoding per RFC 3986.
 pub const PercentEncoding = struct {
-    const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    /// Comptime lookup table: true if byte is unreserved (RFC 3986 §2.3).
+    const unreserved_table: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") |c| {
+            table[c] = true;
+        }
+        break :blk table;
+    };
 
     /// Encodes a string for use in URLs.
     pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
@@ -138,7 +95,7 @@ pub const PercentEncoding = struct {
         const writer = arrayListWriter(&result, allocator);
 
         for (input) |c| {
-            if (std.mem.indexOfScalar(u8, unreserved, c) != null) {
+            if (unreserved_table[c]) {
                 try writer.writeByte(c);
             } else {
                 try writer.print("%{X:0>2}", .{c});
@@ -217,6 +174,17 @@ test "Base64 roundtrip" {
     defer allocator.free(decoded);
 
     try std.testing.expectEqualStrings(original, decoded);
+}
+
+test "Base64 URL-safe encode" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try Base64.encodeUrl(allocator, "\xfb\xff\xfe");
+    defer allocator.free(encoded);
+    // URL-safe: no +, /, or = characters
+    for (encoded) |c| {
+        try std.testing.expect(c != '+' and c != '/' and c != '=');
+    }
 }
 
 test "Hex encode" {
