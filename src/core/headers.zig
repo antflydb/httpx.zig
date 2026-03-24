@@ -10,7 +10,8 @@
 //! - Memory-safe ownership model with automatic cleanup
 
 const std = @import("std");
-const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const array_list_writer_mod = @import("../util/array_list_writer.zig");
+const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
@@ -109,6 +110,7 @@ pub const Headers = struct {
     /// value slices outlive this Headers instance. Used on hot paths where the
     /// source lifetime is guaranteed (e.g. parser → request in the server loop).
     pub fn appendBorrowed(self: *Self, name: []const u8, value: []const u8) !void {
+        if (containsCrLf(name) or containsCrLf(value)) return error.HeaderContainsCrLf;
         try self.entries.append(self.allocator, .{
             .name = name,
             .value = value,
@@ -284,10 +286,7 @@ pub const Headers = struct {
 
     /// Serializes headers to an allocated string.
     pub fn toSlice(self: *const Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8).empty;
-        const writer = arrayListWriter(&buffer, allocator);
-        try self.serialize(writer);
-        return buffer.toOwnedSlice(allocator);
+        return serializeToSlice(allocator, self);
     }
 };
 

@@ -51,6 +51,7 @@ pub const Http2FrameType = enum(u8) {
     goaway = 0x7,
     window_update = 0x8,
     continuation = 0x9,
+    _, // RFC 7540 §4.1: unknown frame types MUST be ignored
 };
 
 /// Represents the 9-byte header standard for all HTTP/2 frames.

@@ -9,7 +9,7 @@
 //! - Request serialization for wire format
 
 const std = @import("std");
-const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const serializeToSlice = @import("../util/array_list_writer.zig").serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -164,10 +164,7 @@ pub const Request = struct {
 
     /// Serializes to an allocated buffer.
     pub fn toSlice(self: *const Self, allocator: Allocator) ![]u8 {
-        var buffer = std.ArrayListUnmanaged(u8).empty;
-        const writer = arrayListWriter(&buffer, allocator);
-        try self.serialize(writer);
-        return buffer.toOwnedSlice(allocator);
+        return serializeToSlice(allocator, self);
     }
 };
 

@@ -30,3 +30,12 @@ pub fn ArrayListWriter(comptime List: type) type {
 pub fn arrayListWriter(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) ArrayListWriter(std.ArrayListUnmanaged(u8)) {
     return .{ .list = list, .allocator = allocator };
 }
+
+/// Serializes any object with a `serialize(writer) !void` method to an owned slice.
+pub fn serializeToSlice(allocator: std.mem.Allocator, obj: anytype) ![]u8 {
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(allocator);
+    const writer = arrayListWriter(&buffer, allocator);
+    try obj.serialize(writer);
+    return buffer.toOwnedSlice(allocator);
+}

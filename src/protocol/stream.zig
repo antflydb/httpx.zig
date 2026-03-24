@@ -17,6 +17,13 @@ const Allocator = mem.Allocator;
 const http = @import("http.zig");
 const hpack = @import("hpack.zig");
 
+/// Overflow-guarded window delta addition per RFC 7540 §6.9.1.
+fn addWindowDelta(current: i32, delta: i32) error{FlowControlError}!i32 {
+    const next = @as(i64, current) + delta;
+    if (next > std.math.maxInt(i32)) return error.FlowControlError;
+    return @intCast(next);
+}
+
 /// HTTP/2 Stream States as per RFC 7540 Section 5.1
 pub const StreamState = enum {
     /// Stream has not been opened yet. Reserved stream IDs are in this state.
@@ -145,16 +152,12 @@ pub const Stream = struct {
 
     /// Updates the send window by delta (can be negative for data sent).
     pub fn updateSendWindow(self: *Self, delta: i32) !void {
-        const new_window = @as(i64, self.send_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
-        self.send_window = @intCast(new_window);
+        self.send_window = try addWindowDelta(self.send_window, delta);
     }
 
     /// Updates the receive window by delta.
     pub fn updateRecvWindow(self: *Self, delta: i32) !void {
-        const new_window = @as(i64, self.recv_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
-        self.recv_window = @intCast(new_window);
+        self.recv_window = try addWindowDelta(self.recv_window, delta);
     }
 };
 
@@ -205,10 +208,12 @@ pub const StreamManager = struct {
     pub fn createStream(self: *Self) !*Stream {
         const id = if (self.is_client) blk: {
             const id = self.next_client_stream_id;
+            if (id > std.math.maxInt(u31) - 2) return error.StreamIdExhausted;
             self.next_client_stream_id += 2;
             break :blk id;
         } else blk: {
             const id = self.next_server_stream_id;
+            if (id > std.math.maxInt(u31) - 2) return error.StreamIdExhausted;
             self.next_server_stream_id += 2;
             break :blk id;
         };
@@ -264,20 +269,17 @@ pub const StreamManager = struct {
 
     /// Updates connection-level send window.
     pub fn updateConnectionSendWindow(self: *Self, delta: i32) !void {
-        const new_window = @as(i64, self.connection_send_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
-        self.connection_send_window = @intCast(new_window);
+        self.connection_send_window = try addWindowDelta(self.connection_send_window, delta);
     }
 
     /// Updates connection-level receive window.
     pub fn updateConnectionRecvWindow(self: *Self, delta: i32) !void {
-        const new_window = @as(i64, self.connection_recv_window) + delta;
-        if (new_window > 2147483647) return error.FlowControlError;
-        self.connection_recv_window = @intCast(new_window);
+        self.connection_recv_window = try addWindowDelta(self.connection_recv_window, delta);
     }
 
     /// Applies initial window size change from SETTINGS to all streams.
     pub fn applyInitialWindowSizeChange(self: *Self, old_size: u32, new_size: u32) !void {
+        if (new_size > std.math.maxInt(i32) or old_size > std.math.maxInt(i32)) return error.FlowControlError;
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
         var it = self.streams.iterator();
         while (it.next()) |entry| {

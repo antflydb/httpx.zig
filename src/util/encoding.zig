@@ -91,20 +91,27 @@ pub const PercentEncoding = struct {
         break :blk table;
     };
 
+    const hex_digits = "0123456789ABCDEF";
+
+    /// Writes percent-encoded bytes directly to any writer.
+    pub fn encodeTo(writer: anytype, input: []const u8) !void {
+        for (input) |c| {
+            if (unreserved_table[c]) {
+                try writer.writeByte(c);
+            } else {
+                try writer.writeByte('%');
+                try writer.writeByte(hex_digits[c >> 4]);
+                try writer.writeByte(hex_digits[c & 0xF]);
+            }
+        }
+    }
+
     /// Encodes a string for use in URLs.
     pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(allocator);
         const writer = arrayListWriter(&result, allocator);
-
-        for (input) |c| {
-            if (unreserved_table[c]) {
-                try writer.writeByte(c);
-            } else {
-                try writer.print("%{X:0>2}", .{c});
-            }
-        }
-
+        try encodeTo(writer, input);
         return result.toOwnedSlice(allocator);
     }
 
@@ -153,11 +160,9 @@ pub fn encodeFormData(allocator: Allocator, params: []const struct { []const u8,
 
     for (params, 0..) |param, idx| {
         if (idx > 0) try writer.writeByte('&');
-        const key = try PercentEncoding.encode(allocator, param[0]);
-        defer allocator.free(key);
-        const value = try PercentEncoding.encode(allocator, param[1]);
-        defer allocator.free(value);
-        try writer.print("{s}={s}", .{ key, value });
+        try PercentEncoding.encodeTo(writer, param[0]);
+        try writer.writeByte('=');
+        try PercentEncoding.encodeTo(writer, param[1]);
     }
 
     return result.toOwnedSlice(allocator);

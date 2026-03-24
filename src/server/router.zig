@@ -181,10 +181,9 @@ pub const Router = struct {
                     if (!mem.eql(u8, lit, part)) return null;
                 },
                 .param => |name| {
-                    if (param_idx < params.len) {
-                        params[param_idx] = .{ .name = name, .value = part };
-                        param_idx += 1;
-                    }
+                    if (param_idx >= params.len) return null;
+                    params[param_idx] = .{ .name = name, .value = part };
+                    param_idx += 1;
                 },
                 .wildcard => {
                     return param_idx;
@@ -243,6 +242,21 @@ pub const RouteGroup = struct {
     /// Adds a DELETE route.
     pub fn delete(self: *Self, path: []const u8, handler: Handler) !void {
         try self.add(.DELETE, path, handler);
+    }
+
+    /// Adds a PATCH route.
+    pub fn patch(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.add(.PATCH, path, handler);
+    }
+
+    /// Adds a HEAD route.
+    pub fn head(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.add(.HEAD, path, handler);
+    }
+
+    /// Adds an OPTIONS route.
+    pub fn options(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.add(.OPTIONS, path, handler);
     }
 };
 

@@ -125,6 +125,7 @@ pub const DynamicEntry = struct {
 pub const DynamicTable = struct {
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(DynamicEntry) = .empty,
+    base: usize = 0, // index of oldest live entry in backing array
     current_size: usize = 0,
     max_size: usize = 4096, // Default per RFC 7541
 
@@ -139,7 +140,7 @@ pub const DynamicTable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.entries.items) |entry| {
+        for (self.entries.items[self.base..]) |entry| {
             self.allocator.free(entry.name);
             self.allocator.free(entry.value);
         }
@@ -152,12 +153,15 @@ pub const DynamicTable = struct {
         const entry_size = name.len + value.len + 32;
 
         // Evict entries until we have room
-        while (self.current_size + entry_size > self.max_size and self.entries.items.len > 0) {
+        while (self.current_size + entry_size > self.max_size and self.len() > 0) {
             self.evictOne();
         }
 
         // If single entry is larger than max_size, don't add it
         if (entry_size > self.max_size) return;
+
+        // Compact if dead entries exceed live entries (amortized O(1))
+        if (self.base > self.len()) self.compact();
 
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
@@ -171,33 +175,43 @@ pub const DynamicTable = struct {
         self.current_size += entry_size;
     }
 
-    /// Evicts the oldest entry (first in list, i.e. index 0).
+    /// Evicts the oldest entry — O(1) via base pointer advancement.
     fn evictOne(self: *Self) void {
-        if (self.entries.items.len == 0) return;
-        const entry = self.entries.orderedRemove(0);
+        if (self.len() == 0) return;
+        const entry = self.entries.items[self.base];
         self.current_size -= entry.size();
         self.allocator.free(entry.name);
         self.allocator.free(entry.value);
+        self.base += 1;
+    }
+
+    /// Compacts the backing array by shifting live entries to the front.
+    fn compact(self: *Self) void {
+        const live = self.len();
+        std.mem.copyForwards(DynamicEntry, self.entries.items[0..live], self.entries.items[self.base..][0..live]);
+        self.entries.items.len = live;
+        self.base = 0;
     }
 
     /// Gets an entry by index (0-based within dynamic table).
     /// Index 0 = newest entry (last appended), higher indices = older entries.
     pub fn get(self: *const Self, index: usize) ?StaticTable.Entry {
-        if (index >= self.entries.items.len) return null;
-        const entry = self.entries.items[self.entries.items.len - 1 - index];
+        const live = self.len();
+        if (index >= live) return null;
+        const entry = self.entries.items[self.base + live - 1 - index];
         return .{ .name = entry.name, .value = entry.value };
     }
 
     /// Updates the maximum size and evicts entries if needed.
     pub fn setMaxSize(self: *Self, new_max: usize) void {
         self.max_size = new_max;
-        while (self.current_size > self.max_size and self.entries.items.len > 0) {
+        while (self.current_size > self.max_size and self.len() > 0) {
             self.evictOne();
         }
     }
 
     pub fn len(self: *const Self) usize {
-        return self.entries.items.len;
+        return self.entries.items.len - self.base;
     }
 };
 

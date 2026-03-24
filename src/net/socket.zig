@@ -108,10 +108,7 @@ pub const Socket = struct {
             .readFn = struct {
                 fn read(ctx: *const anyopaque, buffer: []u8) !usize {
                     const s: *Socket = @ptrCast(@constCast(ctx));
-                    return s.recv(buffer) catch |err| switch (err) {
-                        error.WouldBlock => 0,
-                        else => err,
-                    };
+                    return s.recv(buffer);
                 }
             }.read,
         };

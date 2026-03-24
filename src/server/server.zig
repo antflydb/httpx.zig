@@ -160,8 +160,13 @@ pub const Context = struct {
         if (containsCrLf(name) or containsCrLf(value))
             return error.HeaderContainsCrLf;
         const set_cookie = try common.buildSetCookieHeader(self.allocator, name, value, options);
-        defer self.allocator.free(set_cookie);
-        try self.response.headers.append(HeaderName.SET_COOKIE, set_cookie);
+        errdefer self.allocator.free(set_cookie);
+        const owned_name = try self.allocator.dupe(u8, HeaderName.SET_COOKIE);
+        try self.response.headers.entries.append(self.allocator, .{
+            .name = owned_name,
+            .value = set_cookie,
+            .owned = true,
+        });
     }
 
     /// Appends a Set-Cookie header that removes a cookie via Max-Age=0.
@@ -172,8 +177,13 @@ pub const Context = struct {
         var remove_options = options;
         remove_options.max_age = 0;
         const remove_value = try common.buildSetCookieHeader(self.allocator, name, "", remove_options);
-        defer self.allocator.free(remove_value);
-        try self.response.headers.append(HeaderName.SET_COOKIE, remove_value);
+        errdefer self.allocator.free(remove_value);
+        const owned_name = try self.allocator.dupe(u8, HeaderName.SET_COOKIE);
+        try self.response.headers.entries.append(self.allocator, .{
+            .name = owned_name,
+            .value = remove_value,
+            .owned = true,
+        });
     }
 
     /// Sends a plain text response.
@@ -207,11 +217,12 @@ pub const Context = struct {
         }
 
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
-        defer self.allocator.free(content);
+        errdefer self.allocator.free(content);
         _ = try f.readAll(content);
 
         _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
-        _ = self.response.body(content);
+        self.response.body_data = content;
+        self.response.body_owned = true;
         return self.response.build();
     }
 
@@ -625,7 +636,7 @@ pub const Server = struct {
 
     /// Sets the `Allow` header for automatic OPTIONS and 405 responses.
     fn setAllowHeader(_: *Self, headers: *Headers, methods: []const types.Method) !void {
-        var buf: [128]u8 = undefined;
+        var buf: [256]u8 = undefined;
         var pos: usize = 0;
         var has_options = false;
 
