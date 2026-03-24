@@ -42,10 +42,15 @@ const Segment = union(enum) {
     wildcard: void,
 };
 
+/// Number of method variants used for per-method route partitioning.
+const method_count = @typeInfo(types.Method).@"enum".fields.len;
+
 /// HTTP Router with path parameter support.
+/// Routes are partitioned by HTTP method for O(R/M) lookup instead of O(R).
 pub const Router = struct {
     allocator: Allocator,
-    routes: std.ArrayListUnmanaged(Route) = .empty,
+    /// Per-method route lists indexed by @intFromEnum(method).
+    method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
     not_found_handler: ?Handler = null,
 
     const Self = @This();
@@ -57,19 +62,29 @@ pub const Router = struct {
 
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
-        for (self.routes.items) |route| {
-            self.allocator.free(route.segments);
-            if (route.pattern_owned) {
-                self.allocator.free(route.pattern);
+        for (&self.method_routes) |*routes| {
+            for (routes.items) |route| {
+                self.allocator.free(route.segments);
+                if (route.pattern_owned) {
+                    self.allocator.free(route.pattern);
+                }
             }
+            routes.deinit(self.allocator);
         }
-        self.routes.deinit(self.allocator);
+    }
+
+    fn routesFor(self: *Self, method: types.Method) *std.ArrayListUnmanaged(Route) {
+        return &self.method_routes[@intFromEnum(method)];
+    }
+
+    fn routesForConst(self: *const Self, method: types.Method) []const Route {
+        return self.method_routes[@intFromEnum(method)].items;
     }
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: Handler) !void {
         const segments = try self.parsePattern(pattern);
-        try self.routes.append(self.allocator, .{
+        try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = pattern,
             .segments = segments,
@@ -82,7 +97,7 @@ pub const Router = struct {
         const owned = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(owned);
         const segments = try self.parsePattern(owned);
-        try self.routes.append(self.allocator, .{
+        try self.routesFor(method).append(self.allocator, .{
             .method = method,
             .pattern = owned,
             .pattern_owned = true,
@@ -115,9 +130,7 @@ pub const Router = struct {
     /// the returned slice borrows from it, so it remains valid as long as
     /// the caller keeps the buffer alive.
     pub fn find(self: *Self, method: types.Method, path: []const u8, params_buf: *[16]RouteParam) ?struct { handler: Handler, params: []const RouteParam } {
-        for (self.routes.items) |route| {
-            if (route.method != method) continue;
-
+        for (self.routesForConst(method)) |route| {
             if (self.matchRoute(route, path, params_buf)) |param_count| {
                 return .{
                     .handler = route.handler,
@@ -131,26 +144,22 @@ pub const Router = struct {
 
     /// Returns the list of allowed methods for a given path.
     ///
-    /// The method list is deduplicated and written into `out_methods`.
-    /// The returned value is the number of methods written.
+    /// Scans all method partitions; the returned value is the number of
+    /// methods written into `out_methods`.
     pub fn allowedMethods(self: *const Self, path: []const u8, out_methods: *[16]types.Method) usize {
         var params_buf: [16]RouteParam = undefined;
         var count: usize = 0;
 
-        for (self.routes.items) |route| {
-            if (self.matchRoute(route, path, &params_buf) == null) continue;
-
-            var exists = false;
-            for (out_methods[0..count]) |existing| {
-                if (existing == route.method) {
-                    exists = true;
-                    break;
+        for (0..method_count) |mi| {
+            const routes = self.method_routes[mi].items;
+            for (routes) |route| {
+                if (self.matchRoute(route, path, &params_buf) != null) {
+                    if (count < out_methods.len) {
+                        out_methods[count] = route.method;
+                        count += 1;
+                    }
+                    break; // one match per method partition is enough
                 }
-            }
-
-            if (!exists and count < out_methods.len) {
-                out_methods[count] = route.method;
-                count += 1;
             }
         }
 

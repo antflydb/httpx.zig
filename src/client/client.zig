@@ -85,6 +85,8 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
+    /// Lazily-allocated 64KB decompression window reused across responses.
+    decompress_window: ?[]u8 = null,
 
     const Self = @This();
 
@@ -119,6 +121,7 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
+        if (self.decompress_window) |w| self.allocator.free(w);
     }
 
     /// Adds an interceptor to the client.
@@ -482,10 +485,12 @@ pub const Client = struct {
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Heap-allocate the decompression window (64KB). Stack allocation would
-        // blow fiber stacks (~84KB total with other buffers in this call chain).
-        const decompress_buf = try self.allocator.alloc(u8, flate.max_window_len);
-        defer self.allocator.free(decompress_buf);
+        // Reuse a pooled 64KB decompression window across responses.
+        // Lazily allocated on first compressed response, freed in deinit().
+        if (self.decompress_window == null) {
+            self.decompress_window = try self.allocator.alloc(u8, flate.max_window_len);
+        }
+        const decompress_buf = self.decompress_window.?;
 
         var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
 

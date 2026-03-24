@@ -91,7 +91,7 @@ pub const Headers = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// Appends a header, allowing multiple values for the same name.
+    /// Appends a header, duplicating both name and value.
     pub fn append(self: *Self, name: []const u8, value: []const u8) !void {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
@@ -100,6 +100,17 @@ pub const Headers = struct {
             .name = owned_name,
             .value = owned_value,
             .owned = true,
+        });
+    }
+
+    /// Appends a header without copying. The caller must ensure the name and
+    /// value slices outlive this Headers instance. Used on hot paths where the
+    /// source lifetime is guaranteed (e.g. parser → request in the server loop).
+    pub fn appendBorrowed(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.entries.append(self.allocator, .{
+            .name = name,
+            .value = value,
+            .owned = false,
         });
     }
 

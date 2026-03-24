@@ -68,6 +68,8 @@ pub const Context = struct {
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(DataEntry),
     max_file_size: usize = types.default_max_body_size,
+    /// Internal: middleware dispatch state. Not part of the public API.
+    _mw_state: ?*Server.MiddlewareExecState = null,
 
     /// Entry in the context data map with an optional destructor for cleanup.
     pub const DataEntry = struct {
@@ -491,15 +493,17 @@ pub const Server = struct {
             defer req.deinit();
             req.version = parser.version;
 
+            // Borrow headers and body from the parser without copying.
+            // The parser outlives the request within this loop iteration:
+            // req is deinitialized via `defer req.deinit()` before
+            // `parser.reset()` at the top of the next iteration.
             for (parser.headers.entries.items) |h| {
-                try req.headers.append(h.name, h.value);
+                try req.headers.appendBorrowed(h.name, h.value);
             }
 
             if (parser.getBody().len > 0) {
-                // Dupe the body so req owns its data independently of the parser,
-                // which is stack-allocated and cleaned up via defer.
-                req.body = try self.allocator.dupe(u8, parser.getBody());
-                req.body_owned = true;
+                req.body = parser.getBody();
+                req.body_owned = false;
             }
 
             var ctx = Context.init(self.allocator, &req);
@@ -628,8 +632,8 @@ pub const Server = struct {
         try headers.set(HeaderName.ALLOW, allow.items);
     }
 
-    const mw_exec_state_key = "__mw_exec_state";
-
+    /// Middleware execution state kept on the stack frame of executeMiddleware.
+    /// Not stored in ctx.data — prevents user code from corrupting dispatch.
     const MiddlewareExecState = struct {
         server: *Self,
         route_handler: Handler,
@@ -641,23 +645,29 @@ pub const Server = struct {
             .server = self,
             .route_handler = route_handler,
         };
-        try ctx.data.put(mw_exec_state_key, .{ .ptr = @ptrCast(&state) });
-        defer _ = ctx.data.remove(mw_exec_state_key);
 
-        return middlewareNext(ctx);
+        return middlewareNext(ctx, &state);
     }
 
-    fn middlewareNext(ctx: *Context) anyerror!Response {
-        const entry = ctx.data.get(mw_exec_state_key) orelse return error.MissingMiddlewareState;
-        const state: *MiddlewareExecState = @ptrCast(@alignCast(entry.ptr));
-
+    fn middlewareNext(ctx: *Context, state: *MiddlewareExecState) anyerror!Response {
         if (state.index < state.server.middleware.items.len) {
             const mw = state.server.middleware.items[state.index];
             state.index += 1;
-            return mw.handler(ctx, middlewareNext);
+            // Wrap the stateful next call into the expected `Next` signature
+            // using a trampoline that carries the state pointer through ctx's
+            // private middleware slot.
+            ctx._mw_state = state;
+            return mw.handler(ctx, middlewareTrampoline);
         }
 
         return state.route_handler(ctx);
+    }
+
+    /// Trampoline adapts the `Next` function signature (which takes only `*Context`)
+    /// to the stateful `middlewareNext` which also needs the state pointer.
+    fn middlewareTrampoline(ctx: *Context) anyerror!Response {
+        const state = ctx._mw_state orelse return error.MissingMiddlewareState;
+        return middlewareNext(ctx, state);
     }
 };
 
