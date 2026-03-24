@@ -10,19 +10,22 @@ pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
         // mach_absolute_time returns ticks; convert via timebase info.
         // On Apple Silicon numer/denom == 1/1, on Intel it differs.
-        // Cache the timebase info — it never changes at runtime.
+        // Thread-safe init via atomics to avoid TOCTOU on numer/denom.
         const cached = struct {
-            var numer: u32 = 0;
-            var denom: u32 = 0;
+            var numer: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+            var denom: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
         };
-        if (cached.numer == 0) {
+        var numer = cached.numer.load(.acquire);
+        if (numer == 0) {
             var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
             std.c.mach_timebase_info(&info);
-            cached.numer = info.numer;
-            cached.denom = info.denom;
+            cached.denom.store(info.denom, .release);
+            cached.numer.store(info.numer, .release);
+            numer = info.numer;
         }
+        const denom = cached.denom.load(.acquire);
         const ticks = std.c.mach_absolute_time();
-        const ns: u64 = ticks * cached.numer / cached.denom;
+        const ns: u64 = ticks * numer / denom;
         return @intCast(ns / std.time.ns_per_ms);
     } else {
         var ts: std.c.timespec = undefined;

@@ -52,14 +52,6 @@ pub const AlpnProtocol = struct {
     pub const HTTP_3 = "h3";
 };
 
-/// Parses the status line of an HTTP response (e.g., "HTTP/1.1 200 OK").
-fn parseStatusLine(line: []const u8) !u16 {
-    var parts = mem.splitScalar(u8, line, ' ');
-    _ = parts.next();
-    const status_str = parts.next() orelse return error.InvalidResponse;
-    return std.fmt.parseInt(u16, status_str, 10) catch error.InvalidResponse;
-}
-
 /// HTTP/2 frame types as defined in RFC 7540.
 pub const Http2FrameType = enum(u8) {
     data = 0x0,
@@ -392,14 +384,6 @@ test "Protocol negotiation" {
     try std.testing.expectEqual(NegotiatedProtocol.http_3, negotiateVersion("h3"));
     try std.testing.expectEqual(NegotiatedProtocol.http_1_1, negotiateVersion("http/1.1"));
     try std.testing.expectEqual(NegotiatedProtocol.http_1_1, negotiateVersion(null));
-}
-
-test "Status line parsing" {
-    const status = try parseStatusLine("HTTP/1.1 200 OK");
-    try std.testing.expectEqual(@as(u16, 200), status);
-
-    const redirect = try parseStatusLine("HTTP/1.1 301 Moved Permanently");
-    try std.testing.expectEqual(@as(u16, 301), redirect);
 }
 
 test "VarInt encoding" {

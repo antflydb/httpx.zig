@@ -183,13 +183,6 @@ pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![
     return results;
 }
 
-/// Executes all requests and returns results for each one.
-///
-/// Unlike `all`, this never fails due to a request error; request failures are
-/// represented as `RequestResult.err` values.
-pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    return all(allocator, client, specs);
-}
 
 /// Executes all requests concurrently and returns the first successful response.
 /// Uses Io fibers when available, falls back to sequential execution.
@@ -306,15 +299,6 @@ test "RequestSpec" {
     try std.testing.expect(spec.body != null);
 }
 
-test "allSettled empty" {
-    const allocator = std.testing.allocator;
-    var client = Client.init(allocator, std.testing.io);
-    defer client.deinit();
-
-    const results = try allSettled(allocator, &client, &.{});
-    defer allocator.free(results);
-    try std.testing.expectEqual(@as(usize, 0), results.len);
-}
 
 test "any empty" {
     const allocator = std.testing.allocator;

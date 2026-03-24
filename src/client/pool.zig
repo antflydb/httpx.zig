@@ -147,7 +147,7 @@ pub const TlsConnection = struct {
     }
 
     pub fn shouldEvict(self: *const TlsConnection, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
-        if (!self.in_use and !self.session.connected) return true;
+        if (!self.session.connected) return true;
         return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
     }
 
@@ -390,7 +390,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             defer self.mutex.unlock(self.io);
             const now = milliTimestamp();
             entry.release(now);
-            self.active_count -= 1;
+            self.active_count -|= 1;
             // Opportunistic cleanup on release.
             if (now - self.last_cleanup > self.config.health_check_interval_ms) {
                 self.cleanupLocked(now);
@@ -404,7 +404,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             var key_buf: [280]u8 = undefined;
             const key = formatHostKey(&key_buf, entry.host, entry.port) orelse {
                 // Fallback: can't format key, just free the entry.
-                if (entry.in_use) self.active_count -= 1;
+                if (entry.in_use) self.active_count -|= 1;
                 self.total_count -|= 1;
                 entry.close();
                 self.allocator.free(entry.host);
@@ -432,7 +432,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 }
             }
 
-            if (entry.in_use) self.active_count -= 1;
+            if (entry.in_use) self.active_count -|= 1;
             self.total_count -|= 1;
 
             entry.close();

@@ -268,19 +268,6 @@ pub const TlsSession = struct {
     }
 };
 
-/// Certificate verification result.
-pub const VerifyResult = enum {
-    ok,
-    expired,
-    not_yet_valid,
-    revoked,
-    hostname_mismatch,
-    self_signed,
-    invalid_ca,
-    invalid_signature,
-    unknown_error,
-};
-
 /// Parses a PEM-encoded certificate.
 pub fn parsePemCertificate(allocator: Allocator, pem_data: []const u8) ![]const u8 {
     const begin_marker = "-----BEGIN CERTIFICATE-----";

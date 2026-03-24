@@ -84,8 +84,6 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
-    /// Lazily-allocated 64KB decompression window reused across responses.
-    decompress_window: ?[]u8 = null,
 
     const Self = @This();
 
@@ -120,7 +118,6 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
-        if (self.decompress_window) |w| self.allocator.free(w);
     }
 
     /// Adds an interceptor to the client.
@@ -411,7 +408,7 @@ pub const Client = struct {
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
                     parser.reset();
-                    total_read = 0;
+                    total_read = leftover;
                     continue;
                 }
             }
@@ -480,19 +477,17 @@ pub const Client = struct {
     }
 
     /// Decompress a gzip or deflate (zlib) body that is already fully in memory.
+    /// Uses a stack-allocated window — each fiber has its own stack, so this is
+    /// safe for concurrent decompression without heap allocation or locking.
     fn decompressBody(self: *Self, body: []const u8, container: flate.Container) ![]u8 {
         // Build a SliceIoReader over the compressed bytes.
         var reader_buf: [4096]u8 = undefined;
         var slice_reader = SliceIoReader.init(body, &reader_buf);
 
-        // Reuse a pooled 64KB decompression window across responses.
-        // Lazily allocated on first compressed response, freed in deinit().
-        if (self.decompress_window == null) {
-            self.decompress_window = try self.allocator.alloc(u8, flate.max_window_len);
-        }
-        const decompress_buf = self.decompress_window.?;
+        // Stack-allocated decompression window — fiber-safe without synchronization.
+        var decompress_buf: [flate.max_window_len]u8 = undefined;
 
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, decompress_buf);
+        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, &decompress_buf);
 
         // Read all decompressed output into a growable list.
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -566,11 +561,10 @@ pub const Client = struct {
         if (!res.headers.contains(HeaderName.SET_COOKIE)) return;
         self.cookie_mutex.lockUncancelable(self.io);
         defer self.cookie_mutex.unlock(self.io);
-        const values = try res.headers.getAll(HeaderName.SET_COOKIE, self.allocator);
-        defer self.allocator.free(values);
 
-        for (values) |set_cookie| {
-            const pair = common.parseSetCookiePair(set_cookie) orelse continue;
+        for (res.headers.entries.items) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, HeaderName.SET_COOKIE)) continue;
+            const pair = common.parseSetCookiePair(entry.value) orelse continue;
             try self.setCookieLocked(pair.name, pair.value);
         }
     }
@@ -691,13 +685,8 @@ pub const Client = struct {
     }
 
     /// OPTIONS request convenience method.
-    pub fn httpOptions(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.request(.OPTIONS, url, reqOpts);
-    }
-
-    /// Alias for httpOptions() with conventional method naming.
     pub fn options(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.httpOptions(url, reqOpts);
+        return self.request(.OPTIONS, url, reqOpts);
     }
 };
 

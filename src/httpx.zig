@@ -258,10 +258,6 @@ pub fn race(allocator: std.mem.Allocator, client: *Client, specs: []const Reques
     return concurrency.race(allocator, client, specs);
 }
 
-/// Executes all requests in parallel and returns a settled result for each one.
-pub fn allSettled(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    return concurrency.allSettled(allocator, client, specs);
-}
 
 /// Convenience function to create a GET request.
 pub fn get(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {
