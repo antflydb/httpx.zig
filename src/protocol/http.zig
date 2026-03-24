@@ -102,8 +102,8 @@ pub const Http2FrameHeader = struct {
 /// The standard connection preface sent by the client to initiate HTTP/2.
 pub const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// Configuration parameters for HTTP/2 connections.
-pub const Http2Settings = enum(u16) {
+/// Setting identifiers for HTTP/2 SETTINGS frames (RFC 7540 §6.5.2).
+pub const Http2SettingId = enum(u16) {
     header_table_size = 0x1,
     enable_push = 0x2,
     max_concurrent_streams = 0x3,
@@ -138,32 +138,32 @@ pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Alloc
     var buf: [6]u8 = undefined;
 
     // HEADER_TABLE_SIZE (0x1)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.header_table_size));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.header_table_size));
     writeU32BE(buf[2..6], settings.header_table_size);
     try out.appendSlice(allocator, &buf);
 
     // ENABLE_PUSH (0x2)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.enable_push));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.enable_push));
     writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
     try out.appendSlice(allocator, &buf);
 
     // MAX_CONCURRENT_STREAMS (0x3)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.max_concurrent_streams));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_concurrent_streams));
     writeU32BE(buf[2..6], settings.max_concurrent_streams);
     try out.appendSlice(allocator, &buf);
 
     // INITIAL_WINDOW_SIZE (0x4)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.initial_window_size));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.initial_window_size));
     writeU32BE(buf[2..6], settings.initial_window_size);
     try out.appendSlice(allocator, &buf);
 
     // MAX_FRAME_SIZE (0x5)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.max_frame_size));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_frame_size));
     writeU32BE(buf[2..6], settings.max_frame_size);
     try out.appendSlice(allocator, &buf);
 
     // MAX_HEADER_LIST_SIZE (0x6)
-    writeU16BE(&buf, @intFromEnum(Http2Settings.max_header_list_size));
+    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_header_list_size));
     writeU32BE(buf[2..6], settings.max_header_list_size);
     try out.appendSlice(allocator, &buf);
 }
@@ -176,7 +176,7 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
         const id = readU16BE(payload[i..][0..2]);
         const value = readU32BE(payload[i..][2..6]);
 
-        const setting = std.enums.fromInt(Http2Settings, id) orelse continue;
+        const setting = std.enums.fromInt(Http2SettingId, id) orelse continue;
         switch (setting) {
             .header_table_size => settings.header_table_size = value,
             .enable_push => settings.enable_push = (value != 0),
@@ -216,12 +216,6 @@ pub const Http3FrameType = enum(u64) {
 };
 
 /// Configuration parameters for HTTP/3 connections.
-pub const Http3Settings = struct {
-    max_field_section_size: u64 = 0,
-    qpack_max_table_capacity: u64 = 0,
-    qpack_blocked_streams: u64 = 0,
-};
-
 /// Standard error codes for HTTP/3 stream and connection errors.
 pub const Http3ErrorCode = enum(u64) {
     no_error = 0x100,

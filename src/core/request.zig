@@ -45,8 +45,9 @@ pub const Request = struct {
             if (is_default_port) {
                 try headers.set(HeaderName.HOST, host);
             } else {
-                var host_buf: [256]u8 = undefined;
-                const host_with_port = std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ host, port }) catch host;
+                var host_buf: [264]u8 = undefined;
+                const host_with_port = std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ host, port }) catch
+                    return error.HostNameTooLong;
                 try headers.set(HeaderName.HOST, host_with_port);
             }
         }
