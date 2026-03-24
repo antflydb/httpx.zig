@@ -17,10 +17,7 @@ const types = @import("types.zig");
 const Headers = @import("headers.zig").Headers;
 const HeaderName = @import("headers.zig").HeaderName;
 const Status = @import("status.zig").Status;
-
-fn stringifyJsonAlloc(allocator: Allocator, value: anytype, options: std.json.Stringify.Options) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, value, options);
-}
+const Json = @import("../util/json.zig").Json;
 /// HTTP response representation.
 pub const Response = struct {
     allocator: Allocator,
@@ -124,7 +121,7 @@ pub const Response = struct {
     pub fn fromJson(allocator: Allocator, status_code: u16, value: anytype) !Self {
         var resp = Self.init(allocator, status_code);
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
-        resp.body = try stringifyJsonAlloc(allocator, value, .{});
+        resp.body = try Json.stringify(allocator, value);
         resp.body_owned = true;
 
         if (resp.body) |b| {
@@ -215,7 +212,7 @@ pub const ResponseBuilder = struct {
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
         self.freeOwnedBody();
-        const serialized = try stringifyJsonAlloc(self.allocator, value, .{});
+        const serialized = try Json.stringify(self.allocator, value);
         self.body_data = serialized;
         self.body_owned = true;
         return self;

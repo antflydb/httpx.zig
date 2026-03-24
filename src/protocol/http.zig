@@ -15,8 +15,10 @@ const Allocator = mem.Allocator;
 const builtin = @import("builtin");
 
 const types = @import("../core/types.zig");
-const Headers = @import("../core/headers.zig").Headers;
-const HeaderName = @import("../core/headers.zig").HeaderName;
+const headers_mod = @import("../core/headers.zig");
+const Headers = headers_mod.Headers;
+const HeaderName = headers_mod.HeaderName;
+const containsToken = headers_mod.containsToken;
 const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
@@ -48,187 +50,6 @@ pub const AlpnProtocol = struct {
     pub const HTTP_1_1 = "http/1.1";
     pub const HTTP_2 = "h2";
     pub const HTTP_3 = "h3";
-};
-
-/// HTTP/1.x connection handler for request/response exchange.
-/// Manages the socket reader/writer, protocol versioning, and keep-alive state.
-pub const Http1Connection = struct {
-    allocator: Allocator,
-    reader: std.io.AnyReader,
-    writer: std.io.AnyWriter,
-    version: types.Version = .HTTP_1_1,
-    keep_alive: bool = true,
-    max_response_body_size: usize = types.default_max_body_size,
-    max_headers: usize = 256,
-
-    const Self = @This();
-
-    /// Creates a new HTTP/1.x connection.
-    pub fn init(allocator: Allocator, reader: std.io.AnyReader, writer: std.io.AnyWriter) Self {
-        return .{
-            .allocator = allocator,
-            .reader = reader,
-            .writer = writer,
-        };
-    }
-
-    /// Sends a request and awaits the response.
-    pub fn sendRequest(self: *Self, req: *const Request) !Response {
-        try self.writeRequest(req);
-        return self.readResponse();
-    }
-
-    /// Serializes and writes the request to the underlying connection.
-    /// Delegates to Request.serialize to ensure a single serialization path.
-    fn writeRequest(self: *Self, req: *const Request) !void {
-        try req.serialize(self.writer);
-    }
-
-    /// parse and construct the response object from the network stream.
-    fn readResponse(self: *Self) !Response {
-        var line_buf: [8192]u8 = undefined;
-
-        const status_line = try self.readLine(&line_buf);
-        const status_code = try parseStatusLine(status_line);
-
-        var response = Response.init(self.allocator, status_code);
-        errdefer response.deinit();
-
-        var header_count: usize = 0;
-        while (true) {
-            const header_line = try self.readLine(&line_buf);
-            if (header_line.len == 0) break;
-
-            header_count += 1;
-            if (header_count > self.max_headers) return error.TooManyHeaders;
-
-            if (mem.indexOf(u8, header_line, ":")) |sep| {
-                const name = mem.trim(u8, header_line[0..sep], " \t");
-                const value = mem.trim(u8, header_line[sep + 1 ..], " \t");
-                try response.headers.append(name, value);
-            }
-        }
-
-        self.keep_alive = response.headers.isKeepAlive(response.version);
-
-        if (response.status.mayHaveBody()) {
-            response.body = try self.readBody(&response.headers);
-            response.body_owned = true;
-        }
-
-        return response;
-    }
-
-    /// Determines the body transfer method (Chunked, Content-Length, or Close) and reads the data.
-    fn readBody(self: *Self, headers: *const Headers) ![]u8 {
-        if (headers.isChunked()) {
-            return self.readChunkedBody();
-        }
-
-        if (headers.getContentLength()) |length| {
-            return self.readFixedBody(length);
-        }
-
-        return self.readUntilClose();
-    }
-
-    /// Reads a fixed number of bytes from the stream.
-    fn readFixedBody(self: *Self, length: u64) ![]u8 {
-        if (length > self.max_response_body_size) return error.ResponseBodyTooLarge;
-        const body = try self.allocator.alloc(u8, @intCast(length));
-        errdefer self.allocator.free(body);
-        var read: usize = 0;
-        while (read < length) {
-            const n = try self.reader.read(body[read..]);
-            if (n == 0) break;
-            read += n;
-        }
-        return body;
-    }
-
-    /// Decodes a chunked transfer encoded body.
-    fn readChunkedBody(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8).empty;
-        errdefer result.deinit(self.allocator);
-        var line_buf: [256]u8 = undefined;
-        var total_size: usize = 0;
-
-        while (true) {
-            const size_line = try self.readLine(&line_buf);
-            const chunk_size = try std.fmt.parseInt(usize, size_line, 16);
-
-            if (chunk_size == 0) break;
-
-            total_size += chunk_size;
-            if (total_size > self.max_response_body_size) return error.ResponseBodyTooLarge;
-
-            const start = result.items.len;
-            try result.resize(self.allocator, start + chunk_size);
-
-            var read: usize = 0;
-            while (read < chunk_size) {
-                const n = try self.reader.read(result.items[start + read .. start + chunk_size]);
-                if (n == 0) return error.UnexpectedEof;
-                read += n;
-            }
-            _ = try self.readLine(&line_buf);
-        }
-
-        _ = try self.readLine(&line_buf);
-        return result.toOwnedSlice(self.allocator);
-    }
-
-    /// Reads all remaining data until the connection is closed by the peer.
-    fn readUntilClose(self: *Self) ![]u8 {
-        var result = std.ArrayListUnmanaged(u8).empty;
-        errdefer result.deinit(self.allocator);
-        var buf: [4096]u8 = undefined;
-        var total_size: usize = 0;
-
-        while (true) {
-            const n = self.reader.read(&buf) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
-            if (n == 0) break;
-            total_size += n;
-            if (total_size > self.max_response_body_size) return error.ResponseBodyTooLarge;
-            try result.appendSlice(self.allocator, buf[0..n]);
-        }
-
-        return result.toOwnedSlice(self.allocator);
-    }
-
-    /// Reads a CRLF-terminated line from the stream.
-    fn readLine(self: *Self, buf: []u8) ![]const u8 {
-        var i: usize = 0;
-        while (i < buf.len - 1) {
-            const byte = self.reader.readByte() catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
-            if (byte == '\r') {
-                const next = self.reader.readByte() catch '\n';
-                if (next == '\n') break;
-                buf[i] = byte;
-                i += 1;
-                buf[i] = next;
-                i += 1;
-            } else if (byte == '\n') {
-                break;
-            } else {
-                buf[i] = byte;
-                i += 1;
-            }
-        }
-        if (i >= buf.len - 1) return error.HeaderLineTooLong;
-        return buf[0..i];
-    }
-
-    /// Indicates whether the persistent connection should remain open.
-    pub fn shouldKeepAlive(self: *const Self) bool {
-        return self.keep_alive;
-    }
 };
 
 /// Parses the status line of an HTTP response (e.g., "HTTP/1.1 200 OK").
@@ -598,7 +419,7 @@ pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator:
     try writer.writeAll("0\r\n");
 
     if (trailers) |trailer_headers| {
-        for (trailer_headers.entries.items) |h| {
+        for (trailer_headers.iterator()) |h| {
             try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
         }
     }
@@ -613,9 +434,7 @@ pub fn isH2cUpgradeRequest(headers: *const Headers) bool {
     if (!std.ascii.eqlIgnoreCase(upgrade, "h2c")) return false;
 
     const connection = headers.get(HeaderName.CONNECTION) orelse return false;
-    if (mem.indexOf(u8, connection, "Upgrade") == null and mem.indexOf(u8, connection, "upgrade") == null) {
-        return false;
-    }
+    if (!containsToken(connection, "Upgrade")) return false;
 
     return headers.get(HeaderName.HTTP2_SETTINGS) != null;
 }

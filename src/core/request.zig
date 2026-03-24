@@ -237,7 +237,7 @@ pub const RequestBuilder = struct {
         var request = try Request.init(self.allocator, self.method, url);
         request.version = self.version;
 
-        for (self.headers.entries.items) |h| {
+        for (self.headers.iterator()) |h| {
             try request.headers.append(h.name, h.value);
         }
 

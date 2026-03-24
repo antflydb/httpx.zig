@@ -9,6 +9,7 @@
 //!
 //! Both `ConnectionPool` (plain TCP) and `TlsPool` (TCP + TLS) are
 //! instantiations of `GenericPool`, which handles all shared pool logic.
+//! Connections are indexed by host:port in a HashMap for O(1) lookup.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -225,13 +226,18 @@ pub const PoolStats = struct {
 ///
 /// `Context` is an arbitrary type forwarded to `Entry.createNew`.
 /// Use `void` when no extra context is needed (e.g. plain TCP).
+///
+/// Connections are indexed by `"host:port"` in a `StringHashMap` for O(1)
+/// per-host lookup, matching Go's `net/http.Transport.idleConn` approach.
 pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
     return struct {
         allocator: Allocator,
         io: Io,
         config: PoolConfig,
         context: Context,
-        connections: std.ArrayListUnmanaged(*Entry) = .empty,
+        /// Connections indexed by "host:port" key.
+        host_map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*Entry)) = .{},
+        total_count: usize = 0,
         active_count: usize = 0,
         mutex: Io.Mutex = Io.Mutex.init,
         last_cleanup: i64 = 0,
@@ -255,12 +261,27 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
         /// Releases all pool resources.
         pub fn deinit(self: *Self) void {
-            for (self.connections.items) |entry| {
-                entry.close();
-                self.allocator.free(entry.host);
-                self.allocator.destroy(entry);
+            var it = self.host_map.iterator();
+            while (it.next()) |map_entry| {
+                for (map_entry.value_ptr.items) |entry| {
+                    entry.close();
+                    self.allocator.free(entry.host);
+                    self.allocator.destroy(entry);
+                }
+                map_entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(map_entry.key_ptr.*);
             }
-            self.connections.deinit(self.allocator);
+            self.host_map.deinit(self.allocator);
+        }
+
+        /// Format a "host:port" lookup key into a stack buffer.
+        fn formatHostKey(buf: []u8, host: []const u8, port: u16) ?[]const u8 {
+            return std.fmt.bufPrint(buf, "{s}:{d}", .{ host, port }) catch null;
+        }
+
+        /// Allocate a heap-owned "host:port" key for map insertion.
+        fn allocHostKey(allocator: Allocator, host: []const u8, port: u16) ![]u8 {
+            return std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
         }
 
         /// Gets an idle connection for `(host, port)`, or creates a new one.
@@ -268,6 +289,9 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         /// The returned pointer is heap-allocated and marked in-use.
         /// Callers must call `releaseConnection` or `evictConnection` when done.
         pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Entry {
+            var key_buf: [280]u8 = undefined;
+            const key = formatHostKey(&key_buf, host, port) orelse return error.InvalidUri;
+
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
@@ -279,8 +303,8 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     self.last_cleanup = now;
                 }
 
-                for (self.connections.items) |entry| {
-                    if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
+                if (self.host_map.getPtr(key)) |list| {
+                    for (list.items) |entry| {
                         if (entry.isHealthy(self.config.idle_timeout_ms, now) and
                             entry.requests_made < self.config.max_requests_per_connection)
                         {
@@ -289,15 +313,11 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                             return entry;
                         }
                     }
+
+                    if (list.items.len >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
                 }
 
-                if (self.connections.items.len >= self.config.max_connections) return PoolError.PoolExhausted;
-
-                var host_count: u32 = 0;
-                for (self.connections.items) |entry| {
-                    if (std.mem.eql(u8, entry.host, host) and entry.port == port) host_count += 1;
-                }
-                if (host_count >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+                if (self.total_count >= self.config.max_connections) return PoolError.PoolExhausted;
             }
 
             // Create outside the mutex — DNS, TCP connect (and TLS handshake) may block.
@@ -314,24 +334,39 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 self.allocator.destroy(entry);
             }
 
+            var key_buf: [280]u8 = undefined;
+            const lookup_key = formatHostKey(&key_buf, host, port) orelse unreachable;
+
             // Insert into the pool under the mutex.
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             // Re-check limits — another fiber may have raced and filled the
             // pool while we were connecting.
-            if (self.connections.items.len >= self.config.max_connections) {
+            if (self.total_count >= self.config.max_connections) {
                 return PoolError.PoolExhausted;
             }
-            var recheck_host_count: u32 = 0;
-            for (self.connections.items) |c| {
-                if (std.mem.eql(u8, c.host, host) and c.port == port) recheck_host_count += 1;
-            }
-            if (recheck_host_count >= self.config.max_per_host) {
-                return PoolError.PoolExhaustedForHost;
+
+            if (self.host_map.getPtr(lookup_key)) |list| {
+                if (list.items.len >= self.config.max_per_host) {
+                    return PoolError.PoolExhaustedForHost;
+                }
+                try list.append(self.allocator, entry);
+            } else {
+                const owned_key = try allocHostKey(self.allocator, host, port);
+                var new_list = std.ArrayListUnmanaged(*Entry).empty;
+                new_list.append(self.allocator, entry) catch |err| {
+                    self.allocator.free(owned_key);
+                    return err;
+                };
+                self.host_map.put(self.allocator, owned_key, new_list) catch |err| {
+                    new_list.deinit(self.allocator);
+                    self.allocator.free(owned_key);
+                    return err;
+                };
             }
 
-            try self.connections.append(self.allocator, entry);
+            self.total_count += 1;
             self.active_count += 1;
             return entry;
         }
@@ -353,17 +388,39 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         /// Removes a connection from the pool and frees all its resources.
         /// Use this when a network error occurs instead of releasing.
         pub fn evictConnection(self: *Self, entry: *Entry) void {
+            var key_buf: [280]u8 = undefined;
+            const key = formatHostKey(&key_buf, entry.host, entry.port) orelse {
+                // Fallback: can't format key, just free the entry.
+                if (entry.in_use) self.active_count -= 1;
+                self.total_count -|= 1;
+                entry.close();
+                self.allocator.free(entry.host);
+                self.allocator.destroy(entry);
+                return;
+            };
+
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            for (self.connections.items, 0..) |c, i| {
-                if (c == entry) {
-                    _ = self.connections.swapRemove(i);
-                    break;
+            if (self.host_map.getPtr(key)) |list| {
+                for (list.items, 0..) |c, i| {
+                    if (c == entry) {
+                        _ = list.swapRemove(i);
+                        break;
+                    }
+                }
+                // Remove empty bucket eagerly to avoid stale keys.
+                if (list.items.len == 0) {
+                    if (self.host_map.fetchRemove(key)) |removed| {
+                        self.allocator.free(removed.key);
+                        var empty_list = removed.value;
+                        empty_list.deinit(self.allocator);
+                    }
                 }
             }
 
             if (entry.in_use) self.active_count -= 1;
+            self.total_count -|= 1;
 
             entry.close();
             self.allocator.free(entry.host);
@@ -378,18 +435,25 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         }
 
         fn cleanupLocked(self: *Self, now: i64) void {
-            var i: usize = 0;
-            while (i < self.connections.items.len) {
-                const entry = self.connections.items[i];
-                if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
-                    entry.close();
-                    self.allocator.free(entry.host);
-                    self.allocator.destroy(entry);
-                    _ = self.connections.swapRemove(i);
-                } else {
-                    i += 1;
+            var map_it = self.host_map.iterator();
+            while (map_it.next()) |map_entry| {
+                const list = map_entry.value_ptr;
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    const entry = list.items[i];
+                    if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
+                        entry.close();
+                        self.allocator.free(entry.host);
+                        self.allocator.destroy(entry);
+                        _ = list.swapRemove(i);
+                        self.total_count -|= 1;
+                    } else {
+                        i += 1;
+                    }
                 }
             }
+            // Empty buckets left in the map are harmless (no heap allocation)
+            // and will be reused on next connection to the same host:port.
         }
 
         /// Returns the number of in-use connections.
@@ -403,36 +467,36 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         pub fn totalCount(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            return self.connections.items.len;
+            return self.total_count;
         }
 
         /// Returns the number of idle connections.
         pub fn idleCount(self: *Self) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            return self.connections.items.len - self.active_count;
+            return self.total_count - self.active_count;
         }
 
         /// Returns the number of connections for a specific host/port pair.
         pub fn hostConnectionCount(self: *Self, host: []const u8, port: u16) usize {
+            var key_buf: [280]u8 = undefined;
+            const key = formatHostKey(&key_buf, host, port) orelse return 0;
+
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            var count: usize = 0;
-            for (self.connections.items) |entry| {
-                if (std.mem.eql(u8, entry.host, host) and entry.port == port) {
-                    count += 1;
-                }
-            }
-            return count;
+            const list = self.host_map.get(key) orelse return 0;
+            return list.items.len;
         }
 
         /// Returns a snapshot of total/active/idle pool counts.
         pub fn stats(self: *Self) PoolStats {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const total = self.connections.items.len;
-            const active = self.active_count;
-            return .{ .total = total, .active = active, .idle = total - active };
+            return .{
+                .total = self.total_count,
+                .active = self.active_count,
+                .idle = self.total_count - self.active_count,
+            };
         }
     };
 }

@@ -65,7 +65,7 @@ pub const Context = struct {
     allocator: Allocator,
     request: *Request,
     response: ResponseBuilder,
-    params: std.StringHashMap([]const u8),
+    params: []const RouteParam = &.{},
     data: std.StringHashMap(DataEntry),
     max_file_size: usize = types.default_max_body_size,
     /// Internal: middleware dispatch state. Not part of the public API.
@@ -85,7 +85,6 @@ pub const Context = struct {
             .allocator = allocator,
             .request = req,
             .response = ResponseBuilder.init(allocator),
-            .params = std.StringHashMap([]const u8).init(allocator),
             .data = std.StringHashMap(DataEntry).init(allocator),
         };
     }
@@ -98,7 +97,6 @@ pub const Context = struct {
         }
         self.data.deinit();
         self.response.deinit();
-        self.params.deinit();
     }
 
     /// Stores a pointer in the context data map with an optional destructor.
@@ -117,7 +115,10 @@ pub const Context = struct {
 
     /// Returns a URL parameter by name.
     pub fn param(self: *const Self, name: []const u8) ?[]const u8 {
-        return self.params.get(name);
+        for (self.params) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p.value;
+        }
+        return null;
     }
 
     /// Returns a query parameter by name.
@@ -497,7 +498,7 @@ pub const Server = struct {
             // The parser outlives the request within this loop iteration:
             // req is deinitialized via `defer req.deinit()` before
             // `parser.reset()` at the top of the next iteration.
-            for (parser.headers.entries.items) |h| {
+            for (parser.headers.iterator()) |h| {
                 try req.headers.appendBorrowed(h.name, h.value);
             }
 
@@ -529,9 +530,7 @@ pub const Server = struct {
             }
 
             if (route_result) |r| {
-                for (r.params) |p| {
-                    try ctx.params.put(p.name, p.value);
-                }
+                ctx.params = r.params;
             }
 
             var response: Response = undefined;
@@ -707,7 +706,7 @@ fn isEncodedDot(path: []const u8, i: usize) bool {
 }
 
 fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
-    const items = headers.entries.items;
+    const items = headers.iterator();
     const names = try allocator.alloc([]const u8, items.len);
     defer allocator.free(names);
     for (items, 0..) |h, i| names[i] = h.name;

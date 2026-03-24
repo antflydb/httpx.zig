@@ -16,6 +16,7 @@ const common = @import("../util/common.zig");
 const Context = @import("server.zig").Context;
 const Response = @import("../core/response.zig").Response;
 const types = @import("../core/types.zig");
+const HeaderName = @import("../core/headers.zig").HeaderName;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 
 /// Middleware function type.
@@ -52,24 +53,20 @@ pub fn cors(config: CorsConfig) Middleware {
                 return cfg.allowed_origins[0];
             }
 
-            fn methodNames(methods: []const types.Method) []const []const u8 {
-                // Methods are comptime-known slices; build a static list of their string names.
-                // Max 9 standard HTTP methods.
-                const S = struct {
-                    var names: [16][]const u8 = undefined;
-                };
+            fn methodNames(methods: []const types.Method, buf: *[16][]const u8) []const []const u8 {
                 for (methods, 0..) |m, i| {
-                    S.names[i] = m.toString();
+                    buf[i] = m.toString();
                 }
-                return S.names[0..methods.len];
+                return buf[0..methods.len];
             }
 
             fn handler(ctx: *Context, next: Next) anyerror!Response {
                 const origin = allowedOrigin(ctx, config);
                 try ctx.setHeader("Access-Control-Allow-Origin", origin);
-                try ctx.setHeader("Vary", "Origin");
+                try ctx.setHeader(HeaderName.VARY, "Origin");
 
-                const methods_str = try common.joinStrings(ctx.allocator, methodNames(config.allowed_methods), ", ");
+                var method_name_buf: [16][]const u8 = undefined;
+                const methods_str = try common.joinStrings(ctx.allocator, methodNames(config.allowed_methods, &method_name_buf), ", ");
                 defer ctx.allocator.free(methods_str);
                 try ctx.setHeader("Access-Control-Allow-Methods", methods_str);
 
@@ -136,9 +133,9 @@ pub fn helmet() Middleware {
         .name = "helmet",
         .handler = struct {
             fn handler(ctx: *Context, next: Next) anyerror!Response {
-                try ctx.setHeader("X-Content-Type-Options", "nosniff");
-                try ctx.setHeader("X-Frame-Options", "SAMEORIGIN");
-                try ctx.setHeader("X-XSS-Protection", "0");
+                try ctx.setHeader(HeaderName.X_CONTENT_TYPE_OPTIONS, "nosniff");
+                try ctx.setHeader(HeaderName.X_FRAME_OPTIONS, "SAMEORIGIN");
+                try ctx.setHeader(HeaderName.X_XSS_PROTECTION, "0");
                 try ctx.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
                 return next(ctx);
             }

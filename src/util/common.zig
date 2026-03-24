@@ -10,10 +10,19 @@ pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
         // mach_absolute_time returns ticks; convert via timebase info.
         // On Apple Silicon numer/denom == 1/1, on Intel it differs.
-        var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
-        std.c.mach_timebase_info(&info);
+        // Cache the timebase info — it never changes at runtime.
+        const cached = struct {
+            var numer: u32 = 0;
+            var denom: u32 = 0;
+        };
+        if (cached.numer == 0) {
+            var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
+            std.c.mach_timebase_info(&info);
+            cached.numer = info.numer;
+            cached.denom = info.denom;
+        }
         const ticks = std.c.mach_absolute_time();
-        const ns: u64 = ticks * info.numer / info.denom;
+        const ns: u64 = ticks * cached.numer / cached.denom;
         return @intCast(ns / std.time.ns_per_ms);
     } else {
         var ts: std.c.timespec = undefined;
@@ -143,22 +152,27 @@ pub fn buildSetCookieHeader(allocator: std.mem.Allocator, name: []const u8, valu
 }
 
 /// Returns a best-effort MIME type for a file path extension.
+///
+/// For types that also exist in `ContentType`, this map uses the same MIME
+/// strings. Additional format-specific entries (fonts, video, etc.) that
+/// don't have a `ContentType` variant live only here.
 pub fn mimeTypeFromPath(path: []const u8) []const u8 {
+    const CT = @import("../core/types.zig").ContentType;
     const mime_map = std.StaticStringMap([]const u8).initComptime(.{
-        .{ ".html", "text/html; charset=utf-8" },
-        .{ ".htm", "text/html; charset=utf-8" },
-        .{ ".css", "text/css; charset=utf-8" },
-        .{ ".js", "application/javascript; charset=utf-8" },
-        .{ ".json", "application/json" },
-        .{ ".txt", "text/plain; charset=utf-8" },
-        .{ ".svg", "image/svg+xml" },
-        .{ ".png", "image/png" },
-        .{ ".jpg", "image/jpeg" },
-        .{ ".jpeg", "image/jpeg" },
-        .{ ".gif", "image/gif" },
-        .{ ".webp", "image/webp" },
+        .{ ".html", CT.text_html.toString() ++ "; charset=utf-8" },
+        .{ ".htm", CT.text_html.toString() ++ "; charset=utf-8" },
+        .{ ".css", CT.text_css.toString() ++ "; charset=utf-8" },
+        .{ ".js", CT.text_javascript.toString() ++ "; charset=utf-8" },
+        .{ ".json", CT.application_json.toString() },
+        .{ ".txt", CT.text_plain.toString() ++ "; charset=utf-8" },
+        .{ ".svg", CT.image_svg.toString() },
+        .{ ".png", CT.image_png.toString() },
+        .{ ".jpg", CT.image_jpeg.toString() },
+        .{ ".jpeg", CT.image_jpeg.toString() },
+        .{ ".gif", CT.image_gif.toString() },
+        .{ ".webp", CT.image_webp.toString() },
         .{ ".ico", "image/x-icon" },
-        .{ ".xml", "application/xml" },
+        .{ ".xml", CT.application_xml.toString() },
         .{ ".pdf", "application/pdf" },
         .{ ".woff", "font/woff" },
         .{ ".woff2", "font/woff2" },
@@ -166,7 +180,7 @@ pub fn mimeTypeFromPath(path: []const u8) []const u8 {
         .{ ".webm", "video/webm" },
     });
     const ext = std.fs.path.extension(path);
-    return mime_map.get(ext) orelse "application/octet-stream";
+    return mime_map.get(ext) orelse CT.application_octet_stream.toString();
 }
 
 test "queryValue parses normal and key-only params" {

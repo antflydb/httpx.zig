@@ -92,7 +92,9 @@ pub const Headers = struct {
     }
 
     /// Appends a header, duplicating both name and value.
+    /// Returns error.HeaderContainsCrLf if the name or value contains CR or LF.
     pub fn append(self: *Self, name: []const u8, value: []const u8) !void {
+        if (containsCrLf(name) or containsCrLf(value)) return error.HeaderContainsCrLf;
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
         const owned_value = try self.allocator.dupe(u8, value);
@@ -235,10 +237,9 @@ pub const Headers = struct {
     }
 
     /// Serializes headers to HTTP wire format.
-    /// Returns error.HeaderContainsCrLf if any name or value contains CR/LF.
+    /// CRLF injection is prevented at append/set time, so serialize is safe.
     pub fn serialize(self: *const Self, writer: anytype) !void {
         for (self.entries.items) |entry| {
-            if (containsCrLf(entry.name) or containsCrLf(entry.value)) return error.HeaderContainsCrLf;
             try writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
         }
     }
@@ -257,7 +258,7 @@ const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
 
 /// Returns true if `header_value` contains `token` as a comma-separated,
 /// whitespace-trimmed, case-insensitive token per RFC 7230 §3.2.6.
-fn containsToken(header_value: []const u8, token: []const u8) bool {
+pub fn containsToken(header_value: []const u8, token: []const u8) bool {
     var it = mem.splitScalar(u8, header_value, ',');
     while (it.next()) |part| {
         const trimmed = mem.trim(u8, part, " \t");

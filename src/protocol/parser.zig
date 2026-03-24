@@ -13,7 +13,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const types = @import("../core/types.zig");
-const Headers = @import("../core/headers.zig").Headers;
+const headers_mod = @import("../core/headers.zig");
+const Headers = headers_mod.Headers;
+const containsToken = headers_mod.containsToken;
 const Status = @import("../core/status.zig").Status;
 
 /// Parser state machine states.
@@ -243,6 +245,10 @@ pub const Parser = struct {
             return line_end + 2;
         };
         self.path = try self.allocator.dupe(u8, path);
+        errdefer {
+            self.allocator.free(self.path.?);
+            self.path = null;
+        }
 
         const version_str = parts.next() orelse {
             self.state = .err;
@@ -355,13 +361,8 @@ pub const Parser = struct {
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
                 // Token-list match per RFC 7230 §3.3.1 — prevent "chunkedx" bypass.
-                var it = mem.splitScalar(u8, value, ',');
-                while (it.next()) |part| {
-                    const trimmed = mem.trim(u8, part, " \t");
-                    if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) {
-                        self.chunked = true;
-                        break;
-                    }
+                if (containsToken(value, "chunked")) {
+                    self.chunked = true;
                 }
             }
         }

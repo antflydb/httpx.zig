@@ -144,7 +144,6 @@ pub const UdpSocket = socket.UdpSocket;
 
 pub const Parser = parser.Parser;
 
-pub const Http1Connection = http.Http1Connection;
 pub const Http2Connection = http.Http2Connection;
 pub const Http2FrameType = http.Http2FrameType;
 pub const Http2FrameHeader = http.Http2FrameHeader;
@@ -224,7 +223,6 @@ pub const cors = middleware.cors;
 pub const logger = middleware.logger;
 pub const helmet = middleware.helmet;
 
-pub const Buffer = buffer.Buffer;
 pub const RingBuffer = buffer.RingBuffer;
 pub const FixedBuffer = buffer.FixedBuffer;
 

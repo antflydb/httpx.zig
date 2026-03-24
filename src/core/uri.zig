@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const encoding = @import("../util/encoding.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -145,72 +146,14 @@ pub const Uri = struct {
     }
 };
 
-/// Lookup table for characters that don't need percent encoding in URIs.
-const unreserved_set: [256]bool = blk: {
-    var set: [256]bool = .{false} ** 256;
-    for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") |c| {
-        set[c] = true;
-    }
-    break :blk set;
-};
+/// Percent-encodes a string for URI inclusion. Delegates to encoding.zig.
+pub const encode = encoding.PercentEncoding.encode;
 
-/// Percent-encodes a string for URI inclusion.
-pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8).empty;
-    const writer = arrayListWriter(&result, allocator);
+/// Decodes a percent-encoded string. Delegates to encoding.zig.
+pub const decode = encoding.PercentEncoding.decode;
 
-    for (input) |c| {
-        if (unreserved_set[c]) {
-            try writer.writeByte(c);
-        } else {
-            try writer.print("%{X:0>2}", .{c});
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-/// Decodes a percent-encoded string.
-pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8).empty;
-
-    var i: usize = 0;
-    while (i < input.len) {
-        if (input[i] == '%' and i + 2 < input.len) {
-            const hex = input[i + 1 .. i + 3];
-            if (std.fmt.parseInt(u8, hex, 16)) |byte| {
-                try result.append(allocator, byte);
-                i += 3;
-                continue;
-            } else |_| {}
-        }
-        if (input[i] == '+') {
-            try result.append(allocator, ' ');
-        } else {
-            try result.append(allocator, input[i]);
-        }
-        i += 1;
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-/// Encodes query parameters as a query string.
-pub fn encodeQueryParams(allocator: Allocator, params: []const struct { []const u8, []const u8 }) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8).empty;
-    const writer = arrayListWriter(&result, allocator);
-
-    for (params, 0..) |param, idx| {
-        if (idx > 0) try writer.writeByte('&');
-        const key = try encode(allocator, param[0]);
-        defer allocator.free(key);
-        const value = try encode(allocator, param[1]);
-        defer allocator.free(value);
-        try writer.print("{s}={s}", .{ key, value });
-    }
-
-    return result.toOwnedSlice(allocator);
-}
+/// Encodes query parameters as a query string. Delegates to encoding.zig.
+pub const encodeQueryParams = encoding.encodeFormData;
 
 test "URI parsing basic" {
     const uri = try Uri.parse("https://example.com/path");

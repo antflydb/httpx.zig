@@ -43,7 +43,6 @@ pub const ClientConfig = struct {
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
-    follow_redirects: bool = true,
     verify_ssl: bool = true,
     http2_enabled: bool = false,
     http3_enabled: bool = false,
@@ -202,7 +201,7 @@ pub const Client = struct {
         }
 
         const should_follow = reqOpts.follow_redirects orelse
-            (self.config.follow_redirects and self.config.redirect_policy.follow_redirects);
+            self.config.redirect_policy.follow_redirects;
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
                 response.deinit();
@@ -459,19 +458,16 @@ pub const Client = struct {
                     else null;
 
                 if (container) |ctr| {
-                    if (self.decompressBody(compressed_body, ctr)) |decompressed| {
-                        if (res.body_owned) {
-                            res.allocator.free(compressed_body);
-                        }
-                        res.body = decompressed;
-                        res.body_owned = true;
-                        // Body is now plain; remove encoding/length so callers
-                        // see the uncompressed view.
-                        _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
-                        _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
-                    } else |_| {
-                        // Decompression failed — return the raw body as-is.
+                    const decompressed = try self.decompressBody(compressed_body, ctr);
+                    if (res.body_owned) {
+                        res.allocator.free(compressed_body);
                     }
+                    res.body = decompressed;
+                    res.body_owned = true;
+                    // Body is now plain; remove encoding/length so callers
+                    // see the uncompressed view.
+                    _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+                    _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
                 }
             }
         }

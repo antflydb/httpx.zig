@@ -105,34 +105,45 @@ pub const BatchBuilder = struct {
     }
 };
 
-/// Executes all requests concurrently using Io fibers and waits for
-/// all to complete. Falls back to sequential execution if the Io
-/// backend does not support concurrency.
-pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
-    var results = try allocator.alloc(RequestResult, specs.len);
-    errdefer allocator.free(results);
+// ---------------------------------------------------------------------------
+// Shared dispatch helper
+// ---------------------------------------------------------------------------
 
-    if (specs.len == 0) return results;
-
-    // Try fiber-based concurrency first.
+/// Dispatches all specs as fibers, falling back to sequential execution if
+/// the Io backend does not support concurrency. Used by all/any/race.
+fn dispatchAll(
+    client: *Client,
+    specs: []const RequestSpec,
+    results: []RequestResult,
+    comptime FiberFn: type,
+    fiber_fn: FiberFn,
+    extra_args: anytype,
+) void {
     var group = Io.Group.init;
     var used_fibers = false;
 
     for (specs, 0..) |spec, i| {
-        group.concurrent(client.io, executeSpecFiber, .{ client, spec, &results[i] }) catch {
-            // Concurrency unavailable — fall back to threads for remaining.
-            allThreaded(client, specs[i..], results[i..]);
-            if (used_fibers) {
-                group.await(client.io) catch {};
-            }
-            return results;
+        group.concurrent(client.io, fiber_fn, .{ client, spec, &results[i] } ++ extra_args) catch {
+            // Concurrency unavailable — run remaining sequentially.
+            runSequential(client, specs[i..], results[i..]);
+            if (used_fibers) group.await(client.io) catch {};
+            return;
         };
         used_fibers = true;
     }
 
-    group.await(client.io) catch {};
-    return results;
+    if (used_fibers) group.await(client.io) catch {};
 }
+
+fn runSequential(client: *Client, specs: []const RequestSpec, results: []RequestResult) void {
+    for (specs, 0..) |spec, i| {
+        results[i] = executeSpec(client, spec);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fiber entry points
+// ---------------------------------------------------------------------------
 
 fn executeSpecFiber(client: *Client, spec: RequestSpec, out: *RequestResult) Io.Cancelable!void {
     out.* = executeSpec(client, spec);
@@ -143,10 +154,33 @@ fn raceSpecFiber(client: *Client, spec: RequestSpec, out: *RequestResult, winner
     _ = winner_idx.cmpxchgStrong(std.math.maxInt(usize), idx, .acq_rel, .acquire);
 }
 
-fn allThreaded(client: *Client, specs: []const RequestSpec, results: []RequestResult) void {
-    for (specs, 0..) |spec, i| {
-        results[i] = executeSpec(client, spec);
+fn executeSpec(client: *Client, spec: RequestSpec) RequestResult {
+    const result = client.request(spec.method, spec.url, .{
+        .body = spec.body,
+        .headers = spec.headers,
+    });
+
+    if (result) |response| {
+        return .{ .success = response };
+    } else |err| {
+        return .{ .err = err };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Executes all requests concurrently using Io fibers and waits for
+/// all to complete. Falls back to sequential execution if the Io
+/// backend does not support concurrency.
+pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![]RequestResult {
+    const results = try allocator.alloc(RequestResult, specs.len);
+    errdefer allocator.free(results);
+    if (specs.len == 0) return results;
+
+    dispatchAll(client, specs, results, @TypeOf(executeSpecFiber), executeSpecFiber, .{});
+    return results;
 }
 
 /// Executes all requests and returns results for each one.
@@ -162,32 +196,14 @@ pub fn allSettled(allocator: Allocator, client: *Client, specs: []const RequestS
 pub fn any(allocator: Allocator, client: *Client, specs: []const RequestSpec) !?Response {
     if (specs.len == 0) return null;
 
-    var results = try allocator.alloc(RequestResult, specs.len);
+    const results = try allocator.alloc(RequestResult, specs.len);
     defer {
         for (results) |*r| r.deinit();
         allocator.free(results);
     }
     for (results) |*r| r.* = .{ .err = error.Pending };
 
-    // Try fiber-based concurrency first.
-    var group = Io.Group.init;
-    var used_fibers = false;
-
-    for (specs, 0..) |spec, i| {
-        group.concurrent(client.io, executeSpecFiber, .{ client, spec, &results[i] }) catch {
-            // Concurrency unavailable — run remaining sequentially.
-            allThreaded(client, specs[i..], results[i..]);
-            if (used_fibers) {
-                group.await(client.io) catch {};
-            }
-            break;
-        };
-        used_fibers = true;
-    }
-
-    if (used_fibers) {
-        group.await(client.io) catch {};
-    }
+    dispatchAll(client, specs, results, @TypeOf(executeSpecFiber), executeSpecFiber, .{});
 
     // Return first successful response, transferring ownership to caller.
     for (results) |*r| {
@@ -221,7 +237,7 @@ pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !
 
     var winner_idx = std.atomic.Value(usize).init(no_winner);
 
-    // Try fiber-based concurrency first.
+    // race needs a different fiber that also writes to winner_idx.
     var group = Io.Group.init;
     var used_fibers = false;
 
@@ -232,17 +248,13 @@ pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !
                 results[j] = executeSpec(client, s);
                 _ = winner_idx.cmpxchgStrong(no_winner, j, .acq_rel, .acquire);
             }
-            if (used_fibers) {
-                group.await(client.io) catch {};
-            }
+            if (used_fibers) group.await(client.io) catch {};
             break;
         };
         used_fibers = true;
     }
 
-    if (used_fibers) {
-        group.await(client.io) catch {};
-    }
+    if (used_fibers) group.await(client.io) catch {};
 
     const win = winner_idx.load(.acquire);
     if (win == no_winner) return .{ .err = error.NoRequests };
@@ -251,19 +263,6 @@ pub fn race(allocator: Allocator, client: *Client, specs: []const RequestSpec) !
     const result = results[win];
     results[win] = .{ .err = error.OwnershipTransferred };
     return result;
-}
-
-fn executeSpec(client: *Client, spec: RequestSpec) RequestResult {
-    const result = client.request(spec.method, spec.url, .{
-        .body = spec.body,
-        .headers = spec.headers,
-    });
-
-    if (result) |response| {
-        return .{ .success = response };
-    } else |err| {
-        return .{ .err = err };
-    }
 }
 
 test "BatchBuilder" {
