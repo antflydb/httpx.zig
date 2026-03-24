@@ -264,13 +264,11 @@ pub const TlsSession = struct {
         return self.peer_certificate;
     }
 
-    /// Closes the TLS session, sending a close_notify alert.
+    /// Closes the TLS session and releases all resources.
+    /// This is equivalent to deinit() — after close(), the session cannot be reused.
     pub fn close(self: *Self) void {
-        if (self.client) |*c| {
-            c.end() catch {};
-        }
+        self.deinit();
         self.connected = false;
-        self.client = null;
     }
 };
 

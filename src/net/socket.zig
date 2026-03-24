@@ -171,6 +171,18 @@ pub const IoReaderHelpers = struct {
     }
 
     pub fn rebase(_: *Io.Reader, _: usize) Io.Reader.RebaseError!void {}
+
+    /// Builds a standard Io.Reader.VTable using the shared helpers and a
+    /// custom readVec implementation. Avoids repeating the same four-field
+    /// literal in every Io.Reader adapter.
+    pub fn makeVTable(comptime readVecFn: *const fn (*Io.Reader, [][]u8) Io.Reader.Error!usize) Io.Reader.VTable {
+        return .{
+            .stream = stream,
+            .discard = discard,
+            .readVec = readVecFn,
+            .rebase = rebase,
+        };
+    }
 };
 
 /// Adapter that exposes a `std.Io.Reader` backed by a connected `Socket`.
@@ -205,12 +217,7 @@ pub const SocketIoReader = struct {
         return n;
     }
 
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// Adapter that exposes a `std.Io.Reader` backed by a `[]const u8` slice.
@@ -250,12 +257,7 @@ pub const SliceIoReader = struct {
         return n;
     }
 
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// Adapter that exposes a `std.Io.Writer` backed by a connected `Socket`.
@@ -366,12 +368,7 @@ pub const PrefixedReader = struct {
         return p.inner.vtable.readVec(p.inner, bufs);
     }
 
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// Adapter that wraps an `Io.Reader` and limits reads to exactly `limit` bytes.
@@ -416,12 +413,7 @@ pub const ContentLengthReader = struct {
         return n;
     }
 
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// Adapter that wraps an `Io.Reader` and decodes HTTP chunked transfer encoding.
@@ -522,7 +514,10 @@ pub const ChunkedBodyReader = struct {
                     var tmp: [1]u8 = undefined;
                     const b1 = readOneByte(p.inner, &tmp) catch |err| return err;
                     if (b1 == '\r') {
-                        _ = readOneByte(p.inner, &tmp) catch |err| return err; // \n
+                        const b2 = readOneByte(p.inner, &tmp) catch |err| return err;
+                        if (b2 != '\n') return error.ReadFailed;
+                    } else if (b1 != '\n') {
+                        return error.ReadFailed;
                     }
                     p.state = .chunk_size;
                     continue;
@@ -549,12 +544,7 @@ pub const ChunkedBodyReader = struct {
         }
     }
 
-    const vtable: Io.Reader.VTable = .{
-        .stream = IoReaderHelpers.stream,
-        .discard = IoReaderHelpers.discard,
-        .readVec = readVec,
-        .rebase = IoReaderHelpers.rebase,
-    };
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// TCP listener for accepting incoming connections.

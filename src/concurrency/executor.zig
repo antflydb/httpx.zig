@@ -128,7 +128,7 @@ pub const Executor = struct {
         return self.tasks.items.len;
     }
 
-    /// Runs all tasks synchronously.
+    /// Runs all tasks synchronously in FIFO order.
     pub fn runAll(self: *Self) void {
         while (true) {
             self.mutex.lock();
@@ -136,7 +136,7 @@ pub const Executor = struct {
                 self.mutex.unlock();
                 break;
             }
-            const task = self.tasks.pop();
+            const task = self.tasks.orderedRemove(0);
             self.mutex.unlock();
 
             task.func(task.context);
@@ -154,7 +154,7 @@ pub const Executor = struct {
                 break;
             }
 
-            const task = self.tasks.pop();
+            const task = self.tasks.orderedRemove(0);
             self.mutex.unlock();
 
             task.func(task.context);
