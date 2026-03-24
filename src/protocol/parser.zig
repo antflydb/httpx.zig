@@ -400,6 +400,10 @@ pub const Parser = struct {
 
     fn parseBody(self: *Self, data: []const u8) !usize {
         if (self.content_length) |len| {
+            if (self.bytes_read >= len) {
+                self.state = .complete;
+                return 0;
+            }
             const remaining = len - self.bytes_read;
             const to_read = @min(data.len, @as(usize, @intCast(remaining)));
             try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);

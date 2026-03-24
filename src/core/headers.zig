@@ -210,17 +210,21 @@ pub const Headers = struct {
     }
 
     /// Removes all occurrences of a header, preserving insertion order.
+    /// Uses two-pointer compaction for O(N) instead of O(N*K) with orderedRemove.
     pub fn removeAll(self: *Self, name: []const u8) void {
-        var i: usize = 0;
-        while (i < self.entries.items.len) {
-            if (eqlIgnoreCase(self.entries.items[i].name, name)) {
-                const entry = self.entries.orderedRemove(i);
+        var write: usize = 0;
+        for (self.entries.items) |entry| {
+            if (eqlIgnoreCase(entry.name, name)) {
                 if (entry.owned) {
                     self.allocator.free(entry.name);
                     self.allocator.free(entry.value);
                 }
-            } else i += 1;
+            } else {
+                self.entries.items[write] = entry;
+                write += 1;
+            }
         }
+        self.entries.items.len = write;
     }
 
     /// Returns the number of headers.

@@ -99,6 +99,7 @@ pub const Connection = struct {
         const addr = try Address.resolve(io, host, port);
         var socket = try Socket.connect(addr, io);
         errdefer socket.close();
+        socket.setKeepAlive(true) catch {};
 
         const now = milliTimestamp();
         const conn = try allocator.create(Connection);

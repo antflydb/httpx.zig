@@ -82,6 +82,15 @@ fn comptimeMethodNames(comptime methods: []const types.Method) []const []const u
 /// Creates CORS middleware. Config must be comptime-known so header strings
 /// are precomputed at compile time — zero per-request allocations.
 pub fn cors(comptime config: CorsConfig) Middleware {
+    comptime {
+        if (config.allow_credentials) {
+            for (config.allowed_origins) |o| {
+                if (std.mem.eql(u8, o, "*")) {
+                    @compileError("CORS: allow_credentials=true is incompatible with allowed_origins containing \"*\"");
+                }
+            }
+        }
+    }
     return .{
         .name = "cors",
         .handler = struct {

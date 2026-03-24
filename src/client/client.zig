@@ -324,7 +324,6 @@ pub const Client = struct {
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
-            conn.socket.setKeepAlive(true) catch {};
 
             var bw = std.io.bufferedWriter(conn.socket.writer());
             try req.serialize(bw.writer().any());
@@ -571,9 +570,6 @@ pub const Client = struct {
     }
 
     fn storeCookies(self: *Self, res: *const Response) !void {
-        // Fast path: skip lock + scan if no Set-Cookie header exists.
-        if (!res.headers.contains(HeaderName.SET_COOKIE)) return;
-
         self.cookie_mutex.lockUncancelable(self.io);
         defer self.cookie_mutex.unlock(self.io);
 
@@ -609,8 +605,8 @@ pub const Client = struct {
         }
 
         // New entry path.
-        // count() includes the newly reserved slot, so > max means already full.
-        if (self.cookies.count() > self.config.max_cookies) {
+        // count() includes the newly reserved slot, so >= max means at capacity.
+        if (self.cookies.count() >= self.config.max_cookies) {
             // Undo the slot reservation.
             self.cookies.removeByPtr(gop.key_ptr);
             return;

@@ -251,8 +251,14 @@ pub const Context = struct {
         const writer = arrayListWriter(&payload, self.allocator);
 
         for (events) |evt| {
-            if (evt.id) |id| try writer.print("id: {s}\n", .{id});
-            if (evt.event) |name| try writer.print("event: {s}\n", .{name});
+            if (evt.id) |id| {
+                if (mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidSseField;
+                try writer.print("id: {s}\n", .{id});
+            }
+            if (evt.event) |name| {
+                if (mem.indexOfAny(u8, name, "\r\n") != null) return error.InvalidSseField;
+                try writer.print("event: {s}\n", .{name});
+            }
             if (evt.retry_ms) |retry_ms| try writer.print("retry: {d}\n", .{retry_ms});
 
             var lines = mem.splitScalar(u8, evt.data, '\n');

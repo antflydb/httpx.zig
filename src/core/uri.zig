@@ -32,9 +32,16 @@ pub const Uri = struct {
         var uri = Self{ .raw = uri_string };
         var remaining = uri_string;
 
+        // Search for "://" but verify the candidate scheme contains no "/" or "?"
+        // to avoid false matches in path-only URLs like "/redirect?url=https://x".
         if (mem.indexOf(u8, remaining, "://")) |scheme_end| {
-            uri.scheme = remaining[0..scheme_end];
-            remaining = remaining[scheme_end + 3 ..];
+            const candidate = remaining[0..scheme_end];
+            if (mem.indexOfScalar(u8, candidate, '/') == null and
+                mem.indexOfScalar(u8, candidate, '?') == null)
+            {
+                uri.scheme = candidate;
+                remaining = remaining[scheme_end + 3 ..];
+            }
         }
 
         if (mem.indexOf(u8, remaining, "#")) |frag_start| {
@@ -188,6 +195,14 @@ test "URI TLS detection" {
 
     const http = try Uri.parse("http://example.com/");
     try std.testing.expect(!http.isTls());
+}
+
+test "URI parsing path-only with scheme-like query" {
+    // Path-only URLs must not match "://" inside the path or query.
+    const uri = try Uri.parse("/redirect?url=https://other.com");
+    try std.testing.expect(uri.scheme == null);
+    try std.testing.expectEqualStrings("/redirect", uri.path);
+    try std.testing.expectEqualStrings("url=https://other.com", uri.query.?);
 }
 
 test "Percent encoding" {
