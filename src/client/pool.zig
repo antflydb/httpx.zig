@@ -468,24 +468,29 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             // Remove empty buckets to prevent unbounded map growth from
             // connections to many distinct hosts over the pool's lifetime.
             // Collect keys first — removing during iteration is undefined behavior.
-            // Use a stack buffer (bounded by max_connections) to avoid heap alloc under mutex.
-            var key_buf: [64][]const u8 = undefined;
-            var key_count: usize = 0;
-            var remove_it = self.host_map.iterator();
-            while (remove_it.next()) |entry| {
-                if (entry.value_ptr.items.len == 0) {
-                    if (key_count < key_buf.len) {
-                        key_buf[key_count] = entry.key_ptr.*;
-                        key_count += 1;
+            // Use a stack buffer and loop in passes if more than 64 empty buckets exist.
+            while (true) {
+                var key_buf: [64][]const u8 = undefined;
+                var key_count: usize = 0;
+                var remove_it = self.host_map.iterator();
+                while (remove_it.next()) |entry| {
+                    if (entry.value_ptr.items.len == 0) {
+                        if (key_count < key_buf.len) {
+                            key_buf[key_count] = entry.key_ptr.*;
+                            key_count += 1;
+                        }
                     }
                 }
-            }
-            for (key_buf[0..key_count]) |key| {
-                if (self.host_map.fetchRemove(key)) |removed| {
-                    var list = removed.value;
-                    list.deinit(self.allocator);
-                    self.allocator.free(removed.key);
+                if (key_count == 0) break;
+                for (key_buf[0..key_count]) |key| {
+                    if (self.host_map.fetchRemove(key)) |removed| {
+                        var list = removed.value;
+                        list.deinit(self.allocator);
+                        self.allocator.free(removed.key);
+                    }
                 }
+                // If we filled the buffer, there may be more — loop again.
+                if (key_count < key_buf.len) break;
             }
         }
 

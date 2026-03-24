@@ -64,25 +64,20 @@ pub const Http2FrameHeader = struct {
     /// Encodes the frame header into wire format.
     pub fn serialize(self: Http2FrameHeader) [9]u8 {
         var buf: [9]u8 = undefined;
-        buf[0] = @intCast((self.length >> 16) & 0xFF);
-        buf[1] = @intCast((self.length >> 8) & 0xFF);
-        buf[2] = @intCast(self.length & 0xFF);
+        std.mem.writeInt(u24, buf[0..3], self.length, .big);
         buf[3] = @intFromEnum(self.frame_type);
         buf[4] = self.flags;
-        buf[5] = @intCast((self.stream_id >> 24) & 0x7F);
-        buf[6] = @intCast((self.stream_id >> 16) & 0xFF);
-        buf[7] = @intCast((self.stream_id >> 8) & 0xFF);
-        buf[8] = @intCast(self.stream_id & 0xFF);
+        std.mem.writeInt(u32, buf[5..9], self.stream_id, .big);
         return buf;
     }
 
     /// Decodes a frame header from wire format.
     pub fn parse(data: [9]u8) Http2FrameHeader {
         return .{
-            .length = (@as(u24, data[0]) << 16) | (@as(u24, data[1]) << 8) | data[2],
+            .length = std.mem.readInt(u24, data[0..3], .big),
             .frame_type = @enumFromInt(data[3]),
             .flags = data[4],
-            .stream_id = (@as(u31, data[5] & 0x7F) << 24) | (@as(u31, data[6]) << 16) | (@as(u31, data[7]) << 8) | data[8],
+            .stream_id = @intCast(std.mem.readInt(u32, data[5..9], .big) & 0x7FFFFFFF),
         };
     }
 };

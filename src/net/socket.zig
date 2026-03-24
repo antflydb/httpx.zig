@@ -334,6 +334,7 @@ pub const UdpSocket = struct {
     }
 
     /// Sends a datagram to a specific address.
+    /// UDP sends are all-or-nothing; returns data.len on success.
     pub fn sendTo(self: *Self, dest: Address, data: []const u8) !usize {
         self.socket.send(self.io, &dest, data) catch return error.SendFailed;
         return data.len;

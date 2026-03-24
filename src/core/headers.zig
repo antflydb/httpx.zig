@@ -201,12 +201,12 @@ pub const Headers = struct {
         return false;
     }
 
-    /// Removes all occurrences of a header.
+    /// Removes all occurrences of a header, preserving insertion order.
     pub fn removeAll(self: *Self, name: []const u8) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (eqlIgnoreCase(self.entries.items[i].name, name)) {
-                const entry = self.entries.swapRemove(i);
+                const entry = self.entries.orderedRemove(i);
                 if (entry.owned) {
                     self.allocator.free(entry.name);
                     self.allocator.free(entry.value);

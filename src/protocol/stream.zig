@@ -87,20 +87,8 @@ pub const Stream = struct {
     pub fn deinit(self: *Self, allocator: Allocator) void {
         self.send_buffer.deinit(allocator);
         self.recv_buffer.deinit(allocator);
-        if (self.request_headers) |headers| {
-            for (headers) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
-            }
-            allocator.free(headers);
-        }
-        if (self.response_headers) |headers| {
-            for (headers) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
-            }
-            allocator.free(headers);
-        }
+        freeDecodedHeaders(allocator, self.request_headers);
+        freeDecodedHeaders(allocator, self.response_headers);
     }
 
     /// Checks if sending data is allowed in current state.
@@ -160,6 +148,16 @@ pub const Stream = struct {
         self.recv_window = try addWindowDelta(self.recv_window, delta);
     }
 };
+
+/// Frees a slice of HPACK decoded headers and their owned name/value strings.
+fn freeDecodedHeaders(allocator: Allocator, headers: ?[]hpack.DecodedHeader) void {
+    const hdrs = headers orelse return;
+    for (hdrs) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(hdrs);
+}
 
 /// Manages all streams for an HTTP/2 connection.
 pub const StreamManager = struct {

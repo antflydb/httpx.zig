@@ -23,8 +23,10 @@ pub fn milliTimestamp() i64 {
         }
         const numer: u32 = @intCast(p >> 32);
         const denom: u32 = @intCast(p & 0xFFFFFFFF);
-        const ticks = std.c.mach_absolute_time();
-        const ns: u64 = ticks * numer / denom;
+        const ticks: u64 = std.c.mach_absolute_time();
+        // Use 128-bit intermediate to prevent overflow on Intel Macs
+        // where numer > 1 (Apple Silicon has numer/denom == 1/1).
+        const ns: u64 = @intCast(@as(u128, ticks) * numer / denom);
         return @intCast(ns / std.time.ns_per_ms);
     } else {
         var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };

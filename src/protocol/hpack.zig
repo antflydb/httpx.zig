@@ -476,6 +476,9 @@ pub const HuffmanCodec = struct {
     pub fn encode(data: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(allocator);
+        // Huffman-encoded output is at most the same size as input (typical
+        // HTTP headers compress to ~80%), so pre-allocate to avoid reallocs.
+        try result.ensureTotalCapacity(allocator, data.len);
 
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
@@ -512,6 +515,9 @@ pub const HuffmanCodec = struct {
     pub fn decode(data: []const u8, allocator: Allocator) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(allocator);
+        // Huffman-decoded output is at most ~1.6x the input (8/5 ratio for
+        // shortest 5-bit codes). Pre-allocate to reduce reallocs.
+        try result.ensureTotalCapacity(allocator, data.len * 2);
 
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;

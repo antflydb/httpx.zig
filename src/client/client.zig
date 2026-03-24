@@ -394,6 +394,7 @@ pub const Client = struct {
                     continue;
                 }
 
+                if (leftover >= buf.len) return error.InvalidResponse;
                 const n = recvFrom(source, buf[leftover..]) catch |err| return err;
                 if (n == 0) break;
                 total_read += n;
@@ -463,7 +464,7 @@ pub const Client = struct {
                 const enc = std.mem.trim(u8, raw_enc, " \t");
                 const container: ?flate.Container =
                     if (std.ascii.eqlIgnoreCase(enc, "gzip")) .gzip
-                    else if (std.ascii.eqlIgnoreCase(enc, "deflate")) .zlib
+                    else if (std.ascii.eqlIgnoreCase(enc, "deflate")) .raw
                     else null;
 
                 if (container) |ctr| {
@@ -974,20 +975,21 @@ test "decompressBody gzip" {
     try std.testing.expectEqualStrings("Hello, compressed world!", result);
 }
 
-test "decompressBody deflate (zlib)" {
+test "decompressBody deflate (raw)" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
-    // "Hello, compressed world!" zlib-compressed.
-    const zlib_data = [_]u8{
-        0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
+    // "Hello, compressed world!" raw deflate (no zlib header/checksum).
+    // Most web servers send raw deflate for Content-Encoding: deflate.
+    const raw_data = [_]u8{
+        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
         0x51, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d,
         0x2e, 0x4e, 0x4d, 0x51, 0x28, 0xcf, 0x2f, 0xca,
-        0x49, 0x51, 0x04, 0x00, 0x6e, 0xb1, 0x08, 0xdf,
+        0x49, 0x51, 0x04, 0x00,
     };
 
-    const result = try client.decompressBody(&zlib_data, .zlib);
+    const result = try client.decompressBody(&raw_data, .raw);
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("Hello, compressed world!", result);

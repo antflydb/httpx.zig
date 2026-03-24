@@ -160,13 +160,7 @@ pub const Context = struct {
         if (containsCrLf(name) or containsCrLf(value))
             return error.HeaderContainsCrLf;
         const set_cookie = try common.buildSetCookieHeader(self.allocator, name, value, options);
-        errdefer self.allocator.free(set_cookie);
-        const owned_name = try self.allocator.dupe(u8, HeaderName.SET_COOKIE);
-        try self.response.headers.entries.append(self.allocator, .{
-            .name = owned_name,
-            .value = set_cookie,
-            .owned = true,
-        });
+        try self.appendOwnedSetCookie(set_cookie);
     }
 
     /// Appends a Set-Cookie header that removes a cookie via Max-Age=0.
@@ -177,11 +171,17 @@ pub const Context = struct {
         var remove_options = options;
         remove_options.max_age = 0;
         const remove_value = try common.buildSetCookieHeader(self.allocator, name, "", remove_options);
-        errdefer self.allocator.free(remove_value);
+        try self.appendOwnedSetCookie(remove_value);
+    }
+
+    /// Appends a Set-Cookie header with an already-allocated value.
+    /// On error the value is freed.
+    fn appendOwnedSetCookie(self: *Self, value: []u8) !void {
+        errdefer self.allocator.free(value);
         const owned_name = try self.allocator.dupe(u8, HeaderName.SET_COOKIE);
         try self.response.headers.entries.append(self.allocator, .{
             .name = owned_name,
-            .value = remove_value,
+            .value = value,
             .owned = true,
         });
     }
