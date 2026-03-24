@@ -47,6 +47,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http3_example", .path = "examples/http3_example.zig" },
     };
 
+    const run_all_examples = b.step("run-all-examples", "Run all examples sequentially");
+    var previous_run_step: ?*std.Build.Step = null;
+
     inline for (examples) |example| {
         const exe = b.addExecutable(.{
             .name = example.name,
@@ -67,32 +70,15 @@ pub fn build(b: *std.Build) void {
         run_exe.step.dependOn(&install_exe.step);
         const run_step = b.step("run-" ++ example.name, "Run " ++ example.name ++ " example");
         run_step.dependOn(&run_exe.step);
-    }
 
-    const run_all_examples = b.step("run-all-examples", "Run all examples sequentially");
-    var previous_run_step: ?*std.Build.Step = null;
-
-    inline for (examples) |example| {
-        if (example.skip_run_all) continue;
-        const exe = b.addExecutable(.{
-            .name = "run-all-" ++ example.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(example.path),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        exe.root_module.addImport("httpx", httpx_module);
-        linkPlatformLibs(exe, target);
-
-        const install_exe = b.addInstallArtifact(exe, .{});
-        const run_exe = b.addRunArtifact(exe);
-        run_exe.step.dependOn(&install_exe.step);
-
-        if (previous_run_step) |prev| {
-            run_exe.step.dependOn(prev);
+        // Chain non-skipped examples into the run-all-examples step,
+        // reusing the same executable (no duplicate compilation).
+        if (!example.skip_run_all) {
+            if (previous_run_step) |prev| {
+                run_exe.step.dependOn(prev);
+            }
+            previous_run_step = &run_exe.step;
         }
-        previous_run_step = &run_exe.step;
     }
 
     if (previous_run_step) |last| {

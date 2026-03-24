@@ -154,20 +154,18 @@ pub const JsonBuilder = struct {
                 '\n' => try self.buffer.appendSlice(self.allocator, "\\n"),
                 '\r' => try self.buffer.appendSlice(self.allocator, "\\r"),
                 '\t' => try self.buffer.appendSlice(self.allocator, "\\t"),
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
+                    // JSON requires all control characters to be escaped.
+                    var buf: [6]u8 = undefined;
+                    _ = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                    try self.buffer.appendSlice(self.allocator, &buf);
+                },
                 else => try self.buffer.append(self.allocator, c),
             }
         }
         try self.buffer.append(self.allocator, '"');
     }
 };
-
-/// Parses a JSON path expression (e.g., "data.items[0].name").
-pub fn getPath(allocator: Allocator, json_str: []const u8, path: []const u8) !?[]const u8 {
-    _ = allocator;
-    _ = json_str;
-    _ = path;
-    return null;
-}
 
 test "JsonBuilder object" {
     const allocator = std.testing.allocator;

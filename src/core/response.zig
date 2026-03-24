@@ -110,6 +110,7 @@ pub const Response = struct {
     /// Creates a plain-text response with Content-Type and Content-Length set.
     pub fn fromText(allocator: Allocator, status_code: u16, text_body: []const u8) !Self {
         var resp = Self.init(allocator, status_code);
+        errdefer resp.deinit();
         try resp.headers.set(HeaderName.CONTENT_TYPE, "text/plain; charset=utf-8");
         resp.body = try allocator.dupe(u8, text_body);
         resp.body_owned = true;
@@ -120,6 +121,7 @@ pub const Response = struct {
     /// Creates a JSON response from a serializable value.
     pub fn fromJson(allocator: Allocator, status_code: u16, value: anytype) !Self {
         var resp = Self.init(allocator, status_code);
+        errdefer resp.deinit();
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         resp.body = try Json.stringify(allocator, value);
         resp.body_owned = true;
@@ -195,9 +197,9 @@ pub const ResponseBuilder = struct {
         return self;
     }
 
-    /// Adds a response header.
+    /// Sets a response header (replaces any existing value for the name).
     pub fn header(self: *Self, name: []const u8, value: []const u8) !*Self {
-        try self.headers.append(name, value);
+        try self.headers.set(name, value);
         return self;
     }
 

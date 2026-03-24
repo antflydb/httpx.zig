@@ -51,8 +51,6 @@ pub const Router = struct {
     allocator: Allocator,
     /// Per-method route lists indexed by @intFromEnum(method).
     method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
-    not_found_handler: ?Handler = null,
-
     const Self = @This();
 
     /// Creates a new router.
@@ -196,11 +194,6 @@ pub const Router = struct {
         }
 
         return if (seg_idx == route.segments.len) param_idx else null;
-    }
-
-    /// Sets the 404 handler.
-    pub fn setNotFound(self: *Self, handler: Handler) void {
-        self.not_found_handler = handler;
     }
 
     /// Creates a route group with the given prefix.

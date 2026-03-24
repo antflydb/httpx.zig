@@ -309,12 +309,9 @@ pub const Http3FrameHeader = struct {
     }
 };
 
-/// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.
-pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator: Allocator) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    const writer = arrayListWriter(&out, allocator);
-
+/// Writes payload using HTTP/1.1 chunked transfer format with optional trailers
+/// directly to the given writer, avoiding heap materialization.
+pub fn writeChunkedBody(writer: anytype, body: []const u8, trailers: ?*const Headers) !void {
     const chunk_size: usize = 4096;
     var offset: usize = 0;
     while (offset < body.len) {
@@ -334,6 +331,15 @@ pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator:
     }
 
     try writer.writeAll("\r\n");
+}
+
+/// Encodes payload using HTTP/1.1 chunked transfer format with optional trailers.
+/// Prefer `writeChunkedBody` for streaming directly to a socket writer.
+pub fn encodeChunkedBody(body: []const u8, trailers: ?*const Headers, allocator: Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    const writer = arrayListWriter(&out, allocator);
+    try writeChunkedBody(writer, body, trailers);
     return out.toOwnedSlice(allocator);
 }
 

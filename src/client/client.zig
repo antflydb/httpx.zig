@@ -604,6 +604,12 @@ pub const Client = struct {
                 return;
             }
             gop.key_ptr.* = try self.allocator.dupe(u8, name);
+            errdefer {
+                // If the value dupe below fails, undo the partial insertion
+                // so the map doesn't hold a key with an uninitialized value.
+                self.allocator.free(gop.key_ptr.*);
+                self.cookies.removeByPtr(gop.key_ptr);
+            }
         }
 
         gop.value_ptr.* = try self.allocator.dupe(u8, value);

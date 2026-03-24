@@ -197,6 +197,25 @@ pub const Parser = struct {
         }
     }
 
+    /// Shared CRLF line-reading logic used by all line-oriented parser states.
+    /// Returns the completed line and bytes consumed, or null if CRLF not yet received
+    /// (in which case `data.len` bytes were buffered and the caller should return that).
+    const LineResult = struct { line: []const u8, consumed: usize };
+    fn readLine(self: *Self, data: []const u8) !?LineResult {
+        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
+            try self.line_buffer.appendSlice(self.allocator, data);
+            try self.checkLineBufferLimit();
+            return null;
+        };
+
+        const line = if (self.line_buffer.items.len > 0) blk: {
+            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
+            break :blk self.line_buffer.items;
+        } else data[0..line_end];
+
+        return .{ .line = line, .consumed = line_end + 2 };
+    }
+
     fn bumpHeaderBytes(self: *Self, line_len: usize) !void {
         // Account for CRLF too.
         self.header_bytes += line_len + 2;
@@ -219,30 +238,22 @@ pub const Parser = struct {
     }
 
     fn parseRequestLine(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const lr = (try self.readLine(data)) orelse return data.len;
+        const line = lr.line;
 
         var parts = mem.splitScalar(u8, line, ' ');
 
         const method_str = parts.next() orelse {
             self.state = .err;
             self.error_reason = .malformed_request_line;
-            return line_end + 2;
+            return lr.consumed;
         };
         self.method = types.Method.fromString(method_str) orelse .CUSTOM;
 
         const path = parts.next() orelse {
             self.state = .err;
             self.error_reason = .malformed_request_line;
-            return line_end + 2;
+            return lr.consumed;
         };
         self.path = try self.allocator.dupe(u8, path);
         errdefer {
@@ -253,7 +264,7 @@ pub const Parser = struct {
         const version_str = parts.next() orelse {
             self.state = .err;
             self.error_reason = .malformed_request_line;
-            return line_end + 2;
+            return lr.consumed;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
@@ -261,65 +272,49 @@ pub const Parser = struct {
 
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
-        return line_end + 2;
+        return lr.consumed;
     }
 
     fn parseStatusLine(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const lr = (try self.readLine(data)) orelse return data.len;
+        const line = lr.line;
 
         var parts = mem.splitScalar(u8, line, ' ');
 
         const version_str = parts.next() orelse {
             self.state = .err;
             self.error_reason = .malformed_status_line;
-            return line_end + 2;
+            return lr.consumed;
         };
         self.version = types.Version.fromString(version_str) orelse .HTTP_1_1;
 
         const status_str = parts.next() orelse {
             self.state = .err;
             self.error_reason = .malformed_status_line;
-            return line_end + 2;
+            return lr.consumed;
         };
         self.status_code = std.fmt.parseInt(u16, status_str, 10) catch {
             self.state = .err;
             self.error_reason = .malformed_status_line;
-            return line_end + 2;
+            return lr.consumed;
         };
 
         try self.bumpHeaderBytes(line.len);
 
         self.line_buffer.clearRetainingCapacity();
         self.state = .headers;
-        return line_end + 2;
+        return lr.consumed;
     }
 
     fn parseHeaders(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const lr = (try self.readLine(data)) orelse return data.len;
+        const line = lr.line;
 
         if (line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             try self.bumpHeaderBytes(0);
             self.determineBodyState();
-            return line_end + 2;
+            return lr.consumed;
         }
 
         try self.bumpHeaderBytes(line.len);
@@ -368,7 +363,7 @@ pub const Parser = struct {
         }
 
         self.line_buffer.clearRetainingCapacity();
-        return line_end + 2;
+        return lr.consumed;
     }
 
     fn determineBodyState(self: *Self) void {
@@ -427,16 +422,8 @@ pub const Parser = struct {
     }
 
     fn parseChunkSize(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const lr = (try self.readLine(data)) orelse return data.len;
+        const line = lr.line;
 
         const size_part = if (mem.indexOfScalar(u8, line, ';')) |semi|
             mem.trim(u8, line[0..semi], " \t")
@@ -446,13 +433,13 @@ pub const Parser = struct {
         self.current_chunk_size = std.fmt.parseInt(usize, size_part, 16) catch {
             self.state = .err;
             self.error_reason = .malformed_chunk_size;
-            return line_end + 2;
+            return lr.consumed;
         };
 
         if (self.current_chunk_size > self.max_body_size) {
             self.state = .err;
             self.error_reason = .body_too_large;
-            return line_end + 2;
+            return lr.consumed;
         }
 
         self.line_buffer.clearRetainingCapacity();
@@ -465,7 +452,7 @@ pub const Parser = struct {
             self.state = .chunk_data;
         }
 
-        return line_end + 2;
+        return lr.consumed;
     }
 
     fn parseChunkData(self: *Self, data: []const u8) !usize {
@@ -521,26 +508,17 @@ pub const Parser = struct {
     }
 
     fn parseChunkTrailer(self: *Self, data: []const u8) !usize {
-        const line_end = mem.indexOf(u8, data, "\r\n") orelse {
-            try self.line_buffer.appendSlice(self.allocator, data);
-            try self.checkLineBufferLimit();
-            return data.len;
-        };
-
-        const line = if (self.line_buffer.items.len > 0) blk: {
-            try self.line_buffer.appendSlice(self.allocator, data[0..line_end]);
-            break :blk self.line_buffer.items;
-        } else data[0..line_end];
+        const lr = (try self.readLine(data)) orelse return data.len;
 
         // Ignore trailer fields but consume them until the terminating empty line.
-        if (line.len == 0) {
+        if (lr.line.len == 0) {
             self.line_buffer.clearRetainingCapacity();
             self.state = .complete;
-            return line_end + 2;
+            return lr.consumed;
         }
 
         self.line_buffer.clearRetainingCapacity();
-        return line_end + 2;
+        return lr.consumed;
     }
 };
 

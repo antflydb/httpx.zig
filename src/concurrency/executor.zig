@@ -124,8 +124,9 @@ pub const Executor = struct {
     }
 
     /// Returns the number of pending tasks.
-    pub fn pendingCount(self: *const Self) usize {
-        // best-effort snapshot
+    pub fn pendingCount(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.tasks.items.len;
     }
 

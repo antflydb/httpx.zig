@@ -117,8 +117,45 @@ pub const Headers = struct {
     }
 
     /// Sets a header, replacing any existing values with the same name.
+    /// Optimized: updates value in-place when exactly one match exists,
+    /// avoiding a full scan + realloc for the common single-valued case.
     pub fn set(self: *Self, name: []const u8, value: []const u8) !void {
-        self.removeAll(name);
+        if (containsCrLf(name) or containsCrLf(value)) return error.HeaderContainsCrLf;
+
+        // Find first match and check if there are duplicates.
+        var first_idx: ?usize = null;
+        var has_duplicates = false;
+        for (self.entries.items, 0..) |entry, i| {
+            if (eqlIgnoreCase(entry.name, name)) {
+                if (first_idx == null) {
+                    first_idx = i;
+                } else {
+                    has_duplicates = true;
+                    break;
+                }
+            }
+        }
+
+        if (first_idx) |idx| {
+            if (!has_duplicates) {
+                // Fast path: single existing entry — update value in-place.
+                const owned_value = try self.allocator.dupe(u8, value);
+                const entry = &self.entries.items[idx];
+                if (entry.owned) {
+                    self.allocator.free(entry.value);
+                    // Keep the existing owned name.
+                } else {
+                    // Upgrade borrowed entry to owned.
+                    entry.name = try self.allocator.dupe(u8, entry.name);
+                    entry.owned = true;
+                }
+                entry.value = owned_value;
+                return;
+            }
+            // Slow path: multiple entries — remove all and re-add.
+            self.removeAll(name);
+        }
+
         try self.append(name, value);
     }
 

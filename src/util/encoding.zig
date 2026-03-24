@@ -105,8 +105,18 @@ pub const PercentEncoding = struct {
         return result.toOwnedSlice(allocator);
     }
 
-    /// Decodes a percent-encoded string.
+    /// Decodes a percent-encoded string per RFC 3986.
+    /// For form-data decoding (where '+' maps to space), use `decodeFormData`.
     pub fn decode(allocator: Allocator, input: []const u8) ![]u8 {
+        return decodeInternal(allocator, input, false);
+    }
+
+    /// Decodes a percent-encoded string with '+' → space (application/x-www-form-urlencoded).
+    pub fn decodeFormData(allocator: Allocator, input: []const u8) ![]u8 {
+        return decodeInternal(allocator, input, true);
+    }
+
+    fn decodeInternal(allocator: Allocator, input: []const u8, plus_as_space: bool) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
 
         var i: usize = 0;
@@ -119,7 +129,7 @@ pub const PercentEncoding = struct {
                     continue;
                 } else |_| {}
             }
-            if (input[i] == '+') {
+            if (plus_as_space and input[i] == '+') {
                 try result.append(allocator, ' ');
             } else {
                 try result.append(allocator, input[i]);
