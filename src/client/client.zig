@@ -20,11 +20,15 @@ const Uri = @import("../core/uri.zig").Uri;
 const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
-const Socket = @import("../net/socket.zig").Socket;
-const Address = @import("../net/socket.zig").Address;
-const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
-const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
-const SliceIoReader = @import("../net/socket.zig").SliceIoReader;
+const socket_mod = @import("../net/socket.zig");
+const Socket = socket_mod.Socket;
+const Address = socket_mod.Address;
+const SocketIoReader = socket_mod.SocketIoReader;
+const SocketIoWriter = socket_mod.SocketIoWriter;
+const SliceIoReader = socket_mod.SliceIoReader;
+const PrefixedReader = socket_mod.PrefixedReader;
+const ContentLengthReader = socket_mod.ContentLengthReader;
+const ChunkedBodyReader = socket_mod.ChunkedBodyReader;
 const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
@@ -350,11 +354,16 @@ pub const Client = struct {
 
     /// Unified response reader parameterized on the read source.
     /// `ReadSource` is either `*Socket` (TCP) or `*std.Io.Reader` (TLS/Io).
+    ///
+    /// Streaming pipeline: parse headers only → build Io.Reader chain
+    /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
+    /// Only one copy of the body is ever in memory at a time.
     fn readResponse(self: *Self, source: anytype) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_response_size;
         parser.max_headers = self.config.max_response_headers;
+        parser.headers_only = true;
 
         var buf: [16 * 1024]u8 = undefined;
         var total_read: usize = 0;
@@ -363,9 +372,6 @@ pub const Client = struct {
 
         while (true) {
             while (!parser.isComplete()) {
-                // First consume any leftover bytes from the previous iteration
-                // (can happen when a 1xx response and the real response arrive
-                // in the same TCP segment).
                 if (leftover > 0) {
                     const consumed = try parser.feed(buf[0..leftover]);
                     if (consumed < leftover) {
@@ -387,17 +393,12 @@ pub const Client = struct {
             parser.finishEof();
             if (!parser.isComplete()) return error.InvalidResponse;
 
-            // Skip 1xx informational responses (e.g. 100 Continue).
-            // Cap at 20 to prevent a malicious server from keeping the connection
-            // occupied indefinitely with an unbounded stream of 1xx responses.
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
                     informational_count += 1;
                     if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
-                    // Reset byte counter for the real response. Leftover bytes
-                    // from this recv will be re-consumed without another recv,
-                    // so they don't need to be counted here.
+                    parser.headers_only = true;
                     total_read = 0;
                     continue;
                 }
@@ -405,7 +406,7 @@ pub const Client = struct {
             break;
         }
 
-        return self.responseFromParser(&parser);
+        return self.buildStreamingResponse(&parser, source, buf[0..leftover]);
     }
 
     /// Read bytes from either a Socket or an Io.Reader into `buf`.
@@ -424,7 +425,22 @@ pub const Client = struct {
         }
     }
 
-    fn responseFromParser(self: *Self, parser: *Parser) !Response {
+    /// Wraps `source` (Socket or Io.Reader) into a uniform `Io.Reader` for the reader chain.
+    fn sourceToIoReader(source: anytype, socket_reader: *SocketIoReader, io_buf: []u8) *Io.Reader {
+        const Source = @TypeOf(source);
+        if (Source == *Socket) {
+            socket_reader.* = SocketIoReader.init(source, io_buf);
+            return &socket_reader.reader_iface;
+        } else if (Source == *std.Io.Reader) {
+            return source;
+        } else {
+            @compileError("sourceToIoReader: unsupported source type " ++ @typeName(Source));
+        }
+    }
+
+    /// Builds a Response by streaming the body through an Io.Reader chain.
+    /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
+    fn buildStreamingResponse(self: *Self, parser: *Parser, source: anytype, leftover: []const u8) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -434,71 +450,92 @@ pub const Client = struct {
         res.headers = parser.headers;
         parser.headers = Headers.init(parser.allocator);
 
-        if (parser.getBody().len > 0) {
-            res.body = try parser.body_buffer.toOwnedSlice(parser.allocator);
-            res.body_owned = true;
-        }
+        // Detect if there's a body to read.
+        const has_body = parser.chunked or (parser.content_length orelse 1) > 0;
+        if (!has_body) return res;
 
-        // Transparently decompress gzip/deflate responses.
-        if (res.body) |compressed_body| {
-            if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| {
-                const enc = std.mem.trim(u8, raw_enc, " \t");
-                const container: ?flate.Container =
-                    if (std.ascii.eqlIgnoreCase(enc, "gzip")) .gzip
-                    else if (std.ascii.eqlIgnoreCase(enc, "deflate")) .raw
-                    else null;
+        // Detect Content-Encoding for transparent decompression.
+        const container: ?flate.Container = if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| blk: {
+            const enc = std.mem.trim(u8, raw_enc, " \t");
+            if (std.ascii.eqlIgnoreCase(enc, "gzip")) break :blk .gzip;
+            if (std.ascii.eqlIgnoreCase(enc, "deflate")) break :blk .raw;
+            break :blk null;
+        } else null;
 
-                if (container) |ctr| {
-                    const decompressed = try self.decompressBody(compressed_body, ctr);
-                    if (res.body_owned) {
-                        res.allocator.free(compressed_body);
-                    }
-                    res.body = decompressed;
-                    res.body_owned = true;
-                    // Body is now plain; remove encoding/length so callers
-                    // see the uncompressed view.
-                    _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
-                    _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
-                }
+        // --- Build the Io.Reader chain (all stack-allocated) ---
+
+        // Layer 0: Wrap the raw source (Socket or TLS Io.Reader) into an Io.Reader.
+        var source_io_buf: [8192]u8 = undefined;
+        var socket_reader: SocketIoReader = undefined;
+        const raw_reader = sourceToIoReader(source, &socket_reader, &source_io_buf);
+
+        // Layer 1: Prepend any leftover bytes from header parsing.
+        var prefix_buf: [8192]u8 = undefined;
+        var prefixed = PrefixedReader.init(leftover, raw_reader, &prefix_buf);
+        const body_source: *Io.Reader = if (leftover.len > 0) &prefixed.reader_iface else raw_reader;
+
+        // Layer 2: Apply transfer framing (Content-Length limit or chunked decode).
+        var cl_buf: [8192]u8 = undefined;
+        var cl_reader: ContentLengthReader = undefined;
+        var chunked_buf: [8192]u8 = undefined;
+        var chunked_reader: ChunkedBodyReader = undefined;
+
+        const framed_reader: *Io.Reader = if (parser.chunked) blk: {
+            chunked_reader = ChunkedBodyReader.init(body_source, &chunked_buf);
+            break :blk &chunked_reader.reader_iface;
+        } else if (parser.content_length) |len| blk: {
+            cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
+            break :blk &cl_reader.reader_iface;
+        } else blk: {
+            // No Content-Length, not chunked — body delimited by connection close.
+            break :blk body_source;
+        };
+
+        // Layer 3: Optional decompression.
+        var decompress_window: [flate.max_window_len]u8 = undefined;
+        var decompressor: flate.Decompress = undefined;
+
+        const final_reader: *Io.Reader = if (container) |ctr| blk: {
+            decompressor = flate.Decompress.init(framed_reader, ctr, &decompress_window);
+            break :blk &decompressor.reader;
+        } else framed_reader;
+
+        // --- Read from the chain into a single output buffer ---
+        var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(self.allocator);
+
+        // Pre-allocate hint: use content_length if known (and not compressed).
+        if (container == null) {
+            if (parser.content_length) |len| {
+                try result.ensureTotalCapacity(self.allocator, @intCast(len));
             }
         }
 
-        return res;
-    }
-
-    /// Decompress a gzip or deflate (zlib) body that is already fully in memory.
-    /// Uses a stack-allocated window — each fiber has its own stack, so this is
-    /// safe for concurrent decompression without heap allocation or locking.
-    fn decompressBody(self: *Self, body: []const u8, container: flate.Container) ![]u8 {
-        // Build a SliceIoReader over the compressed bytes.
-        var reader_buf: [4096]u8 = undefined;
-        var slice_reader = SliceIoReader.init(body, &reader_buf);
-
-        // Stack-allocated decompression window — fiber-safe without synchronization.
-        var decompress_buf: [flate.max_window_len]u8 = undefined;
-
-        var decompressor = flate.Decompress.init(&slice_reader.reader_iface, container, &decompress_buf);
-
-        // Read all decompressed output into a growable list.
-        var result = std.ArrayListUnmanaged(u8).empty;
-        errdefer result.deinit(self.allocator);
-        // Pre-allocate using compressed size as a lower-bound hint to reduce reallocs.
-        try result.ensureTotalCapacity(self.allocator, body.len);
-
-        const max_decompressed = self.config.max_response_size;
+        const max_size = self.config.max_response_size;
         var read_buf: [16 * 1024]u8 = undefined;
         while (true) {
             var iov = [_][]u8{read_buf[0..]};
-            const n = decompressor.reader.readVec(&iov) catch |err| switch (err) {
+            const n = final_reader.vtable.readVec(final_reader, &iov) catch |err| switch (err) {
                 error.EndOfStream => break,
-                else => return error.DecompressionFailed,
+                else => return if (container != null) error.DecompressionFailed else error.InvalidResponse,
             };
             if (n == 0) break;
-            if (result.items.len + n > max_decompressed) return error.ResponseTooLarge;
+            if (result.items.len + n > max_size) return error.ResponseTooLarge;
             try result.appendSlice(self.allocator, read_buf[0..n]);
         }
 
-        return result.toOwnedSlice(self.allocator);
+        if (result.items.len > 0) {
+            res.body = try result.toOwnedSlice(self.allocator);
+            res.body_owned = true;
+        }
+
+        // Remove encoding/length headers when decompression was applied.
+        if (container != null) {
+            _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+            _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
+        }
+
+        return res;
     }
 
     fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {

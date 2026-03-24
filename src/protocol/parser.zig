@@ -77,6 +77,10 @@ pub const Parser = struct {
     header_bytes: usize = 0,
     header_count: usize = 0,
     total_body_bytes: usize = 0,
+    /// When true, the parser marks the message as complete after headers are
+    /// parsed and does not consume any body bytes. The caller is responsible
+    /// for reading the body using `content_length` / `chunked` metadata.
+    headers_only: bool = false,
 
     const Self = @This();
 
@@ -389,6 +393,14 @@ pub const Parser = struct {
         if (self.chunked and self.content_length != null) {
             self.state = .err;
             self.error_reason = .smuggling_detected;
+            return;
+        }
+
+        // In headers-only mode the caller will read the body externally
+        // (e.g. via a streaming Io.Reader chain). Mark complete now so
+        // any unconsumed bytes remain available to the caller.
+        if (self.headers_only) {
+            self.state = .complete;
             return;
         }
 

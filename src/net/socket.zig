@@ -322,6 +322,241 @@ pub const SocketIoWriter = struct {
     };
 };
 
+/// Adapter that first serves bytes from a prefix slice, then delegates to an
+/// inner `Io.Reader`. Used to drain leftover header-parse bytes before
+/// switching to the network stream for the body.
+pub const PrefixedReader = struct {
+    prefix: []const u8,
+    prefix_pos: usize = 0,
+    inner: *Io.Reader,
+    reader_iface: Io.Reader,
+
+    pub fn init(prefix: []const u8, inner: *Io.Reader, buffer: []u8) PrefixedReader {
+        return .{
+            .prefix = prefix,
+            .inner = inner,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *PrefixedReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        if (bufs.len == 0) return 0;
+        const buf = bufs[0];
+
+        // Drain prefix first.
+        const remaining = p.prefix[p.prefix_pos..];
+        if (remaining.len > 0) {
+            const n = @min(buf.len, remaining.len);
+            @memcpy(buf[0..n], remaining[0..n]);
+            p.prefix_pos += n;
+            return n;
+        }
+
+        // Prefix exhausted — delegate to inner reader.
+        return p.inner.vtable.readVec(p.inner, bufs);
+    }
+
+    const vtable: Io.Reader.VTable = .{
+        .stream = IoReaderHelpers.stream,
+        .discard = IoReaderHelpers.discard,
+        .readVec = readVec,
+        .rebase = IoReaderHelpers.rebase,
+    };
+};
+
+/// Adapter that wraps an `Io.Reader` and limits reads to exactly `limit` bytes.
+///
+/// Used to enforce Content-Length boundaries when streaming HTTP response bodies.
+/// After `limit` bytes have been delivered, further reads return `EndOfStream`.
+pub const ContentLengthReader = struct {
+    inner: *Io.Reader,
+    remaining: usize,
+    reader_iface: Io.Reader,
+
+    pub fn init(inner: *Io.Reader, limit: usize, buffer: []u8) ContentLengthReader {
+        return .{
+            .inner = inner,
+            .remaining = limit,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *ContentLengthReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        if (p.remaining == 0) return error.EndOfStream;
+        if (bufs.len == 0) return 0;
+
+        // Clamp the caller's buffer to our remaining byte budget.
+        const orig_buf = bufs[0];
+        const clamped_len = @min(orig_buf.len, p.remaining);
+        bufs[0] = orig_buf[0..clamped_len];
+        defer bufs[0] = orig_buf; // restore original slice for caller
+
+        const n = p.inner.vtable.readVec(p.inner, bufs) catch |err| return err;
+        p.remaining -= n;
+        return n;
+    }
+
+    const vtable: Io.Reader.VTable = .{
+        .stream = IoReaderHelpers.stream,
+        .discard = IoReaderHelpers.discard,
+        .readVec = readVec,
+        .rebase = IoReaderHelpers.rebase,
+    };
+};
+
+/// Adapter that wraps an `Io.Reader` and decodes HTTP chunked transfer encoding.
+///
+/// Reads chunk-size lines, delivers chunk data, consumes inter-chunk CRLFs,
+/// and returns `EndOfStream` after the terminal `0\r\n\r\n` chunk.
+pub const ChunkedBodyReader = struct {
+    inner: *Io.Reader,
+    chunk_remaining: usize = 0,
+    state: ChunkState = .chunk_size,
+    line_buf: [32]u8 = undefined,
+    line_len: usize = 0,
+    reader_iface: Io.Reader,
+
+    const ChunkState = enum {
+        chunk_size,
+        chunk_data,
+        chunk_crlf,
+        trailer,
+        done,
+    };
+
+    pub fn init(inner: *Io.Reader, buffer: []u8) ChunkedBodyReader {
+        return .{
+            .inner = inner,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *ChunkedBodyReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readOneByte(inner: *Io.Reader, tmp: *[1]u8) Io.Reader.Error!u8 {
+        var iov = [_][]u8{tmp[0..1]};
+        const n = try inner.vtable.readVec(inner, &iov);
+        if (n == 0) return error.EndOfStream;
+        return tmp[0];
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        if (bufs.len == 0) return 0;
+
+        while (true) {
+            switch (p.state) {
+                .done => return error.EndOfStream,
+
+                .chunk_size => {
+                    // Read bytes one at a time until we see \n.
+                    var tmp: [1]u8 = undefined;
+                    while (true) {
+                        const byte = readOneByte(p.inner, &tmp) catch |err| return err;
+                        if (byte == '\n') break;
+                        if (byte == '\r') continue;
+                        if (p.line_len < p.line_buf.len) {
+                            p.line_buf[p.line_len] = byte;
+                            p.line_len += 1;
+                        }
+                    }
+                    // Parse hex chunk size (ignore extensions after ';').
+                    const line = p.line_buf[0..p.line_len];
+                    p.line_len = 0;
+                    const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+                    const hex = std.mem.trim(u8, line[0..hex_end], " \t");
+                    p.chunk_remaining = std.fmt.parseInt(usize, hex, 16) catch return error.ReadFailed;
+
+                    if (p.chunk_remaining == 0) {
+                        // Terminal chunk. Consume trailer lines until empty line.
+                        p.state = .trailer;
+                        continue;
+                    }
+                    p.state = .chunk_data;
+                    continue;
+                },
+
+                .chunk_data => {
+                    const orig_buf = bufs[0];
+                    const clamped_len = @min(orig_buf.len, p.chunk_remaining);
+                    bufs[0] = orig_buf[0..clamped_len];
+                    defer bufs[0] = orig_buf;
+
+                    const n = p.inner.vtable.readVec(p.inner, bufs) catch |err| return err;
+                    p.chunk_remaining -= n;
+                    if (p.chunk_remaining == 0) {
+                        p.state = .chunk_crlf;
+                    }
+                    return n;
+                },
+
+                .chunk_crlf => {
+                    // Consume the \r\n after chunk data.
+                    var tmp: [1]u8 = undefined;
+                    const b1 = readOneByte(p.inner, &tmp) catch |err| return err;
+                    if (b1 == '\r') {
+                        _ = readOneByte(p.inner, &tmp) catch |err| return err; // \n
+                    }
+                    p.state = .chunk_size;
+                    continue;
+                },
+
+                .trailer => {
+                    // Read trailer lines until we see an empty line (\r\n or \n).
+                    var tmp: [1]u8 = undefined;
+                    var saw_content = false;
+                    while (true) {
+                        const byte = readOneByte(p.inner, &tmp) catch |err| return err;
+                        if (byte == '\n') {
+                            if (!saw_content) {
+                                p.state = .done;
+                                return error.EndOfStream;
+                            }
+                            saw_content = false;
+                            continue;
+                        }
+                        if (byte != '\r') saw_content = true;
+                    }
+                },
+            }
+        }
+    }
+
+    const vtable: Io.Reader.VTable = .{
+        .stream = IoReaderHelpers.stream,
+        .discard = IoReaderHelpers.discard,
+        .readVec = readVec,
+        .rebase = IoReaderHelpers.rebase,
+    };
+};
+
 /// TCP listener for accepting incoming connections.
 pub const TcpListener = struct {
     server: net.Server,
