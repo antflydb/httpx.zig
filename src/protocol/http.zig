@@ -124,35 +124,19 @@ pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Alloc
     // Each setting is 6 bytes: 16-bit ID + 32-bit value.
     var buf: [6]u8 = undefined;
 
-    // HEADER_TABLE_SIZE (0x1)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.header_table_size));
-    writeU32BE(buf[2..6], settings.header_table_size);
-    try out.appendSlice(allocator, &buf);
-
-    // ENABLE_PUSH (0x2)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.enable_push));
-    writeU32BE(buf[2..6], if (settings.enable_push) 1 else 0);
-    try out.appendSlice(allocator, &buf);
-
-    // MAX_CONCURRENT_STREAMS (0x3)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_concurrent_streams));
-    writeU32BE(buf[2..6], settings.max_concurrent_streams);
-    try out.appendSlice(allocator, &buf);
-
-    // INITIAL_WINDOW_SIZE (0x4)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.initial_window_size));
-    writeU32BE(buf[2..6], settings.initial_window_size);
-    try out.appendSlice(allocator, &buf);
-
-    // MAX_FRAME_SIZE (0x5)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_frame_size));
-    writeU32BE(buf[2..6], settings.max_frame_size);
-    try out.appendSlice(allocator, &buf);
-
-    // MAX_HEADER_LIST_SIZE (0x6)
-    writeU16BE(&buf, @intFromEnum(Http2SettingId.max_header_list_size));
-    writeU32BE(buf[2..6], settings.max_header_list_size);
-    try out.appendSlice(allocator, &buf);
+    const settings_list = [_]struct { id: Http2SettingId, val: u32 }{
+        .{ .id = .header_table_size, .val = settings.header_table_size },
+        .{ .id = .enable_push, .val = if (settings.enable_push) 1 else 0 },
+        .{ .id = .max_concurrent_streams, .val = settings.max_concurrent_streams },
+        .{ .id = .initial_window_size, .val = settings.initial_window_size },
+        .{ .id = .max_frame_size, .val = settings.max_frame_size },
+        .{ .id = .max_header_list_size, .val = settings.max_header_list_size },
+    };
+    for (settings_list) |s| {
+        std.mem.writeInt(u16, buf[0..2], @intFromEnum(s.id), .big);
+        std.mem.writeInt(u32, buf[2..6], s.val, .big);
+        try out.appendSlice(allocator, &buf);
+    }
 }
 
 pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const u8) !void {
@@ -160,8 +144,8 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
 
     var i: usize = 0;
     while (i < payload.len) : (i += 6) {
-        const id = readU16BE(payload[i..][0..2]);
-        const value = readU32BE(payload[i..][2..6]);
+        const id = std.mem.readInt(u16, payload[i..][0..2], .big);
+        const value = std.mem.readInt(u32, payload[i..][2..6], .big);
 
         const setting = std.enums.fromInt(Http2SettingId, id) orelse continue;
         switch (setting) {
@@ -175,21 +159,6 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
     }
 }
 
-fn writeU16BE(buf: *[6]u8, v: u16) void {
-    buf[0..2].* = std.mem.toBytes(std.mem.nativeTo(u16, v, .big));
-}
-
-fn readU16BE(buf: *const [2]u8) u16 {
-    return std.mem.readInt(u16, buf, .big);
-}
-
-fn writeU32BE(buf: *[4]u8, v: u32) void {
-    buf.* = std.mem.toBytes(std.mem.nativeTo(u32, v, .big));
-}
-
-fn readU32BE(buf: *const [4]u8) u32 {
-    return std.mem.readInt(u32, buf, .big);
-}
 
 /// HTTP/3 frame types as defined in RFC 9114.
 pub const Http3FrameType = enum(u64) {

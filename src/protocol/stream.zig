@@ -305,10 +305,9 @@ pub fn buildHeadersFramePayload(
         var dep: u32 = p.dependency;
         if (p.exclusive) dep |= 0x80000000;
 
-        try out.append(allocator, @intCast((dep >> 24) & 0xFF));
-        try out.append(allocator, @intCast((dep >> 16) & 0xFF));
-        try out.append(allocator, @intCast((dep >> 8) & 0xFF));
-        try out.append(allocator, @intCast(dep & 0xFF));
+        var dep_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &dep_buf, dep, .big);
+        try out.appendSlice(allocator, &dep_buf);
         try out.append(allocator, p.weight -% 1); // Weight is 1-256, encoded as 0-255
     }
 
@@ -344,10 +343,7 @@ pub fn parseHeadersFramePayload(
     // Check for PRIORITY flag (0x20)
     if (flags & 0x20 != 0) {
         if (payload.len < offset + 5) return error.InvalidFrame;
-        const dep_raw = (@as(u32, payload[offset]) << 24) |
-            (@as(u32, payload[offset + 1]) << 16) |
-            (@as(u32, payload[offset + 2]) << 8) |
-            payload[offset + 3];
+        const dep_raw = std.mem.readInt(u32, payload[offset..][0..4], .big);
         priority = .{
             .exclusive = (dep_raw & 0x80000000) != 0,
             .dependency = @intCast(dep_raw & 0x7FFFFFFF),
@@ -378,43 +374,30 @@ pub fn buildDataFramePayload(data: []const u8, allocator: Allocator) ![]u8 {
 /// Builds a WINDOW_UPDATE frame payload.
 pub fn buildWindowUpdatePayload(increment: u31) [4]u8 {
     var buf: [4]u8 = undefined;
-    buf[0] = @intCast((increment >> 24) & 0x7F);
-    buf[1] = @intCast((increment >> 16) & 0xFF);
-    buf[2] = @intCast((increment >> 8) & 0xFF);
-    buf[3] = @intCast(increment & 0xFF);
+    std.mem.writeInt(u32, &buf, increment, .big);
     return buf;
 }
 
 /// Parses a WINDOW_UPDATE frame payload.
 pub fn parseWindowUpdatePayload(payload: []const u8) !u31 {
     if (payload.len != 4) return error.InvalidFrame;
-    const increment = (@as(u32, payload[0] & 0x7F) << 24) |
-        (@as(u32, payload[1]) << 16) |
-        (@as(u32, payload[2]) << 8) |
-        payload[3];
+    const raw = std.mem.readInt(u32, payload[0..4], .big);
+    const increment = raw & 0x7FFFFFFF;
     if (increment == 0) return error.ProtocolError; // WINDOW_UPDATE with 0 is protocol error
     return @intCast(increment);
 }
 
 /// Builds an RST_STREAM frame payload.
 pub fn buildRstStreamPayload(error_code: http.Http2ErrorCode) [4]u8 {
-    const code = @intFromEnum(error_code);
     var buf: [4]u8 = undefined;
-    buf[0] = @intCast((code >> 24) & 0xFF);
-    buf[1] = @intCast((code >> 16) & 0xFF);
-    buf[2] = @intCast((code >> 8) & 0xFF);
-    buf[3] = @intCast(code & 0xFF);
+    std.mem.writeInt(u32, &buf, @intFromEnum(error_code), .big);
     return buf;
 }
 
 /// Parses an RST_STREAM frame payload.
 pub fn parseRstStreamPayload(payload: []const u8) !http.Http2ErrorCode {
     if (payload.len != 4) return error.InvalidFrame;
-    const code = (@as(u32, payload[0]) << 24) |
-        (@as(u32, payload[1]) << 16) |
-        (@as(u32, payload[2]) << 8) |
-        payload[3];
-    return @enumFromInt(code);
+    return @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
 }
 
 /// Builds a PRIORITY frame payload.
@@ -422,10 +405,7 @@ pub fn buildPriorityPayload(priority: StreamPriority) [5]u8 {
     var buf: [5]u8 = undefined;
     var dep: u32 = priority.dependency;
     if (priority.exclusive) dep |= 0x80000000;
-    buf[0] = @intCast((dep >> 24) & 0xFF);
-    buf[1] = @intCast((dep >> 16) & 0xFF);
-    buf[2] = @intCast((dep >> 8) & 0xFF);
-    buf[3] = @intCast(dep & 0xFF);
+    std.mem.writeInt(u32, buf[0..4], dep, .big);
     buf[4] = priority.weight -% 1;
     return buf;
 }
@@ -433,10 +413,7 @@ pub fn buildPriorityPayload(priority: StreamPriority) [5]u8 {
 /// Parses a PRIORITY frame payload.
 pub fn parsePriorityPayload(payload: []const u8) !StreamPriority {
     if (payload.len != 5) return error.InvalidFrame;
-    const dep_raw = (@as(u32, payload[0]) << 24) |
-        (@as(u32, payload[1]) << 16) |
-        (@as(u32, payload[2]) << 8) |
-        payload[3];
+    const dep_raw = std.mem.readInt(u32, payload[0..4], .big);
     return .{
         .exclusive = (dep_raw & 0x80000000) != 0,
         .dependency = @intCast(dep_raw & 0x7FFFFFFF),
@@ -451,14 +428,8 @@ pub fn buildGoawayPayload(last_stream_id: u31, error_code: http.Http2ErrorCode, 
     const payload = try allocator.alloc(u8, 8 + debug_len);
     errdefer allocator.free(payload);
 
-    payload[0] = @intCast((last_stream_id >> 24) & 0x7F);
-    payload[1] = @intCast((last_stream_id >> 16) & 0xFF);
-    payload[2] = @intCast((last_stream_id >> 8) & 0xFF);
-    payload[3] = @intCast(last_stream_id & 0xFF);
-    payload[4] = @intCast((code >> 24) & 0xFF);
-    payload[5] = @intCast((code >> 16) & 0xFF);
-    payload[6] = @intCast((code >> 8) & 0xFF);
-    payload[7] = @intCast(code & 0xFF);
+    std.mem.writeInt(u32, payload[0..4], last_stream_id, .big);
+    std.mem.writeInt(u32, payload[4..8], code, .big);
 
     if (debug_data) |d| {
         @memcpy(payload[8..], d);
@@ -475,18 +446,8 @@ pub fn parseGoawayPayload(payload: []const u8, allocator: Allocator) !struct {
 } {
     if (payload.len < 8) return error.InvalidFrame;
 
-    const last_stream_id: u31 = @intCast(
-        (@as(u32, payload[0] & 0x7F) << 24) |
-            (@as(u32, payload[1]) << 16) |
-            (@as(u32, payload[2]) << 8) |
-            payload[3],
-    );
-    const error_code: http.Http2ErrorCode = @enumFromInt(
-        (@as(u32, payload[4]) << 24) |
-            (@as(u32, payload[5]) << 16) |
-            (@as(u32, payload[6]) << 8) |
-            payload[7],
-    );
+    const last_stream_id: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF);
+    const error_code: http.Http2ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big));
 
     const debug_data = if (payload.len > 8)
         try allocator.dupe(u8, payload[8..])

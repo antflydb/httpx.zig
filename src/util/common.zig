@@ -27,8 +27,9 @@ pub fn milliTimestamp() i64 {
         const ns: u64 = ticks * numer / denom;
         return @intCast(ns / std.time.ns_per_ms);
     } else {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        if (rc != 0) return 0;
         return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
     }
 }

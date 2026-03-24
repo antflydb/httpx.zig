@@ -237,13 +237,15 @@ pub const DynamicTable = struct {
     }
 
     /// Gets an entry by absolute index.
+    /// Computes the array offset arithmetically from the oldest entry's index.
     pub fn getAbsolute(self: *const Self, absolute_index: u64) ?StaticTable.Entry {
-        for (self.entries.items) |entry| {
-            if (entry.absolute_index == absolute_index) {
-                return .{ .name = entry.name, .value = entry.value };
-            }
-        }
-        return null;
+        if (self.entries.items.len == 0) return null;
+        const oldest_abs = self.entries.items[0].absolute_index;
+        if (absolute_index < oldest_abs) return null;
+        const offset = absolute_index - oldest_abs;
+        if (offset >= self.entries.items.len) return null;
+        const entry = self.entries.items[@intCast(offset)];
+        return .{ .name = entry.name, .value = entry.value };
     }
 
     /// Updates the maximum size and evicts entries if needed.

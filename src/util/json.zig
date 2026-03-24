@@ -72,6 +72,7 @@ pub const JsonBuilder = struct {
 
     /// Ends the current JSON object.
     pub fn endObject(self: *Self) !void {
+        if (self.depth == 0) return error.UnmatchedEnd;
         try self.buffer.append(self.allocator, '}');
         self.depth -= 1;
         self.needs_comma = true;
@@ -87,6 +88,7 @@ pub const JsonBuilder = struct {
 
     /// Ends the current JSON array.
     pub fn endArray(self: *Self) !void {
+        if (self.depth == 0) return error.UnmatchedEnd;
         try self.buffer.append(self.allocator, ']');
         self.depth -= 1;
         self.needs_comma = true;

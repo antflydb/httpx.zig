@@ -305,7 +305,7 @@ pub fn containsToken(header_value: []const u8, token: []const u8) bool {
     return false;
 }
 
-fn containsCrLf(s: []const u8) bool {
+pub fn containsCrLf(s: []const u8) bool {
     return mem.indexOfScalar(u8, s, '\r') != null or mem.indexOfScalar(u8, s, '\n') != null;
 }
 

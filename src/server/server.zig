@@ -22,6 +22,7 @@ const Response = @import("../core/response.zig").Response;
 const ResponseBuilder = @import("../core/response.zig").ResponseBuilder;
 const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
+const containsCrLf = @import("../core/headers.zig").containsCrLf;
 const Parser = @import("../protocol/parser.zig").Parser;
 const http = @import("../protocol/http.zig");
 const Socket = @import("../net/socket.zig").Socket;
@@ -67,7 +68,7 @@ pub const Context = struct {
     request: *Request,
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
-    data: std.StringHashMap(DataEntry),
+    data: ?std.StringHashMap(DataEntry) = null,
     max_file_size: usize = types.default_max_body_size,
 
     /// Entry in the context data map with an optional destructor for cleanup.
@@ -84,32 +85,37 @@ pub const Context = struct {
             .allocator = allocator,
             .request = req,
             .response = ResponseBuilder.init(allocator),
-            .data = std.StringHashMap(DataEntry).init(allocator),
         };
     }
 
     /// Releases context resources. Calls destructors for data entries that have them.
     pub fn deinit(self: *Self) void {
-        var it = self.data.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.dtor) |dtor| dtor(entry.value_ptr.ptr);
+        if (self.data) |*data| {
+            var it = data.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.dtor) |dtor| dtor(entry.value_ptr.ptr);
+            }
+            data.deinit();
         }
-        self.data.deinit();
         self.response.deinit();
     }
 
     /// Stores a pointer in the context data map with an optional destructor.
     /// If replacing an existing entry, its destructor is called first.
     pub fn setData(self: *Self, key: []const u8, ptr: *anyopaque, dtor: ?*const fn (*anyopaque) void) !void {
-        if (self.data.get(key)) |existing| {
+        if (self.data == null) {
+            self.data = std.StringHashMap(DataEntry).init(self.allocator);
+        }
+        if (self.data.?.get(key)) |existing| {
             if (existing.dtor) |d| d(existing.ptr);
         }
-        try self.data.put(key, .{ .ptr = ptr, .dtor = dtor });
+        try self.data.?.put(key, .{ .ptr = ptr, .dtor = dtor });
     }
 
     /// Retrieves a stored pointer by key.
     pub fn getData(self: *const Self, key: []const u8) ?*anyopaque {
-        return if (self.data.get(key)) |entry| entry.ptr else null;
+        const data = self.data orelse return null;
+        return if (data.get(key)) |entry| entry.ptr else null;
     }
 
     /// Returns a URL parameter by name.
@@ -151,8 +157,7 @@ pub const Context = struct {
     /// Appends a Set-Cookie header with common cookie attributes.
     /// Returns error.HeaderContainsCrLf if the name or value contains CR or LF.
     pub fn setCookie(self: *Self, name: []const u8, value: []const u8, options: CookieOptions) !void {
-        if (mem.indexOfScalar(u8, name, '\r') != null or mem.indexOfScalar(u8, name, '\n') != null or
-            mem.indexOfScalar(u8, value, '\r') != null or mem.indexOfScalar(u8, value, '\n') != null)
+        if (containsCrLf(name) or containsCrLf(value))
             return error.HeaderContainsCrLf;
         const set_cookie = try common.buildSetCookieHeader(self.allocator, name, value, options);
         defer self.allocator.free(set_cookie);
@@ -162,7 +167,7 @@ pub const Context = struct {
     /// Appends a Set-Cookie header that removes a cookie via Max-Age=0.
     /// Returns error.HeaderContainsCrLf if the name contains CR or LF.
     pub fn removeCookie(self: *Self, name: []const u8, options: CookieOptions) !void {
-        if (mem.indexOfScalar(u8, name, '\r') != null or mem.indexOfScalar(u8, name, '\n') != null)
+        if (containsCrLf(name))
             return error.HeaderContainsCrLf;
         var remove_options = options;
         remove_options.max_age = 0;
@@ -620,30 +625,32 @@ pub const Server = struct {
 
     /// Sets the `Allow` header for automatic OPTIONS and 405 responses.
     fn setAllowHeader(_: *Self, headers: *Headers, methods: []const types.Method) !void {
-        // Max: 9 methods × ~7 chars + separators = ~80 bytes; 128 is plenty.
         var buf: [128]u8 = undefined;
         var pos: usize = 0;
         var has_options = false;
 
         for (methods) |m| {
             if (m == .OPTIONS) has_options = true;
+            const name = m.toString();
+            if (pos + name.len + 2 > buf.len) break;
             if (pos > 0) {
                 @memcpy(buf[pos..][0..2], ", ");
                 pos += 2;
             }
-            const name = m.toString();
             @memcpy(buf[pos..][0..name.len], name);
             pos += name.len;
         }
 
         if (!has_options) {
-            if (pos > 0) {
-                @memcpy(buf[pos..][0..2], ", ");
-                pos += 2;
-            }
             const opt = "OPTIONS";
-            @memcpy(buf[pos..][0..opt.len], opt);
-            pos += opt.len;
+            if (pos + opt.len + 2 <= buf.len) {
+                if (pos > 0) {
+                    @memcpy(buf[pos..][0..2], ", ");
+                    pos += 2;
+                }
+                @memcpy(buf[pos..][0..opt.len], opt);
+                pos += opt.len;
+            }
         }
 
         try headers.set(HeaderName.ALLOW, buf[0..pos]);

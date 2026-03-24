@@ -28,6 +28,7 @@ pub const Base64 = struct {
     pub fn decode(allocator: Allocator, data: []const u8) ![]u8 {
         const len = standard.Decoder.calcSizeForSlice(data) catch return error.InvalidBase64;
         const result = try allocator.alloc(u8, len);
+        errdefer allocator.free(result);
         standard.Decoder.decode(result, data) catch return error.InvalidBase64;
         return result;
     }
@@ -60,6 +61,7 @@ pub const Hex = struct {
         if (data.len % 2 != 0) return error.InvalidHex;
 
         const result = try allocator.alloc(u8, data.len / 2);
+        errdefer allocator.free(result);
         var i: usize = 0;
         while (i < data.len) {
             const high = hexValue(data[i]) orelse return error.InvalidHex;
@@ -92,6 +94,7 @@ pub const PercentEncoding = struct {
     /// Encodes a string for use in URLs.
     pub fn encode(allocator: Allocator, input: []const u8) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(allocator);
         const writer = arrayListWriter(&result, allocator);
 
         for (input) |c| {
@@ -118,6 +121,7 @@ pub const PercentEncoding = struct {
 
     fn decodeInternal(allocator: Allocator, input: []const u8, plus_as_space: bool) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(allocator);
 
         var i: usize = 0;
         while (i < input.len) {
@@ -144,6 +148,7 @@ pub const PercentEncoding = struct {
 /// Encodes key-value pairs as application/x-www-form-urlencoded.
 pub fn encodeFormData(allocator: Allocator, params: []const struct { []const u8, []const u8 }) ![]u8 {
     var result = std.ArrayListUnmanaged(u8).empty;
+    errdefer result.deinit(allocator);
     const writer = arrayListWriter(&result, allocator);
 
     for (params, 0..) |param, idx| {

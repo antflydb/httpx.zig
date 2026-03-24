@@ -37,7 +37,7 @@ pub const Executor = struct {
     allocator: Allocator,
     config: ExecutorConfig,
     tasks: std.ArrayListUnmanaged(Task) = .empty,
-    running: bool = false,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     threads: []Thread = &.{},
     mutex: Thread.Mutex = .{},
     cond: Thread.Condition = .{},
@@ -88,15 +88,14 @@ pub const Executor = struct {
 
     /// Starts the executor threads.
     pub fn start(self: *Self) !void {
-        if (self.running) return;
-        self.running = true;
+        if (self.running.swap(true, .acq_rel)) return;
 
         self.threads = try self.allocator.alloc(Thread, self.config.num_threads);
         var spawned: usize = 0;
         errdefer {
             // On partial spawn failure, join already-started threads and free.
             self.mutex.lock();
-            self.running = false;
+            self.running.store(false, .release);
             self.cond.broadcast();
             self.mutex.unlock();
             for (self.threads[0..spawned]) |thread| thread.join();
@@ -112,9 +111,8 @@ pub const Executor = struct {
 
     /// Stops all executor threads and frees the thread handle slice.
     pub fn stop(self: *Self) void {
-        if (!self.running) return;
+        if (!self.running.swap(false, .acq_rel)) return;
         self.mutex.lock();
-        self.running = false;
         self.cond.broadcast();
         self.mutex.unlock();
 
@@ -150,10 +148,10 @@ pub const Executor = struct {
     fn workerLoop(self: *Self) void {
         while (true) {
             self.mutex.lock();
-            while (self.running and self.tasks.items.len == 0) {
+            while (self.running.load(.acquire) and self.tasks.items.len == 0) {
                 self.cond.wait(&self.mutex);
             }
-            if (!self.running) {
+            if (!self.running.load(.acquire)) {
                 self.mutex.unlock();
                 break;
             }
