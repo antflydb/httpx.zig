@@ -179,6 +179,9 @@ pub fn all(allocator: Allocator, client: *Client, specs: []const RequestSpec) ![
     errdefer allocator.free(results);
     if (specs.len == 0) return results;
 
+    // Initialize so partial fiber failures don't leave uninitialized entries.
+    for (results) |*r| r.* = .{ .err = error.Pending };
+
     dispatchAll(client, specs, results, @TypeOf(executeSpecFiber), executeSpecFiber, .{});
     return results;
 }

@@ -683,9 +683,19 @@ fn containsTraversal(path: []const u8) bool {
     if (mem.indexOfScalar(u8, path, 0) != null) return true;
     // Reject absolute paths.
     if (path.len > 0 and path[0] == '/') return true;
+    // Reject backslashes — Windows path separators can bypass unix-only checks.
+    if (mem.indexOfScalar(u8, path, '\\') != null) return true;
 
     // Check for ".." in raw form.
     if (mem.indexOf(u8, path, "..") != null) return true;
+
+    // Check for percent-encoded slash (%2f, %2F) — can bypass directory checks.
+    {
+        var j: usize = 0;
+        while (j + 2 < path.len) : (j += 1) {
+            if (path[j] == '%' and path[j + 1] == '2' and (path[j + 2] == 'f' or path[j + 2] == 'F')) return true;
+        }
+    }
 
     // Check for percent-encoded dot variants: %2e and %2E.
     var i: usize = 0;

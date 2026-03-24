@@ -558,7 +558,6 @@ pub const Client = struct {
     }
 
     fn storeCookies(self: *Self, res: *const Response) !void {
-        if (!res.headers.contains(HeaderName.SET_COOKIE)) return;
         self.cookie_mutex.lockUncancelable(self.io);
         defer self.cookie_mutex.unlock(self.io);
 

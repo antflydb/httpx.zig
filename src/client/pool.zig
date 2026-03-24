@@ -465,8 +465,17 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     }
                 }
             }
-            // Empty buckets left in the map are harmless (no heap allocation)
-            // and will be reused on next connection to the same host:port.
+            // Remove empty buckets to prevent unbounded map growth from
+            // connections to many distinct hosts over the pool's lifetime.
+            var remove_it = self.host_map.iterator();
+            while (remove_it.next()) |entry| {
+                if (entry.value_ptr.items.len == 0) {
+                    entry.value_ptr.deinit(self.allocator);
+                    const key = entry.key_ptr.*;
+                    self.host_map.removeByPtr(entry.key_ptr);
+                    self.allocator.free(key);
+                }
+            }
         }
 
         /// Returns the number of in-use connections.

@@ -25,8 +25,8 @@ pub const RouteMatch = struct {
     params: []const RouteParam,
 };
 
-/// Handler function type.
-pub const Handler = *const fn (*@import("server.zig").Context) anyerror!@import("../core/response.zig").Response;
+/// Handler function type — canonical definition lives in server.zig.
+pub const Handler = @import("server.zig").Handler;
 
 const Route = struct {
     method: types.Method,
