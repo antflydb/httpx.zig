@@ -138,87 +138,10 @@ pub const Http2ErrorCode = enum(u32) {
     http_1_1_required = 0xd,
 };
 
-/// Manages the state of an HTTP/2 connection, including HPack context and streams.
-pub const Http2Connection = struct {
-    allocator: Allocator,
-    reader: std.io.AnyReader,
-    writer: std.io.AnyWriter,
-    next_stream_id: u31 = 1,
-    settings: Http2ConnectionSettings = .{},
-    peer_settings: Http2ConnectionSettings = .{},
+/// HTTP/2 connection settings type (alias for types.Http2Settings).
+pub const Http2ConnectionSettings = types.Http2Settings;
 
-    const Self = @This();
-
-    pub const Http2ConnectionSettings = types.Http2Settings;
-
-    pub const Frame = struct {
-        header: Http2FrameHeader,
-        payload: []u8,
-
-        pub fn deinit(self: *Frame, allocator: Allocator) void {
-            allocator.free(self.payload);
-        }
-    };
-
-    /// Initializes a new HTTP/2 connection state.
-    pub fn init(allocator: Allocator, reader: std.io.AnyReader, writer: std.io.AnyWriter) Self {
-        return .{
-            .allocator = allocator,
-            .reader = reader,
-            .writer = writer,
-        };
-    }
-
-    /// Initiates the HTTP/2 session by sending the preface and initial settings.
-    pub fn handshake(self: *Self) !void {
-        try self.writer.writeAll(HTTP2_PREFACE);
-        try self.sendSettings();
-    }
-
-    /// Transmits the local settings to the peer.
-    fn sendSettings(self: *Self) !void {
-        var payload = std.ArrayListUnmanaged(u8).empty;
-        defer payload.deinit(self.allocator);
-
-        try encodeSettingsPayload(self.settings, self.allocator, &payload);
-        const header = Http2FrameHeader{
-            .length = @intCast(payload.items.len),
-            .frame_type = .settings,
-            .flags = 0,
-            .stream_id = 0,
-        };
-        const serialized = header.serialize();
-        try self.writer.writeAll(&serialized);
-        if (payload.items.len > 0) {
-            try self.writer.writeAll(payload.items);
-        }
-    }
-
-    pub fn readFrame(self: *Self, allocator: Allocator, max_payload_size: usize) !Frame {
-        var hdr_bytes: [9]u8 = undefined;
-        try self.reader.readNoEof(&hdr_bytes);
-        const header = Http2FrameHeader.parse(hdr_bytes);
-        const len: usize = @intCast(header.length);
-        if (len > max_payload_size) return error.FrameTooLarge;
-
-        const payload = try allocator.alloc(u8, len);
-        errdefer allocator.free(payload);
-        if (len > 0) {
-            try self.reader.readNoEof(payload);
-        }
-        return .{ .header = header, .payload = payload };
-    }
-
-    pub fn writeFrame(self: *Self, header: Http2FrameHeader, payload: []const u8) !void {
-        const serialized = header.serialize();
-        try self.writer.writeAll(&serialized);
-        if (payload.len > 0) {
-            try self.writer.writeAll(payload);
-        }
-    }
-};
-
-pub fn encodeSettingsPayload(settings: Http2Connection.Http2ConnectionSettings, allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     // Each setting is 6 bytes: 16-bit ID + 32-bit value.
     var buf: [6]u8 = undefined;
 
@@ -253,7 +176,7 @@ pub fn encodeSettingsPayload(settings: Http2Connection.Http2ConnectionSettings, 
     try out.appendSlice(allocator, &buf);
 }
 
-pub fn applySettingsPayload(settings: *Http2Connection.Http2ConnectionSettings, payload: []const u8) !void {
+pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const u8) !void {
     if (payload.len % 6 != 0) return error.InvalidSettingsPayload;
 
     var i: usize = 0;
@@ -505,7 +428,7 @@ test "VarInt encoding" {
 test "HTTP/2 SETTINGS payload encode/decode" {
     const allocator = std.testing.allocator;
 
-    const settings_in = Http2Connection.Http2ConnectionSettings{
+    const settings_in = Http2ConnectionSettings{
         .header_table_size = 4096,
         .enable_push = false,
         .max_concurrent_streams = 123,
@@ -518,7 +441,7 @@ test "HTTP/2 SETTINGS payload encode/decode" {
     defer payload.deinit(allocator);
     try encodeSettingsPayload(settings_in, allocator, &payload);
 
-    var settings_out = Http2Connection.Http2ConnectionSettings{};
+    var settings_out = Http2ConnectionSettings{};
     try applySettingsPayload(&settings_out, payload.items);
 
     try std.testing.expectEqual(settings_in.header_table_size, settings_out.header_table_size);

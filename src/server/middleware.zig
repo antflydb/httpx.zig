@@ -21,12 +21,19 @@ const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 
 /// Middleware function type.
 pub const Middleware = struct {
-    handler: *const fn (*Context, Next) anyerror!Response,
+    handler: *const fn (*Context, *Next) anyerror!Response,
     name: []const u8 = "unnamed",
 };
 
-/// Next function to call the next middleware.
-pub const Next = *const fn (*Context) anyerror!Response;
+/// Opaque handle for calling the next middleware in the chain.
+/// Middleware receives a `*Next` and calls `next.call(ctx)` to proceed.
+pub const Next = struct {
+    _call: *const fn (*Next, *Context) anyerror!Response,
+
+    pub fn call(self: *Next, ctx: *Context) anyerror!Response {
+        return self._call(self, ctx);
+    }
+};
 
 /// CORS configuration.
 pub const CorsConfig = struct {
@@ -38,45 +45,69 @@ pub const CorsConfig = struct {
     max_age: u32 = 86400,
 };
 
-/// Creates CORS middleware.
-pub fn cors(config: CorsConfig) Middleware {
+/// Joins comptime-known string slices with a separator at compile time.
+fn comptimeJoin(comptime parts: []const []const u8, comptime sep: []const u8) []const u8 {
+    comptime {
+        if (parts.len == 0) return "";
+        var len: usize = 0;
+        for (parts, 0..) |p, i| {
+            if (i > 0) len += sep.len;
+            len += p.len;
+        }
+        var buf: [len]u8 = undefined;
+        var pos: usize = 0;
+        for (parts, 0..) |p, i| {
+            if (i > 0) {
+                @memcpy(buf[pos..][0..sep.len], sep);
+                pos += sep.len;
+            }
+            @memcpy(buf[pos..][0..p.len], p);
+            pos += p.len;
+        }
+        return &buf;
+    }
+}
+
+/// Converts a comptime method slice to a string slice of their names.
+fn comptimeMethodNames(comptime methods: []const types.Method) []const []const u8 {
+    comptime {
+        var names: [methods.len][]const u8 = undefined;
+        for (methods, 0..) |m, i| {
+            names[i] = m.toString();
+        }
+        return &names;
+    }
+}
+
+/// Creates CORS middleware. Config must be comptime-known so header strings
+/// are precomputed at compile time — zero per-request allocations.
+pub fn cors(comptime config: CorsConfig) Middleware {
     return .{
         .name = "cors",
         .handler = struct {
-            fn allowedOrigin(ctx: *Context, cfg: CorsConfig) []const u8 {
-                const req_origin = ctx.header("Origin") orelse return cfg.allowed_origins[0];
-                for (cfg.allowed_origins) |o| {
+            const methods_str = comptimeJoin(comptimeMethodNames(config.allowed_methods), ", ");
+            const headers_str = comptimeJoin(config.allowed_headers, ", ");
+            const exposed_str = comptimeJoin(config.exposed_headers, ", ");
+            const max_age_str = std.fmt.comptimePrint("{d}", .{config.max_age});
+
+            fn allowedOrigin(ctx: *Context) []const u8 {
+                const req_origin = ctx.header("Origin") orelse return config.allowed_origins[0];
+                for (config.allowed_origins) |o| {
                     if (std.mem.eql(u8, o, "*") or std.mem.eql(u8, o, req_origin)) {
                         return if (std.mem.eql(u8, o, "*")) "*" else req_origin;
                     }
                 }
-                return cfg.allowed_origins[0];
+                return config.allowed_origins[0];
             }
 
-            fn methodNames(methods: []const types.Method, buf: *[16][]const u8) []const []const u8 {
-                for (methods, 0..) |m, i| {
-                    buf[i] = m.toString();
-                }
-                return buf[0..methods.len];
-            }
-
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
-                const origin = allowedOrigin(ctx, config);
+            fn handler(ctx: *Context, next: *Next) anyerror!Response {
+                const origin = allowedOrigin(ctx);
                 try ctx.setHeader("Access-Control-Allow-Origin", origin);
                 try ctx.setHeader(HeaderName.VARY, "Origin");
-
-                var method_name_buf: [16][]const u8 = undefined;
-                const methods_str = try common.joinStrings(ctx.allocator, methodNames(config.allowed_methods, &method_name_buf), ", ");
-                defer ctx.allocator.free(methods_str);
                 try ctx.setHeader("Access-Control-Allow-Methods", methods_str);
-
-                const headers_str = try common.joinStrings(ctx.allocator, config.allowed_headers, ", ");
-                defer ctx.allocator.free(headers_str);
                 try ctx.setHeader("Access-Control-Allow-Headers", headers_str);
 
                 if (config.exposed_headers.len > 0) {
-                    const exposed_str = try common.joinStrings(ctx.allocator, config.exposed_headers, ", ");
-                    defer ctx.allocator.free(exposed_str);
                     try ctx.setHeader("Access-Control-Expose-Headers", exposed_str);
                 }
 
@@ -84,15 +115,13 @@ pub fn cors(config: CorsConfig) Middleware {
                     try ctx.setHeader("Access-Control-Allow-Credentials", "true");
                 }
 
-                var max_age_buf: [32]u8 = undefined;
-                const max_age = std.fmt.bufPrint(&max_age_buf, "{d}", .{config.max_age}) catch unreachable;
-                try ctx.setHeader("Access-Control-Max-Age", max_age);
+                try ctx.setHeader("Access-Control-Max-Age", max_age_str);
 
                 if (ctx.request.method == .OPTIONS) {
                     return ctx.status(204).text("");
                 }
 
-                return next(ctx);
+                return next.call(ctx);
             }
         }.handler,
     };
@@ -103,9 +132,9 @@ pub fn logger() Middleware {
     return .{
         .name = "logger",
         .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
+            fn handler(ctx: *Context, next: *Next) anyerror!Response {
                 const start = milliTimestamp();
-                const response = try next(ctx);
+                const response = try next.call(ctx);
                 const duration = milliTimestamp() - start;
 
                 std.debug.print("{s} {s} - {d}ms\n", .{
@@ -132,12 +161,12 @@ pub fn helmet() Middleware {
     return .{
         .name = "helmet",
         .handler = struct {
-            fn handler(ctx: *Context, next: Next) anyerror!Response {
+            fn handler(ctx: *Context, next: *Next) anyerror!Response {
                 try ctx.setHeader(HeaderName.X_CONTENT_TYPE_OPTIONS, "nosniff");
                 try ctx.setHeader(HeaderName.X_FRAME_OPTIONS, "SAMEORIGIN");
                 try ctx.setHeader(HeaderName.X_XSS_PROTECTION, "0");
                 try ctx.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-                return next(ctx);
+                return next.call(ctx);
             }
         }.handler,
     };
@@ -151,12 +180,12 @@ pub fn requestId() Middleware {
         .handler = struct {
             var counter = std.atomic.Value(u64).init(0);
 
-            fn handler(ctx: *Context, next_handler: Next) anyerror!Response {
+            fn handler(ctx: *Context, next_handler: *Next) anyerror!Response {
                 const id = counter.fetchAdd(1, .monotonic);
                 var buf: [16]u8 = undefined;
                 const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{id}) catch unreachable;
                 try ctx.setHeader("X-Request-ID", hex);
-                return next_handler(ctx);
+                return next_handler.call(ctx);
             }
         }.handler,
     };

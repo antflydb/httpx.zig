@@ -131,6 +131,51 @@ pub const Socket = struct {
     }
 };
 
+/// Shared Io.Reader VTable helpers for custom reader adapters.
+/// These generic implementations call through the vtable's `readVec` and
+/// can be reused by any adapter that only needs to provide `readVec`.
+pub const IoReaderHelpers = struct {
+    pub fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
+            var iov = [_][]u8{r.buffer[0..max_to_read]};
+            const n = r.vtable.readVec(r, &iov) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+
+            try w.writeAll(r.buffer[0..n]);
+            total += n;
+        }
+
+        return total;
+    }
+
+    pub fn discard(r: *Io.Reader, limit: Io.Limit) error{ EndOfStream, ReadFailed }!usize {
+        var total: usize = 0;
+        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
+
+        while (total < max_limit) {
+            const max_to_read = @min(r.buffer.len, max_limit - total);
+            var iov = [_][]u8{r.buffer[0..max_to_read]};
+            const n = r.vtable.readVec(r, &iov) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            total += n;
+        }
+
+        return total;
+    }
+
+    pub fn rebase(_: *Io.Reader, _: usize) Io.Reader.RebaseError!void {}
+};
+
 /// Adapter that exposes a `std.Io.Reader` backed by a connected `Socket`.
 ///
 /// This is primarily used to integrate with `std.crypto.tls.Client`.
@@ -154,44 +199,6 @@ pub const SocketIoReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
-    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        var total: usize = 0;
-        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
-
-        while (total < max_limit) {
-            const max_to_read = @min(r.buffer.len, max_limit - total);
-            var iov = [_][]u8{r.buffer[0..max_to_read]};
-            const n = readVec(r, &iov) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
-            if (n == 0) break;
-
-            try w.writeAll(r.buffer[0..n]);
-            total += n;
-        }
-
-        return total;
-    }
-
-    fn discard(r: *Io.Reader, limit: Io.Limit) error{ EndOfStream, ReadFailed }!usize {
-        var total: usize = 0;
-        const max_limit = limit.toInt() orelse std.math.maxInt(usize);
-
-        while (total < max_limit) {
-            const max_to_read = @min(r.buffer.len, max_limit - total);
-            var iov = [_][]u8{r.buffer[0..max_to_read]};
-            const n = readVec(r, &iov) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return err,
-            };
-            if (n == 0) break;
-            total += n;
-        }
-
-        return total;
-    }
-
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
         if (bufs.len == 0) return 0;
@@ -201,13 +208,11 @@ pub const SocketIoReader = struct {
         return n;
     }
 
-    fn rebase(_: *Io.Reader, _: usize) Io.Reader.RebaseError!void {}
-
     const vtable: Io.Reader.VTable = .{
-        .stream = stream,
-        .discard = discard,
+        .stream = IoReaderHelpers.stream,
+        .discard = IoReaderHelpers.discard,
         .readVec = readVec,
-        .rebase = rebase,
+        .rebase = IoReaderHelpers.rebase,
     };
 };
 

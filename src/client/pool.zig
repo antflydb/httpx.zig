@@ -304,13 +304,26 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 }
 
                 if (self.host_map.getPtr(key)) |list| {
-                    for (list.items) |entry| {
+                    var i: usize = 0;
+                    while (i < list.items.len) {
+                        const entry = list.items[i];
                         if (entry.isHealthy(self.config.idle_timeout_ms, now) and
                             entry.requests_made < self.config.max_requests_per_connection)
                         {
                             entry.acquire(now);
                             self.active_count += 1;
                             return entry;
+                        }
+                        // Evict stale/broken connections inline so they don't
+                        // count against max_per_host.
+                        if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
+                            entry.close();
+                            self.allocator.free(entry.host);
+                            self.allocator.destroy(entry);
+                            _ = list.swapRemove(i);
+                            self.total_count -|= 1;
+                        } else {
+                            i += 1;
                         }
                     }
 

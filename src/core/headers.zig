@@ -166,7 +166,7 @@ pub const Headers = struct {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (eqlIgnoreCase(self.entries.items[i].name, name)) {
-                const entry = self.entries.orderedRemove(i);
+                const entry = self.entries.swapRemove(i);
                 if (entry.owned) {
                     self.allocator.free(entry.name);
                     self.allocator.free(entry.value);

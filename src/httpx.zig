@@ -144,7 +144,7 @@ pub const UdpSocket = socket.UdpSocket;
 
 pub const Parser = parser.Parser;
 
-pub const Http2Connection = http.Http2Connection;
+pub const Http2ConnectionSettings = http.Http2ConnectionSettings;
 pub const Http2FrameType = http.Http2FrameType;
 pub const Http2FrameHeader = http.Http2FrameHeader;
 pub const Http2ErrorCode = http.Http2ErrorCode;

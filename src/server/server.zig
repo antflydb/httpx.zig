@@ -29,7 +29,8 @@ const Address = @import("../net/socket.zig").Address;
 const TcpListener = @import("../net/socket.zig").TcpListener;
 const Router = @import("router.zig").Router;
 const RouteParam = @import("router.zig").RouteParam;
-const Middleware = @import("middleware.zig").Middleware;
+const middleware_mod = @import("middleware.zig");
+const Middleware = middleware_mod.Middleware;
 const common = @import("../util/common.zig");
 
 pub const CookieOptions = common.CookieOptions;
@@ -68,8 +69,6 @@ pub const Context = struct {
     params: []const RouteParam = &.{},
     data: std.StringHashMap(DataEntry),
     max_file_size: usize = types.default_max_body_size,
-    /// Internal: middleware dispatch state. Not part of the public API.
-    _mw_state: ?*Server.MiddlewareExecState = null,
 
     /// Entry in the context data map with an optional destructor for cleanup.
     pub const DataEntry = struct {
@@ -411,7 +410,10 @@ pub const Server = struct {
         }
 
         // Wait for all in-flight connections to finish before returning.
-        self.connections.await(self.io) catch {};
+        self.connections.await(self.io) catch |err| switch (err) {
+            error.Canceled => {},
+            else => std.debug.print("Server shutdown error: {}\n", .{err}),
+        };
     }
 
     /// Stops the server.
@@ -575,11 +577,9 @@ pub const Server = struct {
                 try response.headers.set(HeaderName.CONNECTION, "close");
             }
 
-            try self.ensureContentLengthHeader(&response);
+            try ensureContentLengthHeader(&response);
 
-            var bw = std.io.bufferedWriter(sock.writer());
-            try response.serialize(bw.writer().any());
-            try bw.flush();
+            try sendBuffered(&sock, &response);
 
             if (!keep_alive) return;
             first_request = false;
@@ -591,15 +591,19 @@ pub const Server = struct {
         var resp = Response.init(self.allocator, code);
         defer resp.deinit();
 
-        try self.ensureContentLengthHeader(&resp);
+        try ensureContentLengthHeader(&resp);
 
+        try sendBuffered(socket, &resp);
+    }
+
+    /// Serializes a response through a buffered writer to reduce syscalls.
+    fn sendBuffered(socket: *Socket, resp: *Response) !void {
         var bw = std.io.bufferedWriter(socket.writer());
         try resp.serialize(bw.writer().any());
         try bw.flush();
     }
 
-    fn ensureContentLengthHeader(self: *Self, response: *Response) !void {
-        _ = self;
+    fn ensureContentLengthHeader(response: *Response) !void {
         if (response.headers.get(HeaderName.CONTENT_LENGTH) != null) return;
         if (response.headers.isChunked()) return;
 
@@ -608,35 +612,58 @@ pub const Server = struct {
     }
 
     /// Sets the `Allow` header for automatic OPTIONS and 405 responses.
-    fn setAllowHeader(self: *Self, headers: *Headers, methods: []const types.Method) !void {
-        var allow = std.ArrayListUnmanaged(u8).empty;
-        defer allow.deinit(self.allocator);
-        const writer = arrayListWriter(&allow, self.allocator);
-
-        var first = true;
+    fn setAllowHeader(_: *Self, headers: *Headers, methods: []const types.Method) !void {
+        // Max: 9 methods × ~7 chars + separators = ~80 bytes; 128 is plenty.
+        var buf: [128]u8 = undefined;
+        var pos: usize = 0;
         var has_options = false;
 
         for (methods) |m| {
             if (m == .OPTIONS) has_options = true;
-            if (!first) try writer.writeAll(", ");
-            first = false;
-            try writer.writeAll(m.toString());
+            if (pos > 0) {
+                @memcpy(buf[pos..][0..2], ", ");
+                pos += 2;
+            }
+            const name = m.toString();
+            @memcpy(buf[pos..][0..name.len], name);
+            pos += name.len;
         }
 
         if (!has_options) {
-            if (!first) try writer.writeAll(", ");
-            try writer.writeAll("OPTIONS");
+            if (pos > 0) {
+                @memcpy(buf[pos..][0..2], ", ");
+                pos += 2;
+            }
+            const opt = "OPTIONS";
+            @memcpy(buf[pos..][0..opt.len], opt);
+            pos += opt.len;
         }
 
-        try headers.set(HeaderName.ALLOW, allow.items);
+        try headers.set(HeaderName.ALLOW, buf[0..pos]);
     }
 
     /// Middleware execution state kept on the stack frame of executeMiddleware.
-    /// Not stored in ctx.data — prevents user code from corrupting dispatch.
+    /// Uses `@fieldParentPtr` through the embedded `Next` to carry state
+    /// without exposing internal fields on Context.
     const MiddlewareExecState = struct {
         server: *Self,
         route_handler: Handler,
         index: usize = 0,
+        next: middleware_mod.Next = .{ ._call = trampoline },
+
+        fn trampoline(next_ptr: *middleware_mod.Next, ctx: *Context) anyerror!Response {
+            const state: *MiddlewareExecState = @fieldParentPtr("next", next_ptr);
+            return advance(ctx, state);
+        }
+
+        fn advance(ctx: *Context, state: *MiddlewareExecState) anyerror!Response {
+            if (state.index < state.server.middleware.items.len) {
+                const mw = state.server.middleware.items[state.index];
+                state.index += 1;
+                return mw.handler(ctx, &state.next);
+            }
+            return state.route_handler(ctx);
+        }
     };
 
     fn executeMiddleware(self: *Self, ctx: *Context, route_handler: Handler) !Response {
@@ -644,29 +671,7 @@ pub const Server = struct {
             .server = self,
             .route_handler = route_handler,
         };
-
-        return middlewareNext(ctx, &state);
-    }
-
-    fn middlewareNext(ctx: *Context, state: *MiddlewareExecState) anyerror!Response {
-        if (state.index < state.server.middleware.items.len) {
-            const mw = state.server.middleware.items[state.index];
-            state.index += 1;
-            // Wrap the stateful next call into the expected `Next` signature
-            // using a trampoline that carries the state pointer through ctx's
-            // private middleware slot.
-            ctx._mw_state = state;
-            return mw.handler(ctx, middlewareTrampoline);
-        }
-
-        return state.route_handler(ctx);
-    }
-
-    /// Trampoline adapts the `Next` function signature (which takes only `*Context`)
-    /// to the stateful `middlewareNext` which also needs the state pointer.
-    fn middlewareTrampoline(ctx: *Context) anyerror!Response {
-        const state = ctx._mw_state orelse return error.MissingMiddlewareState;
-        return middlewareNext(ctx, state);
+        return MiddlewareExecState.advance(ctx, &state);
     }
 };
 
