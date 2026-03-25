@@ -274,6 +274,8 @@ pub const StreamManager = struct {
     }
 
     /// Gets or creates a stream (for handling incoming frames).
+    /// Validates that peer-initiated stream IDs are monotonically increasing
+    /// per RFC 7540 §5.1.1.
     pub fn getOrCreateStream(self: *Self, id: u31) !*Stream {
         if (self.streams.getPtr(id)) |stream| {
             return stream;
@@ -286,6 +288,19 @@ pub const StreamManager = struct {
         }
         if (!self.is_client and !is_client_stream) {
             return error.InvalidStreamId; // Client cannot create server streams
+        }
+
+        // Track highest peer-initiated stream ID for monotonicity enforcement.
+        if (is_client_stream and !self.is_client) {
+            // Server receiving client stream — advance tracker past this ID.
+            if (id >= self.next_client_stream_id) {
+                self.next_client_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else id;
+            }
+        } else if (!is_client_stream and self.is_client) {
+            // Client receiving server stream — advance tracker past this ID.
+            if (id >= self.next_server_stream_id) {
+                self.next_server_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else id;
+            }
         }
 
         try self.streams.put(self.allocator, id, Stream.init(id));

@@ -72,11 +72,12 @@ pub const H2Connection = struct {
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
     continuation_flags: u8 = 0,
 
-    const Self = @This();
-
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
-    /// Half the default initial window size (65535 / 2 ≈ 32KB).
-    pub const window_update_threshold: u32 = 32768;
+    /// Defaults to half the initial window size. Adjusted when peer SETTINGS
+    /// changes INITIAL_WINDOW_SIZE so small windows don't deadlock.
+    window_update_threshold: u32 = 65535 / 2,
+
+    const Self = @This();
 
     /// Maximum total CONTINUATION reassembly size (64KB).
     /// Prevents unbounded memory growth from CONTINUATION frame floods.
@@ -164,6 +165,9 @@ pub const H2Connection = struct {
             try self.stream_manager.applyInitialWindowSizeChange(old_window, new_window);
         }
         self.stream_manager.max_concurrent_streams = self.peer_settings.max_concurrent_streams;
+        // Adapt window update threshold to the local initial window size
+        // so small windows don't deadlock (threshold must be <= window size).
+        self.window_update_threshold = @max(1, self.local_settings.initial_window_size / 2);
     }
 
     // ---------------------------------------------------------------
@@ -390,13 +394,13 @@ pub const H2Connection = struct {
     fn accumulateWindowUpdate(self: *Self, writer: anytype, stream_id: u31, len: u32) !void {
         // Connection-level accumulator.
         self.pending_conn_window_update += len;
-        if (self.pending_conn_window_update >= window_update_threshold) {
+        if (self.pending_conn_window_update >= self.window_update_threshold) {
             try self.flushWindowAccumulator(writer, 0, &self.pending_conn_window_update);
         }
         // Stream-level accumulator.
         if (self.stream_manager.getStream(stream_id)) |s| {
             s.pending_window_update += len;
-            if (s.pending_window_update >= window_update_threshold) {
+            if (s.pending_window_update >= self.window_update_threshold) {
                 try self.flushWindowAccumulator(writer, stream_id, &s.pending_window_update);
             }
         }
@@ -417,6 +421,15 @@ pub const H2Connection = struct {
     fn flushConnWindowUpdate(self: *Self, writer: anytype) !void {
         if (self.pending_conn_window_update > 0) {
             try self.flushWindowAccumulator(writer, 0, &self.pending_conn_window_update);
+        }
+    }
+
+    /// Flushes any remaining stream-level window credit for the given stream.
+    fn flushStreamWindowUpdate(self: *Self, writer: anytype, stream_id: u31) !void {
+        if (self.stream_manager.getStream(stream_id)) |s| {
+            if (s.pending_window_update > 0) {
+                try self.flushWindowAccumulator(writer, stream_id, &s.pending_window_update);
+            }
         }
     }
 
@@ -445,7 +458,22 @@ pub const H2Connection = struct {
                 try self.handleGoaway(frame);
                 return null;
             },
-            .headers, .data, .rst_stream, .priority => frame.*,
+            .push_promise => {
+                // RFC 7540 §6.6: PUSH_PROMISE on a connection where ENABLE_PUSH=0
+                // is a connection error (PROTOCOL_ERROR). We always set enable_push=false.
+                try self.sendGoaway(writer, .protocol_error);
+                return error.ProtocolError;
+            },
+            .headers, .data, .rst_stream => {
+                // RFC 7540 §6.2/§6.1/§6.4: These frame types MUST have a non-zero
+                // stream ID. Stream ID 0 is a connection error (PROTOCOL_ERROR).
+                if (frame.header.stream_id == 0) {
+                    try self.sendGoaway(writer, .protocol_error);
+                    return error.ProtocolError;
+                }
+                return frame.*;
+            },
+            .priority => frame.*,
             else => null, // Unknown frame types MUST be ignored (RFC 7540 §4.1).
         };
     }
@@ -532,6 +560,17 @@ pub const H2Connection = struct {
         const stream = self.stream_manager.getStream(sid) orelse blk: {
             // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
             if (self.goaway_received) return error.ProtocolError;
+
+            // RFC 7540 §5.1.1: Peer stream IDs must be monotonically increasing.
+            const is_peer_stream = if (self.is_server) (sid % 2 == 1) else (sid % 2 == 0);
+            if (is_peer_stream) {
+                const last_seen = if (self.is_server)
+                    self.stream_manager.next_client_stream_id
+                else
+                    self.stream_manager.next_server_stream_id;
+                if (sid < last_seen) return error.ProtocolError;
+            }
+
             break :blk try self.stream_manager.getOrCreateStream(sid);
         };
 
@@ -547,7 +586,14 @@ pub const H2Connection = struct {
                 // stateful — concurrent decodes corrupt the dynamic table.
                 stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
                 stream.request_headers = null;
-                const dec = try self.decodeFrameHeaders(frame.payload, frame.header.flags);
+                const dec = self.decodeFrameHeaders(frame.payload, frame.header.flags) catch |err| {
+                    // Clean up the duped payload on decode failure.
+                    if (stream.headers_payload) |hp| {
+                        self.allocator.free(hp);
+                        stream.headers_payload = null;
+                    }
+                    return err;
+                };
                 stream.request_headers = dec.headers;
                 if (dec.priority) |p| stream.priority = p;
 
@@ -563,6 +609,14 @@ pub const H2Connection = struct {
                 }
             },
             .data => {
+                // RFC 7540 §5.1: DATA on half-closed-remote or closed is a stream error.
+                if (!stream.canReceive()) {
+                    stream.stream_error = error.StreamClosed;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    return;
+                }
                 if (self.max_stream_data_size > 0) {
                     const new_size = stream.data_buf.items.len + frame.payload.len;
                     if (new_size > self.max_stream_data_size) {
@@ -572,6 +626,18 @@ pub const H2Connection = struct {
                         if (stream.completion_sem) |sem| sem.post(self.io);
                         return;
                     }
+                }
+                // RFC 7540 §6.9: Decrement receive windows on incoming DATA.
+                if (frame.payload.len > 0) {
+                    const data_len: i32 = @intCast(@min(frame.payload.len, @as(usize, @intCast(std.math.maxInt(i32)))));
+                    stream.updateRecvWindow(-data_len) catch {
+                        stream.stream_error = error.FlowControlError;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        return;
+                    };
+                    self.stream_manager.updateConnectionRecvWindow(-data_len) catch {};
                 }
                 try stream.data_buf.appendSlice(self.allocator, frame.payload);
                 if (stream.data_event) |ev| ev.set(self.io);
@@ -607,10 +673,11 @@ pub const H2Connection = struct {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
             try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
-            // Flush connection-level window credit on stream completion or reset.
+            // Flush window credit on stream completion or reset.
             if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
                 sf.header.frame_type == .rst_stream)
             {
+                try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
                 try self.flushConnWindowUpdate(writer);
             }
             return sf.header.stream_id;
@@ -641,10 +708,11 @@ pub const H2Connection = struct {
                 // deliverToMailbox decodes HPACK + copies payload under lock,
                 // ensuring the shared hpack_ctx is not accessed concurrently.
                 try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
-                // Flush connection-level window credit on stream completion or reset.
+                // Flush window credit on stream completion or reset.
                 if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
                     sf.header.frame_type == .rst_stream)
                 {
+                    try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
                     try self.flushConnWindowUpdate(writer);
                 }
                 return sf.header.stream_id;
@@ -1351,6 +1419,7 @@ test "deliverToMailbox incremental DATA without END_STREAM" {
     defer server.deinit();
 
     const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
 
     // Deliver a DATA frame without END_STREAM.
     var payload1 = try allocator.dupe(u8, "chunk1");
@@ -1665,8 +1734,9 @@ test "batched WINDOW_UPDATE: small DATA frames don't trigger immediate updates" 
     var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
 
-    // Register stream 1 (client-initiated).
-    _ = try server.stream_manager.getOrCreateStream(1);
+    // Register stream 1 (client-initiated) and transition to open.
+    const s1 = try server.stream_manager.getOrCreateStream(1);
+    s1.state = .open;
 
     // Build 3 small DATA frames (100 bytes each, well below 32KB threshold).
     var c2s = std.ArrayListUnmanaged(u8).empty;
@@ -1705,7 +1775,8 @@ test "batched WINDOW_UPDATE: threshold triggers flush" {
 
     var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
-    _ = try server.stream_manager.getOrCreateStream(1);
+    const s1 = try server.stream_manager.getOrCreateStream(1);
+    s1.state = .open;
 
     // Build multiple DATA frames totaling > 32KB threshold.
     // Each frame is limited to MAX_FRAME_SIZE (16384), so we send 3 frames.
@@ -1746,12 +1817,13 @@ test "batched WINDOW_UPDATE: threshold triggers flush" {
     try std.testing.expectEqual(@as(u32, 0), s.pending_window_update);
 }
 
-test "batched WINDOW_UPDATE: END_STREAM flushes connection credit" {
+test "batched WINDOW_UPDATE: END_STREAM flushes connection and stream credit" {
     const allocator = std.testing.allocator;
 
     var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
-    _ = try server.stream_manager.getOrCreateStream(1);
+    const s1 = try server.stream_manager.getOrCreateStream(1);
+    s1.state = .open;
 
     // Send a small DATA frame with END_STREAM.
     var c2s = std.ArrayListUnmanaged(u8).empty;
@@ -1770,11 +1842,10 @@ test "batched WINDOW_UPDATE: END_STREAM flushes connection credit" {
     var reader = TestReader{ .data = c2s.items };
     _ = try server.processOneFrame(&reader, reply_w);
 
-    // END_STREAM should flush the connection-level accumulator.
+    // END_STREAM should flush both stream and connection accumulators.
     // 5 bytes < threshold, but END_STREAM forces flush.
-    // One WINDOW_UPDATE for connection (13 bytes). Stream-level not flushed
-    // because it's pointless for a completed stream.
-    try std.testing.expectEqual(@as(usize, 13), reply.items.len);
+    // Two WINDOW_UPDATE frames (stream + connection), 13 bytes each = 26.
+    try std.testing.expectEqual(@as(usize, 26), reply.items.len);
     try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
 }
 
@@ -1927,4 +1998,164 @@ test "window accumulator handles values exceeding u31 max" {
     try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
     // At least 2 frames (one for maxInt(u31), one for remainder).
     try std.testing.expect(reply.items.len >= 2 * 13);
+}
+
+test "dispatchFrame rejects HEADERS on stream 0" {
+    const allocator = std.testing.allocator;
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const writer = testWriter(&reply, allocator);
+
+    var frame = Frame{
+        .header = .{ .length = 1, .frame_type = .headers, .flags = 0x04, .stream_id = 0 },
+        .payload = @constCast(&[_]u8{0x82}),
+    };
+    try std.testing.expectError(error.ProtocolError, conn.dispatchFrame(&frame, writer));
+    // Should have sent GOAWAY.
+    try std.testing.expect(reply.items.len > 0);
+    try std.testing.expect(conn.goaway_sent);
+}
+
+test "dispatchFrame rejects DATA on stream 0" {
+    const allocator = std.testing.allocator;
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const writer = testWriter(&reply, allocator);
+
+    var frame = Frame{
+        .header = .{ .length = 5, .frame_type = .data, .flags = 0, .stream_id = 0 },
+        .payload = @constCast("hello"),
+    };
+    try std.testing.expectError(error.ProtocolError, conn.dispatchFrame(&frame, writer));
+    try std.testing.expect(conn.goaway_sent);
+}
+
+test "dispatchFrame rejects PUSH_PROMISE" {
+    const allocator = std.testing.allocator;
+    var conn = H2Connection.initClient(allocator, std.testing.io);
+    defer conn.deinit();
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const writer = testWriter(&reply, allocator);
+
+    var frame = Frame{
+        .header = .{ .length = 5, .frame_type = .push_promise, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&[_]u8{ 0, 0, 0, 2, 0x82 }),
+    };
+    try std.testing.expectError(error.ProtocolError, conn.dispatchFrame(&frame, writer));
+    try std.testing.expect(conn.goaway_sent);
+}
+
+test "deliverToMailbox rejects DATA on half-closed-remote stream" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .half_closed_remote; // Peer already sent END_STREAM.
+
+    var frame = Frame{
+        .header = .{ .length = 5, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast("hello"),
+    };
+    try server.deliverToMailbox(&frame);
+    // Stream should be marked as error.
+    try std.testing.expect(stream.stream_error != null);
+    try std.testing.expect(stream.completed);
+    try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
+}
+
+test "deliverToMailbox enforces stream ID monotonicity" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // First create stream 5.
+    const s5 = try server.stream_manager.getOrCreateStream(5);
+    s5.state = .open;
+
+    // Now try to create stream 3 (lower than 5) — should fail.
+    var frame = Frame{
+        .header = .{ .length = 1, .frame_type = .headers, .flags = 0x05, .stream_id = 3 },
+        .payload = @constCast(&[_]u8{0x82}),
+    };
+    try std.testing.expectError(error.ProtocolError, server.deliverToMailbox(&frame));
+}
+
+test "receive window decremented on incoming DATA" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const initial_recv = stream.recv_window;
+    const initial_conn_recv = server.stream_manager.connection_recv_window;
+
+    var frame = Frame{
+        .header = .{ .length = 100, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&([_]u8{0x41} ** 100)),
+    };
+    try server.deliverToMailbox(&frame);
+
+    try std.testing.expectEqual(initial_recv - 100, stream.recv_window);
+    try std.testing.expectEqual(initial_conn_recv - 100, server.stream_manager.connection_recv_window);
+}
+
+test "stream-level window flushed at END_STREAM" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    const s1 = try server.stream_manager.getOrCreateStream(1);
+    s1.state = .open;
+
+    // Send a DATA frame with END_STREAM via processOneFrame.
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+    _ = try client.stream_manager.createStream();
+    try client.writeData(c2s_w, 1, "test data", true);
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const reply_w = testWriter(&reply, allocator);
+    var reader = TestReader{ .data = c2s.items };
+    _ = try server.processOneFrame(&reader, reply_w);
+
+    // Both stream and connection window should have been flushed.
+    try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
+    const s = server.stream_manager.getStream(1).?;
+    try std.testing.expectEqual(@as(u32, 0), s.pending_window_update);
+    // Two WINDOW_UPDATE frames (stream + connection), 13 bytes each.
+    try std.testing.expectEqual(@as(usize, 26), reply.items.len);
+}
+
+test "adaptive window_update_threshold adjusts with SETTINGS" {
+    const allocator = std.testing.allocator;
+    var conn = H2Connection.initClient(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // Default threshold is half of 65535 = 32767.
+    try std.testing.expectEqual(@as(u32, 32767), conn.window_update_threshold);
+
+    // Change local initial_window_size to 8192 and re-trigger threshold calc.
+    conn.local_settings.initial_window_size = 8192;
+    // Simulate peer sending any SETTINGS to trigger threshold recalculation.
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intFromEnum(http.Http2SettingId.max_concurrent_streams), .big);
+    std.mem.writeInt(u32, payload[2..6], 200, .big);
+    try conn.applyPeerSettings(&payload);
+
+    // Threshold should be half of 8192 = 4096.
+    try std.testing.expectEqual(@as(u32, 4096), conn.window_update_threshold);
 }

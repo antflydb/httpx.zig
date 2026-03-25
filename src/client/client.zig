@@ -165,11 +165,13 @@ pub const Client = struct {
         var h2_it = self.h2_conns.iterator();
         while (h2_it.next()) |entry| {
             const e = entry.value_ptr.*;
+            // Close the socket first so the receive loop's blocking read
+            // returns ConnectionClosed, allowing the fiber to exit cleanly.
+            e.socket.close();
             // Wait for the receive-loop fiber to finish before tearing down.
             e.recv_group.await(self.io) catch {};
             e.h2.deinit();
             if (e.is_tls) e.session.deinit();
-            e.socket.close();
             self.allocator.destroy(e);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -419,10 +421,10 @@ pub const Client = struct {
             // Remove and destroy broken entry.
             if (self.h2_conns.fetchRemove(key)) |removed| {
                 const e = removed.value;
+                e.socket.close();
                 e.recv_group.await(self.io) catch {};
                 e.h2.deinit();
                 if (e.is_tls) e.session.deinit();
-                e.socket.close();
                 self.allocator.destroy(e);
                 self.allocator.free(removed.key);
             }
@@ -530,6 +532,7 @@ pub const Client = struct {
         }
         const stream = try h2.stream_manager.createStream();
         const stream_id = stream.id;
+        errdefer h2.stream_manager.removeStream(stream_id);
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -739,12 +742,16 @@ pub const Client = struct {
         }
         const stream = try h2.stream_manager.createStream();
         const stream_id = stream.id;
+        errdefer h2.stream_manager.removeStream(stream_id);
 
         // Heap-allocate event for pointer stability and timed waits.
         const data_event = try self.allocator.create(Io.Event);
         data_event.* = .unset;
         stream.data_event = data_event;
-        errdefer self.allocator.destroy(data_event);
+        errdefer {
+            stream.data_event = null;
+            self.allocator.destroy(data_event);
+        }
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
