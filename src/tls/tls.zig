@@ -55,18 +55,45 @@ pub const VerifyMode = enum {
 };
 
 /// TLS configuration for clients and servers.
+///
+/// ## Implemented Fields
+///
+/// - `verify_mode`: `.none` disables certificate verification; all other
+///   modes enable it (the stdlib does not distinguish sub-modes).
+/// - `verify_hostname`: controls SNI hostname verification.
+/// - `server_name`: explicit SNI override.
+///
+/// ## Unimplemented Fields (Zig 0.16 stdlib limitation)
+///
+/// The following fields are accepted but **not wired into the handshake**.
+/// Setting them has no effect today. They are retained for forward
+/// compatibility — when the stdlib gains support, they will be plumbed
+/// into `TlsSession.handshake()`.
+///
+/// - `min_version` / `max_version`: stdlib negotiates TLS 1.2/1.3 automatically.
+/// - `ca_file` / `ca_path`: system CA bundle is always used; custom CAs are ignored.
+/// - `cert_file` / `key_file`: mutual TLS (client certificates) is not supported.
+/// - `alpn_protocols`: ALPN is not exposed by `std.crypto.tls.Client`.
+/// - `cipher_suites`: cipher selection is not configurable.
 pub const TlsConfig = struct {
     allocator: Allocator,
+    /// Unimplemented: stdlib negotiates version automatically.
     min_version: TlsVersion = .tls_1_2,
+    /// Unimplemented: stdlib negotiates version automatically.
     max_version: TlsVersion = .tls_1_3,
     verify_mode: VerifyMode = .peer,
     verify_hostname: bool = true,
+    /// Unimplemented: system CA bundle is always used.
     ca_file: ?[]const u8 = null,
+    /// Unimplemented: system CA bundle is always used.
     ca_path: ?[]const u8 = null,
+    /// Unimplemented: mutual TLS is not supported.
     cert_file: ?[]const u8 = null,
+    /// Unimplemented: mutual TLS is not supported.
     key_file: ?[]const u8 = null,
-    // Reserved for future protocol negotiation plumbing.
+    /// Unimplemented: ALPN is not exposed by `std.crypto.tls.Client`.
     alpn_protocols: []const []const u8 = &.{"http/1.1"},
+    /// Unimplemented: cipher selection is not configurable.
     cipher_suites: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
 
@@ -174,8 +201,10 @@ pub const TlsSession = struct {
         self.socket = socket;
     }
 
-    /// Performs the TLS handshake.
+    /// Performs the TLS handshake. Must be called exactly once per session.
+    /// Returns error.AlreadyConnected if called again after a successful handshake.
     pub fn handshake(self: *Self, hostname: []const u8) !void {
+        if (self.connected) return error.AlreadyConnected;
         const tls = std.crypto.tls;
         const sock = self.socket orelse return error.MissingTransport;
         const min_tls_buf = tls.Client.min_buffer_len;

@@ -606,21 +606,15 @@ pub const Client = struct {
         defer h2.stream_manager.removeStream(stream_id);
         if (s.stream_error) |err| return err;
 
-        const hp = s.headers_payload orelse return error.InvalidResponse;
-        const decoded = try h2.decodeFrameHeaders(hp, s.headers_flags);
-        defer {
-            for (decoded.headers) |*dh| {
-                self.allocator.free(dh.name);
-                self.allocator.free(dh.value);
-            }
-            self.allocator.free(decoded.headers);
-        }
+        // Headers were decoded in deliverToMailbox (receive loop) to avoid
+        // concurrent HPACK decode races on the shared hpack_ctx.
+        const decoded_headers = s.request_headers orelse return error.InvalidResponse;
 
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded.headers) |h| {
+        for (decoded_headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
                 status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
             } else if (h.name.len > 0 and h.name[0] != ':') {
@@ -813,22 +807,15 @@ pub const Client = struct {
         }
         if (stream.stream_error) |err| return err;
 
-        // Decode response headers.
-        const hp = stream.headers_payload orelse return error.InvalidResponse;
-        const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
-        defer {
-            for (decoded.headers) |*dh| {
-                self.allocator.free(dh.name);
-                self.allocator.free(dh.value);
-            }
-            self.allocator.free(decoded.headers);
-        }
+        // Headers were decoded in deliverToMailbox (receive loop) to avoid
+        // concurrent HPACK decode races on the shared hpack_ctx.
+        const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
 
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded.headers) |h| {
+        for (decoded_headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
                 status_code = std.fmt.parseInt(u16, h.value, 10) catch
                     return error.InvalidResponse;
@@ -934,21 +921,15 @@ pub const Client = struct {
         const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
         if (s.stream_error) |err| return err;
 
-        const hp = s.headers_payload orelse return error.InvalidResponse;
-        const decoded = try h2.decodeFrameHeaders(hp, s.headers_flags);
-        defer {
-            for (decoded.headers) |*dh| {
-                self.allocator.free(dh.name);
-                self.allocator.free(dh.value);
-            }
-            self.allocator.free(decoded.headers);
-        }
+        // Headers were decoded in deliverToMailbox (receive loop) to avoid
+        // concurrent HPACK decode races on the shared hpack_ctx.
+        const decoded_headers = s.request_headers orelse return error.InvalidResponse;
 
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded.headers) |h| {
+        for (decoded_headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
                 status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
             } else if (h.name.len > 0 and h.name[0] != ':') {

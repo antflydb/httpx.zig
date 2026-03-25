@@ -574,6 +574,10 @@ pub const Server = struct {
         });
         self.running = true;
 
+        if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
+            std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
+        }
+
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
         while (self.running) {
@@ -920,7 +924,21 @@ pub const Server = struct {
                 continue;
             }
 
-            const data_event = self.allocator.create(Io.Event) catch continue;
+            if (h2.stream_manager.activeStreamCount() > h2.stream_manager.max_concurrent_streams) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .refused_stream) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            }
+
+            const data_event = self.allocator.create(Io.Event) catch {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .internal_error) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            };
             data_event.* = .unset;
             stream.data_event = data_event;
 
@@ -992,9 +1010,25 @@ pub const Server = struct {
                 continue;
             }
 
+            // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
+            if (h2.stream_manager.activeStreamCount() > h2.stream_manager.max_concurrent_streams) {
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .refused_stream) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            }
+
             // Install data_event before spawning the fiber so the receive
             // loop can signal it for subsequent DATA frames.
-            const data_event = self.allocator.create(Io.Event) catch continue;
+            const data_event = self.allocator.create(Io.Event) catch {
+                // Alloc failure: reject the stream to avoid a leak.
+                h2.write_mutex.lockUncancelable(h2.io);
+                h2.sendRstStream(sock, sid, .internal_error) catch {};
+                h2.write_mutex.unlock(h2.io);
+                h2.stream_manager.removeStream(sid);
+                continue;
+            };
             data_event.* = .unset;
             stream.data_event = data_event;
 
@@ -1015,9 +1049,9 @@ pub const Server = struct {
         };
     }
 
-    /// Handles a single HTTP/2 stream: decodes headers from the mailbox,
-    /// routes the request, and sends the response. Dispatched as soon as
-    /// HEADERS arrive — the body may still be streaming.
+    /// Handles a single HTTP/2 stream: reads pre-decoded headers from the
+    /// mailbox, routes the request, and sends the response. Dispatched as
+    /// soon as HEADERS arrive — the body may still be streaming.
     fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
         // Ensure cleanup: detach event from stream, free event, remove stream.
         defer {
@@ -1029,16 +1063,10 @@ pub const Server = struct {
         }
 
         const stream = h2.stream_manager.getStream(stream_id) orelse return;
-        const hp = stream.headers_payload orelse return;
 
-        const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
-        defer {
-            for (decoded.headers) |*dh| {
-                self.allocator.free(dh.name);
-                self.allocator.free(dh.value);
-            }
-            self.allocator.free(decoded.headers);
-        }
+        // Headers were decoded in the receive loop's deliverToMailbox to
+        // avoid concurrent HPACK decode races on the shared hpack_ctx.
+        const decoded_headers = stream.request_headers orelse return;
 
         // Extract pseudo-headers → build a Request.
         var method_str: ?[]const u8 = null;
@@ -1048,7 +1076,7 @@ pub const Server = struct {
         var extra_headers = Headers.init(self.allocator);
         defer extra_headers.deinit();
 
-        for (decoded.headers) |h| {
+        for (decoded_headers) |h| {
             if (mem.eql(u8, h.name, ":method")) {
                 method_str = h.value;
             } else if (mem.eql(u8, h.name, ":path")) {

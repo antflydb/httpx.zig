@@ -261,6 +261,7 @@ pub const H2Connection = struct {
         const max_size = self.peer_settings.max_frame_size;
         const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
 
+        if (data.len > std.math.maxInt(i32)) return error.FlowControlError;
         const data_i32: i32 = @intCast(data.len);
         if (stream.send_window < data_i32) return error.FlowControlError;
         if (self.stream_manager.connection_send_window < data_i32) return error.FlowControlError;
@@ -325,13 +326,6 @@ pub const H2Connection = struct {
         self.goaway_received = true;
     }
 
-    /// Handles a received RST_STREAM frame.
-    pub fn handleRstStream(self: *Self, frame: *const Frame) !void {
-        if (frame.header.stream_id == 0) return error.ProtocolError;
-        const s = self.stream_manager.getStream(frame.header.stream_id) orelse return;
-        s.reset();
-    }
-
     /// Sends a GOAWAY frame advertising the last stream ID we processed.
     pub fn sendGoaway(self: *Self, writer: anytype, error_code: Http2ErrorCode) !void {
         const last_id = if (self.is_server) self.stream_manager.next_client_stream_id -| 2 else self.stream_manager.next_server_stream_id -| 2;
@@ -350,13 +344,14 @@ pub const H2Connection = struct {
 
     /// Initiates graceful shutdown: sends GOAWAY with no_error, then pumps
     /// frames until all in-flight streams complete or the peer closes.
+    /// Uses the locked frame pump since handler fibers may still be writing.
     pub fn gracefulShutdown(self: *Self, reader: anytype, writer: anytype) !void {
         if (!self.goaway_sent) {
             try self.sendGoaway(writer, .no_error);
         }
         // Drain remaining stream frames until all streams are done.
         while (self.stream_manager.activeStreamCount() > 0) {
-            _ = self.processOneFrame(reader, writer) catch |err| switch (err) {
+            _ = self.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
                 else => return err,
             };
@@ -500,6 +495,8 @@ pub const H2Connection = struct {
 
     /// Delivers a stream-level frame to the target stream's mailbox.
     /// Copies payload data so the original frame can be freed afterward.
+    /// HPACK decoding happens here (in the receive loop) to avoid concurrent
+    /// decode races on the shared hpack_ctx (RFC 7540 §4.3).
     pub fn deliverToMailbox(self: *Self, frame: *const Frame) !void {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
@@ -509,9 +506,23 @@ pub const H2Connection = struct {
 
         switch (frame.header.frame_type) {
             .headers => {
+                // Store raw HPACK payload (useful for debugging / tests).
                 if (stream.headers_payload) |old| self.allocator.free(old);
                 stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
                 stream.headers_flags = frame.header.flags;
+
+                // Decode HPACK immediately in the receive loop. This is the
+                // only safe place since hpack_ctx is connection-scoped and
+                // stateful — concurrent decodes corrupt the dynamic table.
+                stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
+                stream.request_headers = null;
+                const dec = try self.decodeFrameHeaders(frame.payload, frame.header.flags);
+                stream.request_headers = dec.headers;
+                if (dec.priority) |p| stream.priority = p;
+
+                // Transition idle → open (RFC 7540 §5.1).
+                if (stream.state == .idle) stream.state = .open;
+
                 stream.got_headers = true;
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
@@ -555,8 +566,10 @@ pub const H2Connection = struct {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
             try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
-            // Flush connection-level window credit on stream completion.
-            if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
+            // Flush connection-level window credit on stream completion or reset.
+            if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
+                sf.header.frame_type == .rst_stream)
+            {
                 try self.flushConnWindowUpdate(writer);
             }
             return sf.header.stream_id;
@@ -584,10 +597,13 @@ pub const H2Connection = struct {
                 if (sf.header.frame_type == .data and sf.payload.len > 0) {
                     try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                 }
-                // deliverToMailbox copies payload, safe to call under lock.
+                // deliverToMailbox decodes HPACK + copies payload under lock,
+                // ensuring the shared hpack_ctx is not accessed concurrently.
                 try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
-                // Flush connection-level window credit on stream completion.
-                if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
+                // Flush connection-level window credit on stream completion or reset.
+                if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
+                    sf.header.frame_type == .rst_stream)
+                {
                     try self.flushConnWindowUpdate(writer);
                 }
                 return sf.header.stream_id;

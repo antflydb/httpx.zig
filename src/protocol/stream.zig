@@ -198,7 +198,7 @@ pub const Stream = struct {
 };
 
 /// Frees a slice of HPACK decoded headers and their owned name/value strings.
-fn freeDecodedHeaders(allocator: Allocator, headers: ?[]hpack.DecodedHeader) void {
+pub fn freeDecodedHeaders(allocator: Allocator, headers: ?[]hpack.DecodedHeader) void {
     const hdrs = headers orelse return;
     for (hdrs) |h| {
         allocator.free(h.name);
