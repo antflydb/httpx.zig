@@ -1227,3 +1227,102 @@ test "mailbox-based request-response round-trip" {
     try std.testing.expectEqualStrings(":status", rdec.headers[0].name);
     try std.testing.expectEqualStrings("201", rdec.headers[0].value);
 }
+
+test "h2 round-trip over TCP loopback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_mod = @import("../net/socket.zig");
+    const Socket = socket_mod.Socket;
+    const Address = socket_mod.Address;
+    const TcpListener = socket_mod.TcpListener;
+
+    // 1. Bind listener on ephemeral port.
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
+    // 2. Client: connect and burst-write the h2 handshake + request.
+    var client_sock = try Socket.connect(bound_addr, io);
+    defer client_sock.close();
+
+    var client_h2 = H2Connection.initClient(allocator, io);
+    defer client_h2.deinit();
+
+    // Send client preface (magic + SETTINGS).
+    try client_h2.sendClientPreface(&client_sock);
+
+    // Build and send a GET / request.
+    const req_headers = try H2Connection.buildRequestHeaders(
+        "GET", "/", "http", "localhost", &.{}, allocator,
+    );
+    defer allocator.free(req_headers);
+    const stream = try client_h2.stream_manager.createStream();
+    const stream_id = stream.id;
+    try client_h2.sendHeaders(&client_sock, stream_id, req_headers, true); // END_STREAM
+
+    // 3. Server: accept and process the h2 handshake + request.
+    const accept_result = try listener.accept();
+    var server_sock = accept_result.socket;
+    defer server_sock.close();
+
+    var server_h2 = H2Connection.initServer(allocator, io);
+    defer server_h2.deinit();
+
+    // Read client preface (24-byte magic).
+    var preface_buf: [24]u8 = undefined;
+    H2Connection.readExact(&server_sock, &preface_buf) catch return;
+    if (!mem.eql(u8, &preface_buf, http.HTTP2_PREFACE)) return error.ProtocolError;
+
+    // Read client's SETTINGS frame and ACK it.
+    var settings_frame = try server_h2.readFrame(&server_sock);
+    defer settings_frame.deinit(allocator);
+    if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+    try server_h2.handleSettings(&settings_frame, &server_sock);
+
+    // Send server SETTINGS.
+    try server_h2.sendSettings(&server_sock);
+
+    // Pump frames until a stream completes (reads client's HEADERS + SETTINGS ACK).
+    var completed_sid: ?u31 = null;
+    while (completed_sid == null) {
+        const maybe_sid = try server_h2.processOneFrame(&server_sock, &server_sock);
+        if (maybe_sid) |sid| {
+            const s = server_h2.stream_manager.getStream(sid) orelse continue;
+            if (s.completed) completed_sid = sid;
+        }
+    }
+
+    // Verify the server received the request headers.
+    const srv_stream = server_h2.stream_manager.getStream(completed_sid.?).?;
+    try std.testing.expect(srv_stream.got_headers);
+    try std.testing.expect(srv_stream.completed);
+
+    // 4. Server sends a 200 response with body "hello".
+    var status_buf: [3]u8 = undefined;
+    const resp_headers = try H2Connection.buildResponseHeaders(200, &.{}, &status_buf, allocator);
+    defer allocator.free(resp_headers);
+    try server_h2.sendHeaders(&server_sock, completed_sid.?, resp_headers, false);
+    try server_h2.writeData(&server_sock, completed_sid.?, "hello", true);
+
+    // 5. Client reads the response (pump frames for server SETTINGS + response).
+    try client_h2.awaitStreamComplete(&client_sock, &client_sock, stream_id);
+
+    const resp_stream = client_h2.stream_manager.getStream(stream_id).?;
+    try std.testing.expect(resp_stream.completed);
+    try std.testing.expectEqualStrings("hello", resp_stream.data_buf.items);
+
+    // Decode response headers to verify status.
+    const resp_dec = try client_h2.decodeFrameHeaders(
+        resp_stream.headers_payload.?, resp_stream.headers_flags,
+    );
+    defer {
+        for (resp_dec.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(resp_dec.headers);
+    }
+    try std.testing.expectEqualStrings(":status", resp_dec.headers[0].name);
+    try std.testing.expectEqualStrings("200", resp_dec.headers[0].value);
+}
