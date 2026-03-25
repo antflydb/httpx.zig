@@ -89,24 +89,83 @@ pub const StaticTable = struct {
         return entries[index - 1];
     }
 
-    /// Finds the index of a header name (returns first match).
-    pub fn findName(name: []const u8) ?usize {
+    /// Maximum header name length in the static table (used for stack buffer sizing).
+    const max_name_len = blk: {
+        var m: usize = 0;
+        for (entries) |e| {
+            if (e.name.len > m) m = e.name.len;
+        }
+        break :blk m;
+    };
+
+    /// Maximum combined "name\x00value" length in the static table.
+    const max_nv_len = blk: {
+        var m: usize = 0;
+        for (entries) |e| {
+            const l = e.name.len + 1 + e.value.len;
+            if (l > m) m = l;
+        }
+        break :blk m;
+    };
+
+    /// Comptime map from lowercase header name → first 1-based index.
+    const name_map = blk: {
+        @setEvalBranchQuota(10_000);
+        const SSM = std.StaticStringMap;
+        // Collect unique names with their first occurrence index.
+        var kvs: [entries.len]struct { []const u8, usize } = undefined;
+        var count: usize = 0;
         for (entries, 0..) |entry, i| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
-                return i + 1;
+            var found = false;
+            for (kvs[0..count]) |kv| {
+                if (mem.eql(u8, kv[0], entry.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                kvs[count] = .{ entry.name, i + 1 };
+                count += 1;
             }
         }
-        return null;
+        break :blk SSM(usize).initComptime(kvs[0..count].*);
+    };
+
+    /// Comptime map from "name\x00value" → 1-based index.
+    const name_value_map = blk: {
+        @setEvalBranchQuota(10_000);
+        const SSM = std.StaticStringMap;
+        var kvs: [entries.len]struct { []const u8, usize } = undefined;
+        for (entries, 0..) |entry, i| {
+            kvs[i] = .{ entry.name ++ "\x00" ++ entry.value, i + 1 };
+        }
+        break :blk SSM(usize).initComptime(kvs);
+    };
+
+    /// Finds the index of a header name (returns first match, 1-based).
+    pub fn findName(name: []const u8) ?usize {
+        if (name.len > max_name_len) return null;
+        var lower_buf: [max_name_len]u8 = undefined;
+        const lower = lowerSlice(name, &lower_buf);
+        return name_map.get(lower);
     }
 
-    /// Finds the index of a header name+value pair.
+    /// Finds the index of a header name+value pair (1-based).
     pub fn findNameValue(name: []const u8, value: []const u8) ?usize {
-        for (entries, 0..) |entry, i| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name) and mem.eql(u8, entry.value, value)) {
-                return i + 1;
-            }
+        const combined_len = name.len + 1 + value.len;
+        if (combined_len > max_nv_len) return null;
+        var buf: [max_nv_len]u8 = undefined;
+        _ = lowerSlice(name, &buf);
+        buf[name.len] = 0;
+        @memcpy(buf[name.len + 1 ..][0..value.len], value);
+        return name_value_map.get(buf[0..combined_len]);
+    }
+
+    fn lowerSlice(input: []const u8, out: []u8) []const u8 {
+        for (input, 0..) |c, i| {
+            out[i] = std.ascii.toLower(c);
         }
-        return null;
+        return out[0..input.len];
     }
 };
 

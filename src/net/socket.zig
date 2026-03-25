@@ -420,12 +420,19 @@ pub const ContentLengthReader = struct {
 ///
 /// Reads chunk-size lines, delivers chunk data, consumes inter-chunk CRLFs,
 /// and returns `EndOfStream` after the terminal `0\r\n\r\n` chunk.
+///
+/// Uses an internal read-ahead buffer to reduce per-byte syscalls when
+/// parsing chunk-size lines and inter-chunk delimiters.
 pub const ChunkedBodyReader = struct {
     inner: *Io.Reader,
     chunk_remaining: usize = 0,
     state: ChunkState = .chunk_size,
     line_buf: [32]u8 = undefined,
     line_len: usize = 0,
+    // Read-ahead buffer for reducing syscalls during chunk-size parsing.
+    ahead_buf: [512]u8 = undefined,
+    ahead_start: usize = 0,
+    ahead_end: usize = 0,
     reader_iface: Io.Reader,
 
     const ChunkState = enum {
@@ -452,11 +459,42 @@ pub const ChunkedBodyReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
-    fn readOneByte(inner: *Io.Reader, tmp: *[1]u8) Io.Reader.Error!u8 {
-        var iov = [_][]u8{tmp[0..1]};
-        const n = try inner.vtable.readVec(inner, &iov);
+    /// Reads a single byte, consuming from the read-ahead buffer first,
+    /// then falling back to a bulk read from the inner reader.
+    fn readOneByte(p: *ChunkedBodyReader) Io.Reader.Error!u8 {
+        if (p.ahead_start < p.ahead_end) {
+            const b = p.ahead_buf[p.ahead_start];
+            p.ahead_start += 1;
+            return b;
+        }
+        // Refill the read-ahead buffer in bulk.
+        try p.fillAhead();
+        const b = p.ahead_buf[p.ahead_start];
+        p.ahead_start += 1;
+        return b;
+    }
+
+    /// Fills the read-ahead buffer from the inner reader.
+    /// Compacts remaining bytes to the front first.
+    fn fillAhead(p: *ChunkedBodyReader) Io.Reader.Error!void {
+        // Compact: move unconsumed bytes to front.
+        const remaining = p.ahead_end - p.ahead_start;
+        if (remaining > 0 and p.ahead_start > 0) {
+            std.mem.copyForwards(u8, p.ahead_buf[0..remaining], p.ahead_buf[p.ahead_start..p.ahead_end]);
+        }
+        p.ahead_start = 0;
+        p.ahead_end = remaining;
+
+        if (p.ahead_end >= p.ahead_buf.len) return; // buffer full
+        var iov = [_][]u8{p.ahead_buf[p.ahead_end..]};
+        const n = p.inner.vtable.readVec(p.inner, &iov) catch |err| return err;
         if (n == 0) return error.EndOfStream;
-        return tmp[0];
+        p.ahead_end += n;
+    }
+
+    /// Returns the number of buffered bytes available in the read-ahead buffer.
+    fn aheadAvailable(p: *ChunkedBodyReader) usize {
+        return p.ahead_end - p.ahead_start;
     }
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
@@ -468,17 +506,36 @@ pub const ChunkedBodyReader = struct {
                 .done => return error.EndOfStream,
 
                 .chunk_size => {
-                    // Read bytes one at a time until we see \n.
-                    var tmp: [1]u8 = undefined;
+                    // Read into read-ahead buffer and scan for newline.
                     while (true) {
-                        const byte = readOneByte(p.inner, &tmp) catch |err| return err;
-                        if (byte == '\n') break;
-                        if (byte == '\r') continue;
-                        if (p.line_len < p.line_buf.len) {
-                            p.line_buf[p.line_len] = byte;
-                            p.line_len += 1;
+                        // Scan buffered data for newline.
+                        const buffered = p.ahead_buf[p.ahead_start..p.ahead_end];
+                        if (std.mem.indexOfScalar(u8, buffered, '\n')) |nl_pos| {
+                            // Accumulate line content (excluding \r and \n) into line_buf.
+                            for (buffered[0..nl_pos]) |byte| {
+                                if (byte == '\r') continue;
+                                if (p.line_len < p.line_buf.len) {
+                                    p.line_buf[p.line_len] = byte;
+                                    p.line_len += 1;
+                                }
+                            }
+                            p.ahead_start += nl_pos + 1; // consume through newline
+                            break;
                         }
+                        // No newline yet — accumulate all buffered bytes into line_buf.
+                        for (buffered) |byte| {
+                            if (byte == '\r') continue;
+                            if (p.line_len < p.line_buf.len) {
+                                p.line_buf[p.line_len] = byte;
+                                p.line_len += 1;
+                            }
+                        }
+                        p.ahead_start = p.ahead_end; // consume all
+
+                        // Read more data in bulk.
+                        try p.fillAhead();
                     }
+
                     // Parse hex chunk size (ignore extensions after ';').
                     const line = p.line_buf[0..p.line_len];
                     p.line_len = 0;
@@ -496,6 +553,21 @@ pub const ChunkedBodyReader = struct {
                 },
 
                 .chunk_data => {
+                    // First drain any read-ahead bytes that belong to this chunk.
+                    const ahead_avail = p.aheadAvailable();
+                    if (ahead_avail > 0) {
+                        const orig_buf = bufs[0];
+                        const n = @min(@min(orig_buf.len, p.chunk_remaining), ahead_avail);
+                        @memcpy(orig_buf[0..n], p.ahead_buf[p.ahead_start..][0..n]);
+                        p.ahead_start += n;
+                        p.chunk_remaining -= n;
+                        if (p.chunk_remaining == 0) {
+                            p.state = .chunk_crlf;
+                        }
+                        return n;
+                    }
+
+                    // Read-ahead empty — read directly from inner reader.
                     const orig_buf = bufs[0];
                     const clamped_len = @min(orig_buf.len, p.chunk_remaining);
                     bufs[0] = orig_buf[0..clamped_len];
@@ -511,10 +583,9 @@ pub const ChunkedBodyReader = struct {
 
                 .chunk_crlf => {
                     // Consume the \r\n after chunk data.
-                    var tmp: [1]u8 = undefined;
-                    const b1 = readOneByte(p.inner, &tmp) catch |err| return err;
+                    const b1 = p.readOneByte() catch |err| return err;
                     if (b1 == '\r') {
-                        const b2 = readOneByte(p.inner, &tmp) catch |err| return err;
+                        const b2 = p.readOneByte() catch |err| return err;
                         if (b2 != '\n') return error.ReadFailed;
                     } else if (b1 != '\n') {
                         return error.ReadFailed;
@@ -525,10 +596,9 @@ pub const ChunkedBodyReader = struct {
 
                 .trailer => {
                     // Read trailer lines until we see an empty line (\r\n or \n).
-                    var tmp: [1]u8 = undefined;
                     var saw_content = false;
                     while (true) {
-                        const byte = readOneByte(p.inner, &tmp) catch |err| return err;
+                        const byte = p.readOneByte() catch |err| return err;
                         if (byte == '\n') {
                             if (!saw_content) {
                                 p.state = .done;

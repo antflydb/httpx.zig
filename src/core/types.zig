@@ -110,11 +110,15 @@ pub const Version = enum {
 
     /// Parses a version string into a Version enum.
     pub fn fromString(str: []const u8) ?Version {
-        if (std.mem.eql(u8, str, "HTTP/1.0")) return .HTTP_1_0;
-        if (std.mem.eql(u8, str, "HTTP/1.1")) return .HTTP_1_1;
-        if (std.mem.eql(u8, str, "HTTP/2") or std.mem.eql(u8, str, "HTTP/2.0")) return .HTTP_2;
-        if (std.mem.eql(u8, str, "HTTP/3") or std.mem.eql(u8, str, "HTTP/3.0")) return .HTTP_3;
-        return null;
+        const map = std.StaticStringMap(Version).initComptime(.{
+            .{ "HTTP/1.0", .HTTP_1_0 },
+            .{ "HTTP/1.1", .HTTP_1_1 },
+            .{ "HTTP/2", .HTTP_2 },
+            .{ "HTTP/2.0", .HTTP_2 },
+            .{ "HTTP/3", .HTTP_3 },
+            .{ "HTTP/3.0", .HTTP_3 },
+        });
+        return map.get(str);
     }
 
     /// Returns true if the version supports multiplexing.
@@ -403,7 +407,10 @@ test "Method properties" {
 test "Version.fromString" {
     try std.testing.expectEqual(Version.HTTP_1_1, Version.fromString("HTTP/1.1").?);
     try std.testing.expectEqual(Version.HTTP_2, Version.fromString("HTTP/2").?);
+    try std.testing.expectEqual(Version.HTTP_2, Version.fromString("HTTP/2.0").?);
     try std.testing.expectEqual(Version.HTTP_3, Version.fromString("HTTP/3").?);
+    try std.testing.expectEqual(Version.HTTP_3, Version.fromString("HTTP/3.0").?);
+    try std.testing.expect(Version.fromString("INVALID") == null);
 }
 
 test "Version properties" {
