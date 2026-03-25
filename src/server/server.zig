@@ -50,6 +50,8 @@ const common = @import("../util/common.zig");
 const h2_mod = @import("../protocol/h2_connection.zig");
 const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
+const stream_mod = @import("../protocol/stream.zig");
+const Stream = stream_mod.Stream;
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
@@ -100,6 +102,11 @@ pub const Context = struct {
     h2_sock: ?*Socket = null,
     h2_stream_id: u31 = 0,
     h2_stream_sent: bool = false,
+
+    /// Streaming body reader for HTTP/2 requests where the body arrives
+    /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
+    /// for H2 requests that completed before the handler was dispatched.
+    h2_body_reader: ?*H2StreamReader = null,
 
     /// Entry in the context data map with an optional destructor for cleanup.
     pub const DataEntry = struct {
@@ -319,6 +326,72 @@ pub const Context = struct {
         _ = self.response.status(code);
         _ = try self.response.header(HeaderName.LOCATION, url);
         return self.response.build();
+    }
+
+    /// Reader for server-side HTTP/2 streaming request bodies.
+    /// Reads incrementally from the stream's data_buf mailbox, waiting
+    /// on data_event when no data is available. Returns 0 (EOF) when
+    /// END_STREAM has been received and all data has been consumed.
+    pub const H2StreamReader = struct {
+        h2_stream: *Stream,
+        io: Io,
+        data_event: *Io.Event,
+
+        /// Reads available body data into `buf`. Returns 0 on EOF.
+        pub fn read(self: *H2StreamReader, buf: []u8) !usize {
+            while (true) {
+                const avail = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
+                if (avail > 0) {
+                    const n = @min(avail, buf.len);
+                    const start = self.h2_stream.read_offset;
+                    @memcpy(buf[0..n], self.h2_stream.data_buf.items[start..][0..n]);
+                    self.h2_stream.read_offset += n;
+                    if (self.h2_stream.read_offset >= Stream.compact_threshold) {
+                        self.h2_stream.compactDataBuf();
+                    }
+                    return n;
+                }
+                if (self.h2_stream.completed) return 0;
+                if (self.h2_stream.stream_error) |err| return err;
+
+                // Reset event, re-check (race guard), then wait.
+                self.data_event.reset();
+                const avail2 = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
+                if (avail2 > 0) continue;
+                if (self.h2_stream.completed) return 0;
+                if (self.h2_stream.stream_error) |err| return err;
+
+                self.data_event.waitUncancelable(self.io);
+            }
+        }
+
+        /// Reads all remaining body data into a single owned slice.
+        pub fn readAll(self: *H2StreamReader, allocator: Allocator) ![]u8 {
+            var result = std.ArrayListUnmanaged(u8).empty;
+            errdefer result.deinit(allocator);
+            var buf: [8192]u8 = undefined;
+            while (true) {
+                const n = try self.read(&buf);
+                if (n == 0) break;
+                try result.appendSlice(allocator, buf[0..n]);
+            }
+            return result.toOwnedSlice(allocator);
+        }
+    };
+
+    /// Returns the request body, buffering from the streaming H2 reader if needed.
+    /// For HTTP/1.1 this returns request.body directly. For HTTP/2 streaming,
+    /// reads the entire body on first call.
+    pub fn body(self: *Self) !?[]const u8 {
+        if (self.request.body != null) return self.request.body;
+        if (self.h2_body_reader) |reader| {
+            const data = try reader.readAll(self.allocator);
+            self.request.body = data;
+            self.request.body_owned = true;
+            self.h2_body_reader = null;
+            return self.request.body;
+        }
+        return null;
     }
 
     /// Writer for server-side HTTP/2 streaming responses.
@@ -801,7 +874,7 @@ pub const Server = struct {
         // 5. Handle the original HTTP/1.1 request as stream 1.
         _ = try h2.stream_manager.getOrCreateStream(1);
         original_req.version = .HTTP_2;
-        try self.routeAndRespondH2(&h2, sock, 1, original_req);
+        try self.routeAndRespondH2(&h2, sock, 1, original_req, null);
         h2.stream_manager.removeStream(1);
 
         // 6. Enter the normal H2 receive loop for subsequent requests.
@@ -839,14 +912,20 @@ pub const Server = struct {
 
             const sid = maybe_sid orelse continue;
             const stream = h2.stream_manager.getStream(sid) orelse continue;
-            if (!stream.completed) continue;
+
+            if (!stream.got_headers) continue;
+            if (stream.data_event != null) continue;
             if (stream.stream_error != null) {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
 
-            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid }) catch {
-                self.handleH2Stream(&h2, sock, sid) catch |err| {
+            const data_event = self.allocator.create(Io.Event) catch continue;
+            data_event.* = .unset;
+            stream.data_event = data_event;
+
+            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
+                self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
                 };
             };
@@ -902,17 +981,27 @@ pub const Server = struct {
 
             const sid = maybe_sid orelse continue;
             const stream = h2.stream_manager.getStream(sid) orelse continue;
-            if (!stream.completed) continue;
 
+            // Dispatch as soon as HEADERS arrive. Use data_event as the
+            // "already dispatched" flag — once installed, the receive loop
+            // won't dispatch again for this stream.
+            if (!stream.got_headers) continue;
+            if (stream.data_event != null) continue;
             if (stream.stream_error != null) {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
 
+            // Install data_event before spawning the fiber so the receive
+            // loop can signal it for subsequent DATA frames.
+            const data_event = self.allocator.create(Io.Event) catch continue;
+            data_event.* = .unset;
+            stream.data_event = data_event;
+
             // Spawn a fiber to handle this stream's request. Falls back to
             // synchronous handling if the Io backend doesn't support fibers.
-            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid }) catch {
-                self.handleH2Stream(&h2, sock, sid) catch |err| {
+            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
+                self.handleH2Stream(&h2, sock, sid, data_event) catch |err| {
                     std.debug.print("H2 stream handler error: {}\n", .{err});
                 };
             };
@@ -920,18 +1009,26 @@ pub const Server = struct {
     }
 
     /// Fiber entry point for per-stream HTTP/2 request handling.
-    fn handleH2StreamFiber(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31) Io.Cancelable!void {
-        self.handleH2Stream(h2, sock, stream_id) catch |err| {
+    fn handleH2StreamFiber(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) Io.Cancelable!void {
+        self.handleH2Stream(h2, sock, stream_id, data_event) catch |err| {
             std.debug.print("H2 stream handler error: {}\n", .{err});
         };
     }
 
-    /// Handles a single completed HTTP/2 stream: decodes headers from the
-    /// mailbox, routes the request, and sends the response. Acquires
-    /// `h2.write_mutex` for the response write phase.
-    fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31) !void {
-        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+    /// Handles a single HTTP/2 stream: decodes headers from the mailbox,
+    /// routes the request, and sends the response. Dispatched as soon as
+    /// HEADERS arrive — the body may still be streaming.
+    fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
+        // Ensure cleanup: detach event from stream, free event, remove stream.
+        defer {
+            if (h2.stream_manager.getStream(stream_id)) |s| {
+                s.data_event = null;
+            }
+            self.allocator.destroy(data_event);
+            h2.stream_manager.removeStream(stream_id);
+        }
 
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
         const hp = stream.headers_payload orelse return;
 
         const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
@@ -977,21 +1074,33 @@ pub const Server = struct {
             try req.headers.appendBorrowed("host", auth);
         }
 
-        if (stream.data_buf.items.len > 0) {
-            req.body = stream.data_buf.items;
-            req.body_owned = false;
+        // If the body already arrived (stream completed before handler ran or
+        // headers-only request), set it directly. Otherwise provide a streaming reader.
+        var body_reader: ?Context.H2StreamReader = null;
+        if (stream.completed) {
+            if (stream.data_buf.items.len > 0) {
+                req.body = stream.data_buf.items;
+                req.body_owned = false;
+            }
+        } else {
+            body_reader = .{
+                .h2_stream = stream,
+                .io = self.io,
+                .data_event = data_event,
+            };
         }
 
-        try self.routeAndRespondH2(h2, sock, stream_id, &req);
+        try self.routeAndRespondH2(h2, sock, stream_id, &req, if (body_reader != null) &body_reader.? else null);
     }
 
     /// Routes a request through middleware and sends the H2 response.
     /// Shared between normal H2 streams (from HPACK) and h2c upgrade (from HTTP/1.1).
-    fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request) !void {
+    fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request, body_reader: ?*Context.H2StreamReader) !void {
         var ctx = Context.init(self.allocator, self.io, req);
         ctx.max_file_size = self.config.max_file_size;
         ctx.h2 = h2;
         ctx.h2_sock = sock;
+        ctx.h2_body_reader = body_reader;
         ctx.h2_stream_id = stream_id;
         defer ctx.deinit();
 
@@ -1512,4 +1621,101 @@ test "H2StreamWriter write and close" {
     const last_frame_start = buf.items.len - 9; // empty payload, just header
     const flags = buf.items[last_frame_start + 4];
     try std.testing.expect(flags & H2Connection.FLAG_END_STREAM != 0);
+}
+
+test "H2StreamReader reads pre-buffered data and returns EOF" {
+    const allocator = std.testing.allocator;
+
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+
+    // Pre-populate data as if DATA frames already arrived.
+    try s.data_buf.appendSlice(allocator, "hello world");
+    s.completed = true;
+    s.got_headers = true;
+
+    var event = Io.Event.unset;
+    var reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+
+    var buf: [32]u8 = undefined;
+    const n = try reader.read(&buf);
+    try std.testing.expectEqualStrings("hello world", buf[0..n]);
+
+    // Second read should return EOF.
+    const n2 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "H2StreamReader.readAll buffers entire body" {
+    const allocator = std.testing.allocator;
+
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+
+    try s.data_buf.appendSlice(allocator, "part1");
+    try s.data_buf.appendSlice(allocator, "part2");
+    s.completed = true;
+    s.got_headers = true;
+
+    var event = Io.Event.unset;
+    var reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+
+    const body_data = try reader.readAll(allocator);
+    defer allocator.free(body_data);
+    try std.testing.expectEqualStrings("part1part2", body_data);
+}
+
+test "Context.body() returns request.body for HTTP/1.1" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .POST, "/");
+    defer req.deinit();
+
+    const body_content = "request body";
+    req.body = body_content;
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const result = try ctx.body();
+    try std.testing.expectEqualStrings(body_content, result.?);
+}
+
+test "Context.body() buffers from H2StreamReader" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .POST, "/");
+    defer req.deinit();
+
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+    try s.data_buf.appendSlice(allocator, "streamed body");
+    s.completed = true;
+
+    var event = Io.Event.unset;
+    var body_reader = Context.H2StreamReader{
+        .h2_stream = &s,
+        .io = std.testing.io,
+        .data_event = &event,
+    };
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+    ctx.h2_body_reader = &body_reader;
+
+    const result = try ctx.body();
+    try std.testing.expectEqualStrings("streamed body", result.?);
+
+    // Second call should return the buffered body directly.
+    const result2 = try ctx.body();
+    try std.testing.expectEqualStrings("streamed body", result2.?);
+
+    // h2_body_reader should be consumed (set to null).
+    try std.testing.expect(ctx.h2_body_reader == null);
 }
