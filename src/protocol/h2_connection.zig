@@ -424,7 +424,7 @@ pub const H2Connection = struct {
         // Signal streams above last_stream_id — they were never processed.
         var it = self.stream_manager.streams.iterator();
         while (it.next()) |entry| {
-            const s = entry.value_ptr;
+            const s = entry.value_ptr.*;
             if (s.id > self.last_peer_stream_id and !s.completed) {
                 s.stream_error = error.GoawayRefused;
                 s.completed = true;
@@ -908,7 +908,7 @@ pub const H2Connection = struct {
     pub fn signalAllStreams(self: *Self, err: anyerror) void {
         var it = self.stream_manager.streams.iterator();
         while (it.next()) |entry| {
-            const s = entry.value_ptr;
+            const s = entry.value_ptr.*;
             if (!s.completed) {
                 s.stream_error = err;
                 s.completed = true;

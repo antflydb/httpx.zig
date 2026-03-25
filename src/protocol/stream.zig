@@ -212,9 +212,15 @@ pub fn freeDecodedHeaders(allocator: Allocator, headers: ?[]hpack.DecodedHeader)
 }
 
 /// Manages all streams for an HTTP/2 connection.
+///
+/// Streams are heap-allocated for pointer stability: `*Stream` pointers
+/// remain valid across map mutations (put/remove) that may rehash the
+/// backing table. This is critical for multiplexed connections where the
+/// receive loop fiber may insert new peer-initiated streams while request
+/// fibers hold `*Stream` pointers.
 pub const StreamManager = struct {
     allocator: Allocator,
-    streams: std.AutoHashMapUnmanaged(u31, Stream) = .{},
+    streams: std.AutoHashMapUnmanaged(u31, *Stream) = .{},
 
     /// Next stream ID to use for client-initiated streams (odd numbers).
     next_client_stream_id: u31 = 1,
@@ -252,7 +258,8 @@ pub const StreamManager = struct {
     pub fn deinit(self: *Self) void {
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
         }
         self.streams.deinit(self.allocator);
         self.hpack_ctx.deinit();
@@ -272,20 +279,23 @@ pub const StreamManager = struct {
             break :blk id;
         };
 
-        try self.streams.put(self.allocator, id, Stream.init(id));
-        return self.streams.getPtr(id).?;
+        const stream = try self.allocator.create(Stream);
+        stream.* = Stream.init(id);
+        errdefer self.allocator.destroy(stream);
+        try self.streams.put(self.allocator, id, stream);
+        return stream;
     }
 
     /// Gets an existing stream by ID.
     pub fn getStream(self: *Self, id: u31) ?*Stream {
-        return self.streams.getPtr(id);
+        return self.streams.get(id);
     }
 
     /// Gets or creates a stream (for handling incoming frames).
     /// Validates that peer-initiated stream IDs are monotonically increasing
     /// per RFC 7540 §5.1.1.
     pub fn getOrCreateStream(self: *Self, id: u31) !*Stream {
-        if (self.streams.getPtr(id)) |stream| {
+        if (self.streams.get(id)) |stream| {
             return stream;
         }
 
@@ -311,16 +321,19 @@ pub const StreamManager = struct {
             }
         }
 
-        try self.streams.put(self.allocator, id, Stream.init(id));
-        return self.streams.getPtr(id).?;
+        const stream = try self.allocator.create(Stream);
+        stream.* = Stream.init(id);
+        errdefer self.allocator.destroy(stream);
+        try self.streams.put(self.allocator, id, stream);
+        return stream;
     }
 
     /// Removes a closed stream and updates the closed-stream watermark.
     pub fn removeStream(self: *Self, id: u31) void {
         if (self.streams.fetchRemove(id)) |kv| {
             if (id > self.max_closed_stream_id) self.max_closed_stream_id = id;
-            var stream = kv.value;
-            stream.deinit(self.allocator);
+            kv.value.deinit(self.allocator);
+            self.allocator.destroy(kv.value);
         }
     }
 
@@ -329,7 +342,7 @@ pub const StreamManager = struct {
         var count: usize = 0;
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            const state = entry.value_ptr.state;
+            const state = entry.value_ptr.*.state;
             if (state != .idle and state != .closed) {
                 count += 1;
             }
@@ -355,7 +368,7 @@ pub const StreamManager = struct {
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            const s = entry.value_ptr;
+            const s = entry.value_ptr.*;
             // Only adjust streams where we can still send data.
             if (!s.canSend()) continue;
             s.updateSendWindow(delta) catch {
