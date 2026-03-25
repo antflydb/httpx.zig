@@ -60,12 +60,19 @@ pub const H2Connection = struct {
     /// Serializes frame writes so multiple fibers can safely share one connection.
     write_mutex: Io.Mutex = Io.Mutex.init,
 
+    /// Accumulated connection-level DATA bytes not yet acknowledged via WINDOW_UPDATE.
+    pending_conn_window_update: u32 = 0,
+
     // Reassembly buffer for CONTINUATION frames.
     continuation_stream_id: ?u31 = null,
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
     continuation_flags: u8 = 0,
 
     const Self = @This();
+
+    /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
+    /// Half the default initial window size (65535 / 2 ≈ 32KB).
+    pub const window_update_threshold: u32 = 32768;
 
     // -- Frame flag constants (RFC 7540 §6) --
     pub const FLAG_ACK: u8 = 0x01;
@@ -368,6 +375,34 @@ pub const H2Connection = struct {
         try self.writeFrame(writer, .window_update, 0, stream_id, &payload);
     }
 
+    /// Accumulates received DATA bytes and sends WINDOW_UPDATE when the
+    /// threshold is exceeded, reducing per-frame overhead on busy connections.
+    fn accumulateWindowUpdate(self: *Self, writer: anytype, stream_id: u31, len: u32) !void {
+        // Connection-level accumulator.
+        self.pending_conn_window_update += len;
+        if (self.pending_conn_window_update >= window_update_threshold) {
+            try self.sendWindowUpdate(writer, 0, @intCast(self.pending_conn_window_update));
+            self.pending_conn_window_update = 0;
+        }
+        // Stream-level accumulator.
+        if (self.stream_manager.getStream(stream_id)) |s| {
+            s.pending_window_update += len;
+            if (s.pending_window_update >= window_update_threshold) {
+                try self.sendWindowUpdate(writer, stream_id, @intCast(s.pending_window_update));
+                s.pending_window_update = 0;
+            }
+        }
+    }
+
+    /// Flushes any remaining connection-level window credit. Called on
+    /// stream completion to avoid leaving credit below the threshold.
+    fn flushConnWindowUpdate(self: *Self, writer: anytype) !void {
+        if (self.pending_conn_window_update > 0) {
+            try self.sendWindowUpdate(writer, 0, @intCast(self.pending_conn_window_update));
+            self.pending_conn_window_update = 0;
+        }
+    }
+
     // ---------------------------------------------------------------
     // Dispatching
     // ---------------------------------------------------------------
@@ -517,11 +552,13 @@ pub const H2Connection = struct {
         const maybe = try self.dispatchFrame(&frame, writer);
         if (maybe) |sf| {
             if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                const inc: u31 = @intCast(sf.payload.len);
-                try self.sendWindowUpdate(writer, 0, inc);
-                try self.sendWindowUpdate(writer, sf.header.stream_id, inc);
+                try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
             try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+            // Flush connection-level window credit on stream completion.
+            if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
+                try self.flushConnWindowUpdate(writer);
+            }
             return sf.header.stream_id;
         }
         return null;
@@ -545,12 +582,14 @@ pub const H2Connection = struct {
             const maybe = try self.dispatchFrame(&frame, writer);
             if (maybe) |sf| {
                 if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                    const inc: u31 = @intCast(sf.payload.len);
-                    try self.sendWindowUpdate(writer, 0, inc);
-                    try self.sendWindowUpdate(writer, sf.header.stream_id, inc);
+                    try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                 }
                 // deliverToMailbox copies payload, safe to call under lock.
                 try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+                // Flush connection-level window credit on stream completion.
+                if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
+                    try self.flushConnWindowUpdate(writer);
+                }
                 return sf.header.stream_id;
             }
         }
@@ -1561,4 +1600,123 @@ test "h2 round-trip over TCP loopback" {
     }
     try std.testing.expectEqualStrings(":status", resp_dec.headers[0].name);
     try std.testing.expectEqualStrings("200", resp_dec.headers[0].value);
+}
+
+test "batched WINDOW_UPDATE: small DATA frames don't trigger immediate updates" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Register stream 1 (client-initiated).
+    _ = try server.stream_manager.getOrCreateStream(1);
+
+    // Build 3 small DATA frames (100 bytes each, well below 32KB threshold).
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+    _ = try client.stream_manager.createStream();
+    try client.writeData(c2s_w, 1, "A" ** 100, false);
+    try client.writeData(c2s_w, 1, "B" ** 100, false);
+    try client.writeData(c2s_w, 1, "C" ** 100, false);
+
+    // Server processes the frames, writing responses to reply buffer.
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const reply_w = testWriter(&reply, allocator);
+
+    var reader = TestReader{ .data = c2s.items };
+    _ = try server.processOneFrame(&reader, reply_w);
+    _ = try server.processOneFrame(&reader, reply_w);
+    _ = try server.processOneFrame(&reader, reply_w);
+
+    // 300 bytes total < 32KB threshold. No WINDOW_UPDATE should be emitted.
+    try std.testing.expectEqual(@as(usize, 0), reply.items.len);
+    try std.testing.expectEqual(@as(u32, 300), server.pending_conn_window_update);
+
+    // Verify data was still delivered to the stream mailbox.
+    const s = server.stream_manager.getStream(1).?;
+    try std.testing.expectEqual(@as(usize, 300), s.data_buf.items.len);
+    try std.testing.expectEqual(@as(u32, 300), s.pending_window_update);
+}
+
+test "batched WINDOW_UPDATE: threshold triggers flush" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    _ = try server.stream_manager.getOrCreateStream(1);
+
+    // Build multiple DATA frames totaling > 32KB threshold.
+    // Each frame is limited to MAX_FRAME_SIZE (16384), so we send 3 frames.
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+    _ = try client.stream_manager.createStream();
+    try client.writeData(c2s_w, 1, "X" ** 16000, false);
+    try client.writeData(c2s_w, 1, "Y" ** 16000, false);
+    try client.writeData(c2s_w, 1, "Z" ** 1000, false);
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const reply_w = testWriter(&reply, allocator);
+
+    var reader = TestReader{ .data = c2s.items };
+
+    // First frame: 16000 bytes, below 32KB threshold. No WINDOW_UPDATE.
+    _ = try server.processOneFrame(&reader, reply_w);
+    try std.testing.expectEqual(@as(usize, 0), reply.items.len);
+    try std.testing.expectEqual(@as(u32, 16000), server.pending_conn_window_update);
+
+    // Second frame: 32000 cumulative, still below 32768 threshold. No flush.
+    _ = try server.processOneFrame(&reader, reply_w);
+    try std.testing.expectEqual(@as(usize, 0), reply.items.len);
+    try std.testing.expectEqual(@as(u32, 32000), server.pending_conn_window_update);
+
+    // Third frame: 33000 cumulative, exceeds 32768 threshold. Should flush.
+    _ = try server.processOneFrame(&reader, reply_w);
+    // 2 WINDOW_UPDATE frames (connection + stream), 13 bytes each.
+    try std.testing.expectEqual(@as(usize, 26), reply.items.len);
+    try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
+
+    const s = server.stream_manager.getStream(1).?;
+    try std.testing.expectEqual(@as(u32, 0), s.pending_window_update);
+}
+
+test "batched WINDOW_UPDATE: END_STREAM flushes connection credit" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    _ = try server.stream_manager.getOrCreateStream(1);
+
+    // Send a small DATA frame with END_STREAM.
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+    _ = try client.stream_manager.createStream();
+    try client.writeData(c2s_w, 1, "small", true); // END_STREAM
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const reply_w = testWriter(&reply, allocator);
+
+    var reader = TestReader{ .data = c2s.items };
+    _ = try server.processOneFrame(&reader, reply_w);
+
+    // END_STREAM should flush the connection-level accumulator.
+    // 5 bytes < threshold, but END_STREAM forces flush.
+    // One WINDOW_UPDATE for connection (13 bytes). Stream-level not flushed
+    // because it's pointless for a completed stream.
+    try std.testing.expectEqual(@as(usize, 13), reply.items.len);
+    try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
 }

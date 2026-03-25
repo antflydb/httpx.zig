@@ -104,6 +104,9 @@ pub const Stream = struct {
     /// Read cursor into data_buf for incremental consumption.
     read_offset: usize = 0,
 
+    /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
+    pending_window_update: u32 = 0,
+
     /// Compaction threshold: shift consumed bytes to the front when
     /// read_offset exceeds this to bound memory usage on long-lived streams.
     pub const compact_threshold: usize = 64 * 1024;
