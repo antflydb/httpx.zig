@@ -266,6 +266,9 @@ pub const StreamManager = struct {
     }
 
     /// Creates a new stream with the next available ID.
+    /// The stream is immediately transitioned to `.open` state since locally
+    /// initiated streams are open by definition at creation (RFC 7540 §5.1:
+    /// sending HEADERS transitions idle → open).
     pub fn createStream(self: *Self) !*Stream {
         const id = if (self.is_client) blk: {
             const id = self.next_client_stream_id;
@@ -281,6 +284,7 @@ pub const StreamManager = struct {
 
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(id);
+        stream.state = .open;
         errdefer self.allocator.destroy(stream);
         try self.streams.put(self.allocator, id, stream);
         return stream;

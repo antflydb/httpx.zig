@@ -73,6 +73,10 @@ pub const H2Connection = struct {
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
     max_stream_data_size: usize = 0,
 
+    /// Server's own limit on how many concurrent streams the peer can open.
+    /// Initialized from local_settings and NOT overwritten by peer SETTINGS.
+    local_max_concurrent_streams: u32 = 100,
+
     // Reassembly buffer for CONTINUATION frames.
     continuation_stream_id: ?u31 = null,
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -177,7 +181,9 @@ pub const H2Connection = struct {
         if (old_table_size != self.peer_settings.header_table_size) {
             self.stream_manager.hpack_ctx.setTableSize(self.peer_settings.header_table_size);
         }
-        self.stream_manager.max_concurrent_streams = self.peer_settings.max_concurrent_streams;
+        // Note: peer_settings.max_concurrent_streams limits how many streams
+        // *we* can initiate to the peer. It does NOT change our own local limit
+        // on how many streams the peer can open to us (local_max_concurrent_streams).
         // Adapt window update threshold to the local initial window size
         // so small windows don't deadlock (threshold must be <= window size).
         self.window_update_threshold = @max(1, self.local_settings.initial_window_size / 2);
@@ -570,7 +576,14 @@ pub const H2Connection = struct {
                 }
                 return frame.*;
             },
-            .priority => frame.*,
+            .priority => {
+                // RFC 7540 §6.3: PRIORITY on stream 0 is a connection error.
+                if (frame.header.stream_id == 0) {
+                    try self.sendGoaway(writer, .protocol_error);
+                    return error.ProtocolError;
+                }
+                return frame.*;
+            },
             else => null, // Unknown frame types MUST be ignored (RFC 7540 §4.1).
         };
     }

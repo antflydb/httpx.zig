@@ -675,6 +675,7 @@ pub const Server = struct {
         while (self.running) {
 
             var buffer: [8192]u8 = undefined;
+            var leftover: usize = 0;
             parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
@@ -695,7 +696,7 @@ pub const Server = struct {
                     break :blk first_n;
                 } else try sock.recv(&buffer);
                 if (n == 0) return;
-                _ = parser.feed(buffer[0..n]) catch |err| switch (err) {
+                const consumed = parser.feed(buffer[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
                         try self.sendError(&sock, 413);
                         return;
@@ -710,6 +711,11 @@ pub const Server = struct {
                     },
                     else => return err,
                 };
+                // Track unconsumed bytes for h2c upgrade or pipelining.
+                if (consumed < n) {
+                    std.mem.copyForwards(u8, buffer[0 .. n - consumed], buffer[consumed..n]);
+                }
+                leftover = n - consumed;
                 if (parser.isError()) {
                     try self.sendError(&sock, 400);
                     return;
@@ -753,8 +759,10 @@ pub const Server = struct {
             }
 
             // RFC 7540 §3.2: h2c upgrade — switch to HTTP/2 over cleartext.
+            // Pass any bytes beyond the parsed request (H2 preface pipelined
+            // in the same TCP segment) as initial_data for the H2 reader.
             if (first_request and http.isH2cUpgradeRequest(&req.headers)) {
-                return self.handleH2cUpgrade(&sock, &req);
+                return self.handleH2cUpgrade(&sock, &req, buffer[0..leftover]);
             }
 
             var ctx = Context.init(self.allocator, self.io, &req);
@@ -866,7 +874,8 @@ pub const Server = struct {
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
     /// Sends 101 Switching Protocols, handles the original request as stream 1,
     /// then enters the normal H2 receive loop for subsequent requests.
-    fn handleH2cUpgrade(self: *Self, sock: *Socket, original_req: *Request) !void {
+    /// `initial_h2_data` contains any bytes pipelined beyond the upgrade request.
+    fn handleH2cUpgrade(self: *Self, sock: *Socket, original_req: *Request, initial_h2_data: []const u8) !void {
         // 1. Send 101 Switching Protocols.
         try sock.sendAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
 
@@ -892,19 +901,15 @@ pub const Server = struct {
         h2.stream_manager.removeStream(1);
 
         // 6. Enter the normal H2 receive loop for subsequent requests.
+        // Use H2SocketReader to replay any bytes pipelined after the upgrade
+        // request (client may have sent the H2 preface in the same TCP segment).
+        var h2c_reader = H2SocketReader{ .socket = sock, .initial = initial_h2_data, .initial_pos = 0 };
+
         // The client will next send the h2 preface (24 bytes) + SETTINGS.
-        // Read and validate the preface.
-        var preface_buf: [24]u8 = undefined;
-        var preface_pos: usize = 0;
-        while (preface_pos < 24) {
-            const n = try sock.recv(preface_buf[preface_pos..]);
-            if (n == 0) return;
-            preface_pos += n;
-        }
-        if (!mem.eql(u8, &preface_buf, http.HTTP2_PREFACE)) return error.ProtocolError;
+        try h2.readClientPreface(&h2c_reader);
 
         // Read client's SETTINGS frame.
-        var settings_frame = try h2.readFrame(sock);
+        var settings_frame = try h2.readFrame(&h2c_reader);
         defer settings_frame.deinit(self.allocator);
         if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
         try h2.handleSettings(&settings_frame, sock);
@@ -919,7 +924,7 @@ pub const Server = struct {
         defer h2.signalAllStreams(error.ConnectionClosed);
 
         while (!h2.goaway_received and self.running) {
-            const maybe_sid = h2.processOneFrameLocked(sock, sock) catch |err| switch (err) {
+            const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
                 error.ConnectionClosed => break,
                 else => return err,
             };
@@ -934,7 +939,7 @@ pub const Server = struct {
                 continue;
             }
 
-            if (h2.stream_manager.activeStreamCount() >= h2.stream_manager.max_concurrent_streams) {
+            if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
                 h2.write_mutex.unlock(h2.io);
@@ -1016,13 +1021,16 @@ pub const Server = struct {
             // won't dispatch again for this stream.
             if (!stream.got_headers) continue;
             if (stream.data_event != null) continue;
+            // Stream errors on not-yet-dispatched streams: signal and let
+            // the handler fiber (or immediate cleanup) handle removal.
             if (stream.stream_error != null) {
+                // No handler fiber owns this stream yet, so remove directly.
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
 
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
-            if (h2.stream_manager.activeStreamCount() >= h2.stream_manager.max_concurrent_streams) {
+            if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
                 h2.write_mutex.unlock(h2.io);
@@ -1065,9 +1073,15 @@ pub const Server = struct {
     /// soon as HEADERS arrive — the body may still be streaming.
     fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
         // Ensure cleanup: detach event from stream, free event, remove stream.
+        // Hold write_mutex when NULLing data_event to avoid a race with the
+        // receive loop's deliverToMailbox which reads data_event concurrently.
         defer {
-            if (h2.stream_manager.getStream(stream_id)) |s| {
-                s.data_event = null;
+            {
+                h2.write_mutex.lockUncancelable(h2.io);
+                defer h2.write_mutex.unlock(h2.io);
+                if (h2.stream_manager.getStream(stream_id)) |s| {
+                    s.data_event = null;
+                }
             }
             self.allocator.destroy(data_event);
             h2.stream_manager.removeStream(stream_id);
@@ -1175,7 +1189,24 @@ pub const Server = struct {
                 return;
             };
         } else {
-            response = Response.init(self.allocator, 404);
+            // Mirror the HTTP/1.1 path: 405 with Allow header for known paths,
+            // 204 for OPTIONS, 404 otherwise.
+            var allow_methods: [16]types.Method = undefined;
+            const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
+            if (req.method == .OPTIONS and allow_count > 0) {
+                response = Response.init(self.allocator, 204);
+                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+            } else if (allow_count > 0) {
+                response = Response.init(self.allocator, 405);
+                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+            } else if (self.global_handler) |global_handler| {
+                response = self.executeMiddleware(&ctx, global_handler) catch {
+                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                    return;
+                };
+            } else {
+                response = Response.init(self.allocator, 404);
+            }
         }
 
         // If the handler used streamH2(), it already sent HEADERS+DATA.
@@ -1216,10 +1247,17 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
 
-        try h2.sendHeaders(sock, stream_id, h2_headers, !has_body);
+        h2.sendHeaders(sock, stream_id, h2_headers, !has_body) catch |err| {
+            // Mark stream closed so activeStreamCount doesn't keep counting it.
+            if (h2.stream_manager.getStream(stream_id)) |s| s.reset();
+            return err;
+        };
 
         if (has_body) {
-            try h2.writeDataBlocking(sock, stream_id, response.body.?, true);
+            h2.writeDataBlocking(sock, stream_id, response.body.?, true) catch |err| {
+                if (h2.stream_manager.getStream(stream_id)) |s| s.reset();
+                return err;
+            };
         }
     }
 
