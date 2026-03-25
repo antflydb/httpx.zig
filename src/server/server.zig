@@ -828,6 +828,8 @@ pub const Server = struct {
             stream_fibers.await(self.io) catch {};
             if (!h2.goaway_sent) h2.sendGoaway(sock, .no_error) catch {};
         }
+        // Wake all blocked handler fibers before awaiting them (reverse defer order).
+        defer h2.signalAllStreams(error.ConnectionClosed);
 
         while (!h2.goaway_received and self.running) {
             const maybe_sid = h2.processOneFrameLocked(sock, sock) catch |err| switch (err) {
@@ -885,6 +887,8 @@ pub const Server = struct {
                 h2.sendGoaway(sock, .no_error) catch {};
             }
         }
+        // Wake all blocked handler fibers before awaiting them (reverse defer order).
+        defer h2.signalAllStreams(error.ConnectionClosed);
 
         // Receive loop: reads frames, handles connection-level traffic, and
         // delivers stream-level frames to per-stream mailboxes. Uses the
