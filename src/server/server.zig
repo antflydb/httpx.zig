@@ -607,6 +607,11 @@ pub const Server = struct {
                 }
             }
 
+            // RFC 7540 §3.2: h2c upgrade — switch to HTTP/2 over cleartext.
+            if (first_request and http.isH2cUpgradeRequest(&req.headers)) {
+                return self.handleH2cUpgrade(&sock, &req);
+            }
+
             var ctx = Context.init(self.allocator, &req);
             ctx.max_file_size = self.config.max_file_size;
             defer ctx.deinit();
@@ -710,6 +715,80 @@ pub const Server = struct {
                     try sock.setRecvTimeout(self.config.keep_alive_timeout_ms);
                 }
             }
+        }
+    }
+
+    /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
+    /// Sends 101 Switching Protocols, handles the original request as stream 1,
+    /// then enters the normal H2 receive loop for subsequent requests.
+    fn handleH2cUpgrade(self: *Self, sock: *Socket, original_req: *Request) !void {
+        // 1. Send 101 Switching Protocols.
+        try sock.sendAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+
+        // 2. Decode the HTTP2-Settings header (base64url → SETTINGS payload).
+        const settings_b64 = original_req.headers.get(HeaderName.HTTP2_SETTINGS) orelse
+            return error.MissingH2cSettings;
+        const settings_payload = try http.decodeH2cSettings(settings_b64, self.allocator);
+        defer self.allocator.free(settings_payload);
+
+        // 3. Create H2 connection and apply peer settings.
+        var h2 = H2Connection.initServer(self.allocator, self.io);
+        defer h2.deinit();
+        try http.applySettingsPayload(&h2.peer_settings, settings_payload);
+
+        // 4. Send server SETTINGS.
+        try h2.sendSettings(sock);
+
+        // 5. Handle the original HTTP/1.1 request as stream 1.
+        _ = try h2.stream_manager.getOrCreateStream(1);
+        original_req.version = .HTTP_2;
+        try self.routeAndRespondH2(&h2, sock, 1, original_req);
+        h2.stream_manager.removeStream(1);
+
+        // 6. Enter the normal H2 receive loop for subsequent requests.
+        // The client will next send the h2 preface (24 bytes) + SETTINGS.
+        // Read and validate the preface.
+        var preface_buf: [24]u8 = undefined;
+        var preface_pos: usize = 0;
+        while (preface_pos < 24) {
+            const n = try sock.recv(preface_buf[preface_pos..]);
+            if (n == 0) return;
+            preface_pos += n;
+        }
+        if (!mem.eql(u8, &preface_buf, http.HTTP2_PREFACE)) return error.ProtocolError;
+
+        // Read client's SETTINGS frame.
+        var settings_frame = try h2.readFrame(sock);
+        defer settings_frame.deinit(self.allocator);
+        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        try h2.handleSettings(&settings_frame, sock);
+
+        // Run the standard H2 frame loop.
+        var stream_fibers = Io.Group.init;
+        defer {
+            stream_fibers.await(self.io) catch {};
+            if (!h2.goaway_sent) h2.sendGoaway(sock, .no_error) catch {};
+        }
+
+        while (!h2.goaway_received and self.running) {
+            const maybe_sid = h2.processOneFrameLocked(sock, sock) catch |err| switch (err) {
+                error.ConnectionClosed => break,
+                else => return err,
+            };
+
+            const sid = maybe_sid orelse continue;
+            const stream = h2.stream_manager.getStream(sid) orelse continue;
+            if (!stream.completed) continue;
+            if (stream.stream_error != null) {
+                h2.stream_manager.removeStream(sid);
+                continue;
+            }
+
+            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid }) catch {
+                self.handleH2Stream(&h2, sock, sid) catch |err| {
+                    std.debug.print("H2 stream handler error: {}\n", .{err});
+                };
+            };
         }
     }
 
@@ -843,8 +922,13 @@ pub const Server = struct {
             req.body_owned = false;
         }
 
-        // Route and handle the request.
-        var ctx = Context.init(self.allocator, &req);
+        try self.routeAndRespondH2(h2, sock, stream_id, &req);
+    }
+
+    /// Routes a request through middleware and sends the H2 response.
+    /// Shared between normal H2 streams (from HPACK) and h2c upgrade (from HTTP/1.1).
+    fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request) !void {
+        var ctx = Context.init(self.allocator, req);
         ctx.max_file_size = self.config.max_file_size;
         defer ctx.deinit();
 
@@ -857,9 +941,9 @@ pub const Server = struct {
 
         var suppress_body = false;
         var params_buf: [16]RouteParam = undefined;
-        var route_result = self.router.find(req_method, req.uri.path, &params_buf);
+        var route_result = self.router.find(req.method, req.uri.path, &params_buf);
 
-        if (route_result == null and req_method == .HEAD) {
+        if (route_result == null and req.method == .HEAD) {
             route_result = self.router.find(.GET, req.uri.path, &params_buf);
             suppress_body = route_result != null;
         }

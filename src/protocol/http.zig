@@ -307,6 +307,17 @@ pub fn isH2cUpgradeRequest(headers: *const Headers) bool {
     return headers.get(HeaderName.HTTP2_SETTINGS) != null;
 }
 
+/// Decodes the base64url-encoded HTTP2-Settings header value (RFC 7540 §3.2.1)
+/// into a raw SETTINGS frame payload suitable for `applySettingsPayload`.
+pub fn decodeH2cSettings(encoded: []const u8, allocator: Allocator) ![]u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const out_len = decoder.calcSizeForSlice(encoded) catch return error.InvalidH2cSettings;
+    const out = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(out);
+    decoder.decode(out, encoded) catch return error.InvalidH2cSettings;
+    return out;
+}
+
 /// Determines the highest supported HTTP version based on ALPN negotiation string.
 pub fn negotiateVersion(alpn: ?[]const u8) types.Version {
     if (alpn) |protocol| {
@@ -422,4 +433,21 @@ test "isH2cUpgradeRequest detects valid h2c headers" {
     try headers.set(HeaderName.HTTP2_SETTINGS, "AAMAAABkAAQCAAAAAAIAAAAA");
 
     try std.testing.expect(isH2cUpgradeRequest(&headers));
+}
+
+test "decodeH2cSettings decodes base64url SETTINGS payload" {
+    const allocator = std.testing.allocator;
+    // This is a valid HTTP2-Settings value encoding three settings:
+    // MAX_CONCURRENT_STREAMS=100, INITIAL_WINDOW_SIZE=33554432, ENABLE_PUSH=0
+    const encoded = "AAMAAABkAAQCAAAAAAIAAAAA";
+    const payload = try decodeH2cSettings(encoded, allocator);
+    defer allocator.free(payload);
+
+    // Each setting is 6 bytes (2-byte ID + 4-byte value), so 3 settings = 18 bytes.
+    try std.testing.expectEqual(@as(usize, 18), payload.len);
+
+    // Verify we can apply it as a valid SETTINGS payload.
+    var settings = Http2ConnectionSettings{};
+    try applySettingsPayload(&settings, payload);
+    try std.testing.expectEqual(@as(u32, 100), settings.max_concurrent_streams);
 }
