@@ -434,6 +434,8 @@ pub const Client = struct {
         const addr = try Address.resolve(self.io, host, port);
         entry.socket = try Socket.connect(addr, self.io);
         errdefer entry.socket.close();
+        entry.socket.setNoDelay(true) catch {};
+        entry.socket.setKeepAlive(true) catch {};
 
         entry.is_tls = is_tls;
         entry.broken = false;
