@@ -83,6 +83,9 @@ fn comptimeMethodNames(comptime methods: []const types.Method) []const []const u
 /// are precomputed at compile time — zero per-request allocations.
 pub fn cors(comptime config: CorsConfig) Middleware {
     comptime {
+        if (config.allowed_origins.len == 0) {
+            @compileError("CORS: allowed_origins must not be empty");
+        }
         if (config.allow_credentials) {
             for (config.allowed_origins) |o| {
                 if (std.mem.eql(u8, o, "*")) {

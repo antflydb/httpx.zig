@@ -322,7 +322,7 @@ pub const Client = struct {
         var bw = std.io.bufferedWriter(socket.writer());
         try req.serialize(bw.writer().any());
         try bw.flush();
-        var res = try self.readResponse(socket);
+        var res = try self.readResponse(socket, req.method);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -335,7 +335,7 @@ pub const Client = struct {
         const w = try session.getWriter();
         try req.serialize(w);
         const r = try session.getReader();
-        var res = try self.readResponse(r);
+        var res = try self.readResponse(r, req.method);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -358,7 +358,7 @@ pub const Client = struct {
     /// Streaming pipeline: parse headers only → build Io.Reader chain
     /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
     /// Only one copy of the body is ever in memory at a time.
-    fn readResponse(self: *Self, source: anytype) !Response {
+    fn readResponse(self: *Self, source: anytype, req_method: types.Method) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_response_size;
@@ -406,7 +406,7 @@ pub const Client = struct {
             break;
         }
 
-        return self.buildStreamingResponse(&parser, source, buf[0..leftover]);
+        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method);
     }
 
     /// Read bytes from either a Socket or an Io.Reader into `buf`.
@@ -440,7 +440,7 @@ pub const Client = struct {
 
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
-    fn buildStreamingResponse(self: *Self, parser: *Parser, source: anytype, leftover: []const u8) !Response {
+    fn buildStreamingResponse(self: *Self, parser: *Parser, source: anytype, leftover: []const u8, req_method: types.Method) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -450,8 +450,11 @@ pub const Client = struct {
         res.headers = parser.headers;
         parser.headers = Headers.init(parser.allocator);
 
-        // Detect if there's a body to read.
-        const has_body = parser.chunked or (parser.content_length orelse 1) > 0;
+        // RFC 7230 §3.3: Responses to HEAD and 1xx/204/304 status codes
+        // MUST NOT contain a message body regardless of headers.
+        const no_body_status = (code >= 100 and code < 200) or code == 204 or code == 304;
+        const has_body = !no_body_status and req_method != .HEAD and
+            (parser.chunked or (parser.content_length orelse 1) > 0);
         if (!has_body) return res;
 
         // Detect Content-Encoding for transparent decompression.
@@ -484,6 +487,7 @@ pub const Client = struct {
             chunked_reader = ChunkedBodyReader.init(body_source, &chunked_buf);
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
+            if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -507,7 +511,9 @@ pub const Client = struct {
         // Pre-allocate hint: use content_length if known (and not compressed).
         if (container == null) {
             if (parser.content_length) |len| {
-                try result.ensureTotalCapacity(self.allocator, @intCast(len));
+                if (len <= std.math.maxInt(usize)) {
+                    try result.ensureTotalCapacity(self.allocator, @intCast(len));
+                }
             }
         }
 

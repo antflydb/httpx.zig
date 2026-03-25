@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mem = std.mem;
 const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
+const containsCrLf = @import("../core/headers.zig").containsCrLf;
 /// Monotonic millisecond timestamp for connection health and deadline tracking.
 pub fn milliTimestamp() i64 {
     if (builtin.os.tag == .macos) {
@@ -115,7 +116,13 @@ pub fn cookieValue(cookie_header: []const u8, name: []const u8) ?[]const u8 {
 }
 
 /// Builds a Set-Cookie header value with common RFC 6265 attributes.
+/// Returns error.HeaderContainsCrLf if any option value contains CR or LF.
 pub fn buildSetCookieHeader(allocator: std.mem.Allocator, name: []const u8, value: []const u8, options: CookieOptions) ![]u8 {
+    // Validate all string inputs against CRLF injection.
+    if (containsCrLf(name) or containsCrLf(value)) return error.HeaderContainsCrLf;
+    if (options.path) |p| if (containsCrLf(p)) return error.HeaderContainsCrLf;
+    if (options.domain) |d| if (containsCrLf(d)) return error.HeaderContainsCrLf;
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     const writer = arrayListWriter(&out, allocator);
