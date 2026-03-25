@@ -135,16 +135,6 @@ pub const Client = struct {
         return self.requestInternal(method, url, reqOpts, 0);
     }
 
-    /// Alias for request() with a shorter name for application code.
-    pub fn send(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.request(method, url, reqOpts);
-    }
-
-    /// Alias for GET requests in fetch-style client code.
-    pub fn fetch(self: *Self, url: []const u8, reqOpts: RequestOptions) !Response {
-        return self.get(url, reqOpts);
-    }
-
     fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
         const owned_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
@@ -823,17 +813,15 @@ test "Client cookie jar public API" {
     try std.testing.expectEqual(@as(usize, 0), client.cookies.count());
 }
 
-test "Client send/fetch/options aliases" {
+test "Client method convenience functions" {
     const allocator = std.testing.allocator;
     var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
-    // Compile-time alias checks through function pointer assignment.
-    const send_ptr: *const fn (*Client, types.Method, []const u8, RequestOptions) anyerror!Response = Client.send;
-    const fetch_ptr: *const fn (*Client, []const u8, RequestOptions) anyerror!Response = Client.fetch;
+    // Compile-time check that convenience methods exist.
+    const request_ptr: *const fn (*Client, types.Method, []const u8, RequestOptions) anyerror!Response = Client.request;
     const options_ptr: *const fn (*Client, []const u8, RequestOptions) anyerror!Response = Client.options;
-    _ = send_ptr;
-    _ = fetch_ptr;
+    _ = request_ptr;
     _ = options_ptr;
 }
 

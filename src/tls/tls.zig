@@ -150,6 +150,7 @@ pub const TlsSession = struct {
         self.tls_write_buf = null;
         self.net_in = null;
         self.net_out = null;
+        self.connected = false;
     }
 
     /// Attaches a connected socket that will carry the TLS session.
@@ -245,9 +246,10 @@ pub const TlsSession = struct {
 
     /// Closes the TLS session and releases all resources.
     /// This is equivalent to deinit() — after close(), the session cannot be reused.
+    /// Closes the TLS session and releases all resources.
+    /// Equivalent to deinit() — after close(), the session cannot be reused.
     pub fn close(self: *Self) void {
         self.deinit();
-        self.connected = false;
     }
 };
 

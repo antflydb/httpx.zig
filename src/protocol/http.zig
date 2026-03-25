@@ -27,7 +27,6 @@ const Response = @import("../core/response.zig").Response;
 const Status = @import("../core/status.zig").Status;
 
 /// HTTP protocol version negotiation result.
-/// Alias for `types.Version` — kept for backward compatibility.
 pub const NegotiatedProtocol = types.Version;
 
 /// Standard Application-Layer Protocol Negotiation (ALPN) identifiers.
@@ -116,7 +115,6 @@ pub const Http2ErrorCode = enum(u32) {
     http_1_1_required = 0xd,
 };
 
-/// HTTP/2 connection settings type (alias for types.Http2Settings).
 pub const Http2ConnectionSettings = types.Http2Settings;
 
 pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {

@@ -101,7 +101,6 @@ pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const common = @import("util/common.zig");
-pub const utils = common;
 
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
@@ -194,8 +193,6 @@ pub const RequestOptions = client_mod.RequestOptions;
 pub const Interceptor = client_mod.Interceptor;
 pub const RequestInterceptor = client_mod.RequestInterceptor;
 pub const ResponseInterceptor = client_mod.ResponseInterceptor;
-pub const HttpClient = Client;
-pub const ReqOptions = RequestOptions;
 
 pub const ConnectionPool = pool.ConnectionPool;
 pub const PoolConfig = pool.PoolConfig;
@@ -210,8 +207,6 @@ pub const CookieOptions = server_mod.CookieOptions;
 pub const SameSite = server_mod.SameSite;
 pub const SseEvent = server_mod.SseEvent;
 pub const PreRouteHook = server_mod.PreRouteHook;
-pub const HttpServer = Server;
-pub const Ctx = Context;
 
 pub const Router = router.Router;
 pub const RouteGroup = router.RouteGroup;
@@ -266,13 +261,8 @@ pub fn get(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response 
     return c.get(url, .{});
 }
 
-/// Convenience alias for GET requests.
-pub fn fetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {
-    return get(allocator, io, url);
-}
-
-/// Convenience function to create a request with an explicit method.
-pub fn send(
+/// Convenience function to create a one-shot request with an explicit method.
+pub fn sendRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
     method: Method,
@@ -399,10 +389,6 @@ test "json" {
 
 test "common" {
     _ = common;
-}
-
-test "utils alias" {
-    _ = utils;
 }
 
 test "socket" {
