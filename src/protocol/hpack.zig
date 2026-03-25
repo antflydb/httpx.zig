@@ -279,6 +279,11 @@ pub const HpackContext = struct {
     allocator: Allocator,
     dynamic_table: DynamicTable,
 
+    /// When non-null, the encoder must emit a dynamic table size update
+    /// at the beginning of the next header block (RFC 7541 §4.2).
+    /// Set when the peer acknowledges a new SETTINGS_HEADER_TABLE_SIZE.
+    pending_table_size_update: ?usize = null,
+
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
@@ -307,6 +312,14 @@ pub const HpackContext = struct {
         }
         const dynamic_index = index - StaticTable.entries.len - 1;
         return self.dynamic_table.get(dynamic_index);
+    }
+
+    /// Signals that the peer has acknowledged a new SETTINGS_HEADER_TABLE_SIZE.
+    /// The encoder will emit a size update instruction at the start of the next
+    /// header block per RFC 7541 §4.2.
+    pub fn setTableSize(self: *Self, new_size: usize) void {
+        self.dynamic_table.setMaxSize(new_size);
+        self.pending_table_size_update = new_size;
     }
 };
 
@@ -651,6 +664,15 @@ pub fn encodeHeaders(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
 
+    // RFC 7541 §4.2: Emit pending dynamic table size update at block start.
+    if (ctx.pending_table_size_update) |new_size| {
+        ctx.pending_table_size_update = null;
+        var buf: [10]u8 = undefined;
+        const n = try encodeInteger(new_size, 5, &buf);
+        buf[0] |= 0x20; // Dynamic table size update prefix
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+
     for (headers) |header| {
         // Try to find in static table first
         if (StaticTable.findNameValue(header.name, header.value)) |index| {
@@ -722,6 +744,7 @@ pub fn decodeHeadersWithOptions(
 
     var offset: usize = 0;
     var total_decoded_size: usize = 0;
+    var saw_non_update = false; // RFC 7541 §4.2: size updates only at block start
 
     while (offset < data.len) {
         if (headers.items.len >= options.max_headers) return error.TooManyHeaders;
@@ -730,6 +753,7 @@ pub fn decodeHeadersWithOptions(
 
         if (first & 0x80 != 0) {
             // Indexed header field
+            saw_non_update = true;
             const idx_result = try decodeInteger(data[offset..], 7);
             offset += idx_result.len;
 
@@ -742,6 +766,7 @@ pub fn decodeHeadersWithOptions(
             });
         } else if (first & 0x40 != 0) {
             // Literal with incremental indexing
+            saw_non_update = true;
             const idx_result = try decodeInteger(data[offset..], 6);
             offset += idx_result.len;
 
@@ -769,6 +794,8 @@ pub fn decodeHeadersWithOptions(
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
             // Dynamic table size update (RFC 7541 §4.2).
+            // MUST occur at the beginning of a header block, before any header representations.
+            if (saw_non_update) return error.DecompressionError;
             const size_result = try decodeInteger(data[offset..], 5);
             offset += size_result.len;
             const max_allowed = if (options.max_table_size > 0) options.max_table_size else 4096;
@@ -776,6 +803,7 @@ pub fn decodeHeadersWithOptions(
             ctx.dynamic_table.setMaxSize(@intCast(size_result.value));
         } else {
             // Literal without indexing or never indexed
+            saw_non_update = true;
             const prefix_bits: u3 = if (first & 0x10 != 0) 4 else 4;
             const idx_result = try decodeInteger(data[offset..], prefix_bits);
             offset += idx_result.len;
@@ -1401,4 +1429,77 @@ test "HPACK accepts dynamic table size update within max_table_size" {
 
     try std.testing.expectEqual(@as(usize, 1), headers.len);
     try std.testing.expectEqual(@as(usize, 2048), ctx.dynamic_table.max_size);
+}
+
+test "HPACK rejects table size update after header representation" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Indexed header (:method GET) followed by a size update — must fail.
+    var buf: [4]u8 = undefined;
+    buf[0] = 0x82; // Indexed: :method GET
+    buf[1] = 0x20 | 0x00; // Size update to 0 (0x20 prefix, value 0)
+    // This is invalid: size update after a header representation (RFC 7541 §4.2).
+
+    try std.testing.expectError(error.DecompressionError, decodeHeadersWithOptions(&ctx, buf[0..2], allocator, .{}));
+}
+
+test "HPACK encoder emits table size update" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Signal a table size change.
+    ctx.setTableSize(1024);
+
+    // Encode a header — should be prefixed with a size update instruction.
+    const headers = [_]HeaderEntry{
+        .{ .name = ":method", .value = "GET" },
+    };
+    const encoded = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // First byte should be a size update (0x20 prefix).
+    try std.testing.expect(encoded[0] & 0xE0 == 0x20);
+
+    // Subsequent encode should NOT have a size update.
+    const encoded2 = try encodeHeaders(&ctx, &headers, allocator);
+    defer allocator.free(encoded2);
+    // First byte should be an indexed header (0x80 prefix), not a size update.
+    try std.testing.expect(encoded2[0] & 0x80 != 0);
+}
+
+test "HPACK encoder size update round-trips through decoder" {
+    const allocator = std.testing.allocator;
+    var encoder_ctx = HpackContext.init(allocator);
+    defer encoder_ctx.deinit();
+    var decoder_ctx = HpackContext.init(allocator);
+    defer decoder_ctx.deinit();
+
+    // Signal table size change on encoder side.
+    encoder_ctx.setTableSize(2048);
+
+    const headers = [_]HeaderEntry{
+        .{ .name = ":status", .value = "200" },
+    };
+    const encoded = try encodeHeaders(&encoder_ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Decode — should apply the size update and parse the header.
+    const decoded = try decodeHeadersWithOptions(&decoder_ctx, encoded, allocator, .{
+        .max_table_size = 4096,
+    });
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqualStrings(":status", decoded[0].name);
+    try std.testing.expectEqualStrings("200", decoded[0].value);
+    try std.testing.expectEqual(@as(usize, 2048), decoder_ctx.dynamic_table.max_size);
 }

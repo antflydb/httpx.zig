@@ -405,11 +405,13 @@ pub const Context = struct {
         closed: bool = false,
 
         /// Sends data as DATA frames without END_STREAM.
+        /// Blocks if the flow-control window is exhausted, resuming
+        /// when WINDOW_UPDATE frames are received from the peer.
         pub fn write(self: *H2StreamWriter, data: []const u8) !void {
             if (self.closed) return error.StreamClosed;
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
-            try self.h2.writeData(self.sock, self.stream_id, data, false);
+            try self.h2.writeDataBlocking(self.sock, self.stream_id, data, false);
         }
 
         /// Sends END_STREAM and marks the writer done.
@@ -1095,6 +1097,11 @@ pub const Server = struct {
             } else if (mem.eql(u8, h.name, ":scheme")) {
                 // Consumed but not needed for routing.
             } else if (h.name.len > 0 and h.name[0] != ':') {
+                // RFC 7540 §8.1.2.2: Reject connection-specific headers.
+                if (isH2ForbiddenHeader(h.name, h.value)) {
+                    try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                    return;
+                }
                 try extra_headers.append(h.name, h.value);
             }
         }
@@ -1212,7 +1219,7 @@ pub const Server = struct {
         try h2.sendHeaders(sock, stream_id, h2_headers, !has_body);
 
         if (has_body) {
-            try h2.writeData(sock, stream_id, response.body.?, true);
+            try h2.writeDataBlocking(sock, stream_id, response.body.?, true);
         }
     }
 
@@ -1352,6 +1359,26 @@ pub const Server = struct {
         return MiddlewareExecState.advance(ctx, &state);
     }
 };
+
+/// RFC 7540 §8.1.2.2: Connection-specific headers are forbidden in HTTP/2.
+/// Returns true if the header must be rejected.
+fn isH2ForbiddenHeader(name: []const u8, value: []const u8) bool {
+    const forbidden = [_][]const u8{
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    };
+    for (forbidden) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f)) return true;
+    }
+    // "te" is allowed only with value "trailers".
+    if (std.ascii.eqlIgnoreCase(name, "te")) {
+        return !std.ascii.eqlIgnoreCase(value, "trailers");
+    }
+    return false;
+}
 
 /// Returns true if `path` contains traversal sequences (`..`), null bytes,
 /// or starts with `/` (absolute). Checks both raw and common percent-encoded
@@ -1755,4 +1782,26 @@ test "Context.body() buffers from H2StreamReader" {
 
     // h2_body_reader should be consumed (set to null).
     try std.testing.expect(ctx.h2_body_reader == null);
+}
+
+test "isH2ForbiddenHeader rejects connection-specific headers" {
+    // RFC 7540 §8.1.2.2: connection-specific headers are forbidden.
+    try std.testing.expect(isH2ForbiddenHeader("connection", "keep-alive"));
+    try std.testing.expect(isH2ForbiddenHeader("Connection", "keep-alive"));
+    try std.testing.expect(isH2ForbiddenHeader("keep-alive", "timeout=5"));
+    try std.testing.expect(isH2ForbiddenHeader("proxy-connection", "keep-alive"));
+    try std.testing.expect(isH2ForbiddenHeader("transfer-encoding", "chunked"));
+    try std.testing.expect(isH2ForbiddenHeader("Transfer-Encoding", "chunked"));
+    try std.testing.expect(isH2ForbiddenHeader("upgrade", "h2c"));
+
+    // "te" with value "trailers" is allowed.
+    try std.testing.expect(!isH2ForbiddenHeader("te", "trailers"));
+    try std.testing.expect(!isH2ForbiddenHeader("TE", "trailers"));
+    // "te" with other values is forbidden.
+    try std.testing.expect(isH2ForbiddenHeader("te", "gzip"));
+    try std.testing.expect(isH2ForbiddenHeader("te", "chunked"));
+
+    // Normal headers are allowed.
+    try std.testing.expect(!isH2ForbiddenHeader("content-type", "text/html"));
+    try std.testing.expect(!isH2ForbiddenHeader("accept", "*/*"));
 }

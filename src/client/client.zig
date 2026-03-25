@@ -582,10 +582,10 @@ pub const Client = struct {
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                    if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
                 } else {
                     try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                    if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                    if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
                 }
             }
 
@@ -794,10 +794,10 @@ pub const Client = struct {
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
             }
         }
 

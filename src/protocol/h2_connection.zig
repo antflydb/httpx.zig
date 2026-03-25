@@ -56,12 +56,18 @@ pub const H2Connection = struct {
     goaway_sent: bool = false,
     goaway_received: bool = false,
     last_peer_stream_id: u31 = 0,
+    /// Highest peer-initiated stream ID we have processed (for GOAWAY, RFC 7540 §6.8).
+    last_processed_stream_id: u31 = 0,
 
     /// Serializes frame writes so multiple fibers can safely share one connection.
     write_mutex: Io.Mutex = Io.Mutex.init,
 
     /// Accumulated connection-level DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_conn_window_update: u32 = 0,
+
+    /// Signaled when send window increases (WINDOW_UPDATE received), allowing
+    /// writeDataBlocking to wake up and send more data.
+    send_window_event: Io.Event = .unset,
 
     /// Maximum bytes of DATA payload allowed per stream. 0 = unlimited.
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
@@ -157,12 +163,19 @@ pub const H2Connection = struct {
 
     /// Applies a received SETTINGS payload to `peer_settings`.
     /// Updates stream windows if INITIAL_WINDOW_SIZE changed.
+    /// Signals the HPACK encoder if HEADER_TABLE_SIZE changed (RFC 7541 §4.2).
     pub fn applyPeerSettings(self: *Self, payload: []const u8) !void {
         const old_window = self.peer_settings.initial_window_size;
+        const old_table_size = self.peer_settings.header_table_size;
         try http.applySettingsPayload(&self.peer_settings, payload);
         const new_window = self.peer_settings.initial_window_size;
         if (old_window != new_window) {
             try self.stream_manager.applyInitialWindowSizeChange(old_window, new_window);
+        }
+        // RFC 7541 §4.2: When peer changes HEADER_TABLE_SIZE, our encoder must
+        // emit a size update at the start of the next header block.
+        if (old_table_size != self.peer_settings.header_table_size) {
+            self.stream_manager.hpack_ctx.setTableSize(self.peer_settings.header_table_size);
         }
         self.stream_manager.max_concurrent_streams = self.peer_settings.max_concurrent_streams;
         // Adapt window update threshold to the local initial window size
@@ -304,6 +317,66 @@ pub const H2Connection = struct {
         if (end_stream) stream.sendEndStream();
     }
 
+    /// Sends DATA frame(s) with flow-control back-pressure. Unlike `writeData`,
+    /// this method blocks (yields the fiber) when the send window is exhausted,
+    /// waiting for WINDOW_UPDATE frames from the peer.
+    ///
+    /// **Caller must hold `write_mutex`**. The mutex is temporarily released
+    /// while waiting for window space so the receive loop can process frames.
+    pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
+        const max_size = self.peer_settings.max_frame_size;
+
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+            if (stream.stream_error) |err| return err;
+
+            const remaining = data.len - offset;
+
+            // Available window = min(stream, connection), clamped to 0.
+            const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
+            const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
+            const window = @min(sw, cw);
+            const chunk_size = @min(remaining, @min(window, max_size));
+
+            if (chunk_size == 0) {
+                // Window exhausted — release mutex, wait for WINDOW_UPDATE, reacquire.
+                {
+                    self.write_mutex.unlock(self.io);
+                    defer self.write_mutex.lockUncancelable(self.io);
+                    self.send_window_event.reset();
+                    // Re-check after reset (receive loop may have updated between our check and reset).
+                    const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+                    if (s2.stream_error) |err| return err;
+                    const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
+                    const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
+                    if (sw2 == 0 or cw2 == 0) {
+                        self.send_window_event.waitUncancelable(self.io);
+                    }
+                }
+                continue;
+            }
+
+            const chunk_i32: i32 = @intCast(chunk_size);
+            try stream.updateSendWindow(-chunk_i32);
+            try self.stream_manager.updateConnectionSendWindow(-chunk_i32);
+
+            const is_last = (offset + chunk_size >= data.len);
+            const flags: u8 = if (is_last and end_stream) FLAG_END_STREAM else 0;
+            try self.writeFrame(writer, .data, flags, stream_id, data[offset..][0..chunk_size]);
+            offset += chunk_size;
+        }
+
+        if (data.len == 0 and end_stream) {
+            try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
+        }
+
+        if (end_stream) {
+            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+            stream.sendEndStream();
+        }
+    }
+
     // ---------------------------------------------------------------
     // Connection-level frame handlers
     // ---------------------------------------------------------------
@@ -336,6 +409,8 @@ pub const H2Connection = struct {
             const s = self.stream_manager.getStream(frame.header.stream_id) orelse return;
             try s.updateSendWindow(@intCast(increment));
         }
+        // Wake any fiber blocked in writeDataBlocking waiting for window space.
+        self.send_window_event.set(self.io);
     }
 
     /// Handles a received GOAWAY frame.
@@ -345,10 +420,9 @@ pub const H2Connection = struct {
         self.goaway_received = true;
     }
 
-    /// Sends a GOAWAY frame advertising the last stream ID we processed.
+    /// Sends a GOAWAY frame advertising the last stream ID we processed (RFC 7540 §6.8).
     pub fn sendGoaway(self: *Self, writer: anytype, error_code: Http2ErrorCode) !void {
-        const last_id = if (self.is_server) self.stream_manager.next_client_stream_id -| 2 else self.stream_manager.next_server_stream_id -| 2;
-        const payload = try stream_mod.buildGoawayPayload(@intCast(last_id), error_code, null, self.allocator);
+        const payload = try stream_mod.buildGoawayPayload(self.last_processed_stream_id, error_code, null, self.allocator);
         defer self.allocator.free(payload);
         try self.writeFrame(writer, .goaway, 0, 0, payload);
         self.goaway_sent = true;
@@ -557,13 +631,18 @@ pub const H2Connection = struct {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
 
+        // Track highest peer-initiated stream ID for GOAWAY (RFC 7540 §6.8).
+        const is_peer_initiated = if (self.is_server) (sid % 2 == 1) else (sid % 2 == 0);
+        if (is_peer_initiated and sid > self.last_processed_stream_id) {
+            self.last_processed_stream_id = sid;
+        }
+
         const stream = self.stream_manager.getStream(sid) orelse blk: {
             // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
             if (self.goaway_received) return error.ProtocolError;
 
             // RFC 7540 §5.1.1: Peer stream IDs must be monotonically increasing.
-            const is_peer_stream = if (self.is_server) (sid % 2 == 1) else (sid % 2 == 0);
-            if (is_peer_stream) {
+            if (is_peer_initiated) {
                 const last_seen = if (self.is_server)
                     self.stream_manager.next_client_stream_id
                 else
@@ -2158,4 +2237,114 @@ test "adaptive window_update_threshold adjusts with SETTINGS" {
 
     // Threshold should be half of 8192 = 4096.
     try std.testing.expectEqual(@as(u32, 4096), conn.window_update_threshold);
+}
+
+test "sendGoaway uses last_processed_stream_id" {
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Simulate receiving frames on streams 1, 3, 5.
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        _ = try server.stream_manager.getOrCreateStream(sid);
+        server.last_processed_stream_id = sid;
+    }
+
+    // sendGoaway should advertise stream 5 (the last we processed).
+    try server.sendGoaway(writer, .no_error);
+
+    // Parse the GOAWAY payload to verify last_stream_id.
+    var reader = TestReader{ .data = wire.items };
+    var frame = try server.readFrame(&reader);
+    defer frame.deinit(allocator);
+
+    try std.testing.expectEqual(Http2FrameType.goaway, frame.header.frame_type);
+    const last_id: u31 = @intCast(mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF);
+    try std.testing.expectEqual(@as(u31, 5), last_id);
+}
+
+test "deliverToMailbox tracks last_processed_stream_id" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u31, 0), server.last_processed_stream_id);
+
+    // Deliver a HEADERS frame on stream 1 (peer-initiated for server).
+    // Use a minimal valid HPACK block: indexed :method GET.
+    const hpack_payload = [_]u8{0x82}; // Indexed: :method GET
+    var frame1 = Frame{
+        .header = .{
+            .length = 1,
+            .frame_type = .headers,
+            .flags = H2Connection.FLAG_END_HEADERS | H2Connection.FLAG_END_STREAM,
+            .stream_id = 1,
+        },
+        .payload = @constCast(&hpack_payload),
+    };
+    try server.deliverToMailbox(&frame1);
+    try std.testing.expectEqual(@as(u31, 1), server.last_processed_stream_id);
+
+    // Deliver on stream 5 (skipping 3).
+    var frame5 = Frame{
+        .header = .{
+            .length = 1,
+            .frame_type = .headers,
+            .flags = H2Connection.FLAG_END_HEADERS | H2Connection.FLAG_END_STREAM,
+            .stream_id = 5,
+        },
+        .payload = @constCast(&hpack_payload),
+    };
+    try server.deliverToMailbox(&frame5);
+    try std.testing.expectEqual(@as(u31, 5), server.last_processed_stream_id);
+}
+
+test "applyPeerSettings signals HPACK encoder table size update" {
+    const allocator = std.testing.allocator;
+
+    var conn = H2Connection.initClient(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // Initially no pending update.
+    try std.testing.expect(conn.stream_manager.hpack_ctx.pending_table_size_update == null);
+
+    // Peer sends SETTINGS with HEADER_TABLE_SIZE = 2048.
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intFromEnum(http.Http2SettingId.header_table_size), .big);
+    std.mem.writeInt(u32, payload[2..6], 2048, .big);
+    try conn.applyPeerSettings(&payload);
+
+    // Encoder should have a pending table size update.
+    try std.testing.expectEqual(@as(?usize, 2048), conn.stream_manager.hpack_ctx.pending_table_size_update);
+    try std.testing.expectEqual(@as(usize, 2048), conn.stream_manager.hpack_ctx.dynamic_table.max_size);
+}
+
+test "handleWindowUpdate signals send_window_event" {
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var conn = H2Connection.initClient(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // Write a WINDOW_UPDATE for connection (stream 0).
+    const wu_payload = stream_mod.buildWindowUpdatePayload(1000);
+    try conn.writeFrame(writer, .window_update, 0, 0, &wu_payload);
+
+    var reader = TestReader{ .data = wire.items };
+    var frame = try conn.readFrame(&reader);
+    defer frame.deinit(allocator);
+
+    // After handling, the event should be set (no pending waiter, just verifying no crash).
+    try conn.handleWindowUpdate(&frame);
+    // send_window_event was set — this is a smoke test that it doesn't panic.
+    try std.testing.expectEqual(conn.stream_manager.connection_send_window, 65535 + 1000);
 }
