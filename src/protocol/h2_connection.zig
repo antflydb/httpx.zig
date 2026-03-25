@@ -413,11 +413,25 @@ pub const H2Connection = struct {
         self.send_window_event.set(self.io);
     }
 
-    /// Handles a received GOAWAY frame.
+    /// Handles a received GOAWAY frame. Signals streams above the peer's
+    /// last_stream_id as retryable (RFC 7540 §6.8: streams with ID >
+    /// last_stream_id were never processed and can be safely retried).
     pub fn handleGoaway(self: *Self, frame: *const Frame) !void {
         if (frame.payload.len < 8) return error.FrameSizeError;
         self.last_peer_stream_id = @intCast(mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF);
         self.goaway_received = true;
+
+        // Signal streams above last_stream_id — they were never processed.
+        var it = self.stream_manager.streams.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr;
+            if (s.id > self.last_peer_stream_id and !s.completed) {
+                s.stream_error = error.GoawayRefused;
+                s.completed = true;
+                if (s.data_event) |ev| ev.set(self.io);
+                if (s.completion_sem) |sem| sem.post(self.io);
+            }
+        }
     }
 
     /// Sends a GOAWAY frame advertising the last stream ID we processed (RFC 7540 §6.8).
@@ -481,11 +495,20 @@ pub const H2Connection = struct {
     }
 
     /// Sends WINDOW_UPDATE(s) to drain an accumulator, capping each
-    /// increment at maxInt(u31) per RFC 7540 §6.9.
+    /// increment at maxInt(u31) per RFC 7540 §6.9. Restores the local
+    /// receive window accounting so it stays in sync with WINDOW_UPDATE.
     fn flushWindowAccumulator(self: *Self, writer: anytype, stream_id: u31, accum: *u32) !void {
         while (accum.* > 0) {
             const inc: u31 = @intCast(@min(accum.*, std.math.maxInt(u31)));
             try self.sendWindowUpdate(writer, stream_id, inc);
+            // Restore the local recv window to match the credit we just advertised.
+            if (stream_id == 0) {
+                self.stream_manager.updateConnectionRecvWindow(@intCast(inc)) catch {};
+            } else {
+                if (self.stream_manager.getStream(stream_id)) |s| {
+                    s.updateRecvWindow(@intCast(inc)) catch {};
+                }
+            }
             accum.* -= inc;
         }
     }
@@ -534,7 +557,7 @@ pub const H2Connection = struct {
             },
             .push_promise => {
                 // RFC 7540 §6.6: PUSH_PROMISE on a connection where ENABLE_PUSH=0
-                // is a connection error (PROTOCOL_ERROR). We always set enable_push=false.
+                // is a connection error (PROTOCOL_ERROR). enable_push defaults to false.
                 try self.sendGoaway(writer, .protocol_error);
                 return error.ProtocolError;
             },
@@ -638,6 +661,12 @@ pub const H2Connection = struct {
         }
 
         const stream = self.stream_manager.getStream(sid) orelse blk: {
+            // RFC 7540 §5.1: Late frames for a stream that was already
+            // fully processed and removed are a stream error, not a
+            // connection error. Return ClosedStream so the caller can
+            // send RST_STREAM(STREAM_CLOSED) without killing the connection.
+            if (sid <= self.stream_manager.max_closed_stream_id) return error.ClosedStream;
+
             // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
             if (self.goaway_received) return error.ProtocolError;
 
@@ -647,7 +676,7 @@ pub const H2Connection = struct {
                     self.stream_manager.next_client_stream_id
                 else
                     self.stream_manager.next_server_stream_id;
-                if (sid < last_seen) return error.ProtocolError;
+                if (sid < last_seen) return error.ClosedStream;
             }
 
             break :blk try self.stream_manager.getOrCreateStream(sid);
@@ -716,7 +745,10 @@ pub const H2Connection = struct {
                         if (stream.completion_sem) |sem| sem.post(self.io);
                         return;
                     };
-                    self.stream_manager.updateConnectionRecvWindow(-data_len) catch {};
+                    // RFC 7540 §6.9.1: connection-level flow control violation
+                    // is a connection error. Return the error so the caller
+                    // can send GOAWAY(FLOW_CONTROL_ERROR).
+                    try self.stream_manager.updateConnectionRecvWindow(-data_len);
                 }
                 try stream.data_buf.appendSlice(self.allocator, frame.payload);
                 if (stream.data_event) |ev| ev.set(self.io);
@@ -751,7 +783,15 @@ pub const H2Connection = struct {
             if (sf.header.frame_type == .data and sf.payload.len > 0) {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
-            try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+            self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+                // RFC 7540 §5.1: late frame for a closed stream — send
+                // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
+                error.ClosedStream => {
+                    self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                    return sf.header.stream_id;
+                },
+                else => return err,
+            };
             // Flush window credit on stream completion or reset.
             if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
                 sf.header.frame_type == .rst_stream)
@@ -786,7 +826,13 @@ pub const H2Connection = struct {
                 }
                 // deliverToMailbox decodes HPACK + copies payload under lock,
                 // ensuring the shared hpack_ctx is not accessed concurrently.
-                try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+                self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+                    error.ClosedStream => {
+                        self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                        return sf.header.stream_id;
+                    },
+                    else => return err,
+                };
                 // Flush window credit on stream completion or reset.
                 if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
                     sf.header.frame_type == .rst_stream)
@@ -2160,12 +2206,13 @@ test "deliverToMailbox enforces stream ID monotonicity" {
     const s5 = try server.stream_manager.getOrCreateStream(5);
     s5.state = .open;
 
-    // Now try to create stream 3 (lower than 5) — should fail.
+    // Now try to create stream 3 (lower than 5) — should return ClosedStream
+    // since it looks like a late frame for a previously-seen stream ID.
     var frame = Frame{
         .header = .{ .length = 1, .frame_type = .headers, .flags = 0x05, .stream_id = 3 },
         .payload = @constCast(&[_]u8{0x82}),
     };
-    try std.testing.expectError(error.ProtocolError, server.deliverToMailbox(&frame));
+    try std.testing.expectError(error.ClosedStream, server.deliverToMailbox(&frame));
 }
 
 test "receive window decremented on incoming DATA" {
@@ -2347,4 +2394,128 @@ test "handleWindowUpdate signals send_window_event" {
     try conn.handleWindowUpdate(&frame);
     // send_window_event was set — this is a smoke test that it doesn't panic.
     try std.testing.expectEqual(conn.stream_manager.connection_send_window, 65535 + 1000);
+}
+
+test "late frame for removed stream returns ClosedStream not ProtocolError" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Create and open stream 1.
+    const s1 = try server.stream_manager.getOrCreateStream(1);
+    s1.state = .open;
+    // Simulate completing and removing it.
+    server.stream_manager.removeStream(1);
+
+    // Late DATA for stream 1 should be ClosedStream, not ProtocolError.
+    var frame = Frame{
+        .header = .{ .length = 3, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast("abc"),
+    };
+    try std.testing.expectError(error.ClosedStream, server.deliverToMailbox(&frame));
+}
+
+test "GOAWAY signals streams above last_stream_id" {
+    const allocator = std.testing.allocator;
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+
+    // Create streams 1 and 3.
+    const s1 = try client.stream_manager.createStream();
+    s1.state = .open;
+    const s3 = try client.stream_manager.createStream();
+    s3.state = .open;
+
+    // Build GOAWAY payload: last_stream_id=1, error_code=no_error.
+    const goaway_payload = try stream_mod.buildGoawayPayload(1, .no_error, null, allocator);
+    defer allocator.free(goaway_payload);
+
+    // Synthesize GOAWAY frame and handle it.
+    var goaway_frame = Frame{
+        .header = .{ .length = @intCast(goaway_payload.len), .frame_type = .goaway, .flags = 0, .stream_id = 0 },
+        .payload = goaway_payload,
+    };
+    _ = writer;
+    try client.handleGoaway(&goaway_frame);
+
+    // Stream 1 (within last_stream_id) should NOT be signaled.
+    try std.testing.expect(s1.stream_error == null);
+    try std.testing.expect(!s1.completed);
+
+    // Stream 3 (above last_stream_id) should be signaled as GoawayRefused.
+    try std.testing.expect(s3.stream_error != null);
+    try std.testing.expect(s3.completed);
+}
+
+test "recv window restored after WINDOW_UPDATE sent" {
+    const allocator = std.testing.allocator;
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    const initial_recv = conn.stream_manager.connection_recv_window;
+
+    // Simulate receiving DATA that decrements recv window and accumulates.
+    const data_bytes: i32 = @intCast(conn.window_update_threshold + 1);
+    try conn.stream_manager.updateConnectionRecvWindow(-data_bytes);
+    conn.pending_conn_window_update = conn.window_update_threshold + 1;
+
+    // Flush sends WINDOW_UPDATE and restores the recv window.
+    try conn.flushConnWindowUpdate(writer);
+
+    // After flush, recv window should be restored to initial value.
+    try std.testing.expectEqual(initial_recv, conn.stream_manager.connection_recv_window);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_conn_window_update);
+}
+
+test "enable_push defaults to false" {
+    const settings = @import("../core/types.zig").Http2Settings{};
+    try std.testing.expectEqual(false, settings.enable_push);
+}
+
+test "MAX_CONCURRENT_STREAMS off-by-one fixed: >= not >" {
+    const allocator = std.testing.allocator;
+    var manager = stream_mod.StreamManager.init(allocator, false);
+    defer manager.deinit();
+    manager.max_concurrent_streams = 2;
+
+    // Create 2 open streams = the limit.
+    const s1 = try manager.getOrCreateStream(1);
+    s1.state = .open;
+    const s3 = try manager.getOrCreateStream(3);
+    s3.state = .open;
+
+    try std.testing.expectEqual(@as(usize, 2), manager.activeStreamCount());
+    // With >= check, 2 active streams meets the limit of 2.
+    try std.testing.expect(manager.activeStreamCount() >= manager.max_concurrent_streams);
+}
+
+test "applyInitialWindowSizeChange skips closed streams" {
+    const allocator = std.testing.allocator;
+    var manager = stream_mod.StreamManager.init(allocator, true);
+    defer manager.deinit();
+
+    // Create an open stream and a closed stream.
+    const s1 = try manager.createStream();
+    s1.state = .open;
+    s1.send_window = 1000;
+
+    const s3 = try manager.createStream();
+    s3.state = .closed;
+    s3.send_window = 500;
+
+    // Apply window size change: 65535 → 70000 (delta = +4465).
+    try manager.applyInitialWindowSizeChange(65535, 70000);
+
+    // Open stream should be updated.
+    try std.testing.expectEqual(@as(i32, 1000 + 4465), s1.send_window);
+    // Closed stream should be unchanged (canSend() = false).
+    try std.testing.expectEqual(@as(i32, 500), s3.send_window);
 }

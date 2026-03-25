@@ -228,6 +228,10 @@ pub const StreamManager = struct {
     /// Maximum concurrent streams allowed (from SETTINGS).
     max_concurrent_streams: u32 = 100,
 
+    /// Highest stream ID that has been removed. Used to distinguish late
+    /// frames for closed streams from truly invalid stream IDs.
+    max_closed_stream_id: u31 = 0,
+
     /// HPACK encoder/decoder context.
     hpack_ctx: hpack.HpackContext,
 
@@ -307,9 +311,10 @@ pub const StreamManager = struct {
         return self.streams.getPtr(id).?;
     }
 
-    /// Removes a closed stream.
+    /// Removes a closed stream and updates the closed-stream watermark.
     pub fn removeStream(self: *Self, id: u31) void {
         if (self.streams.fetchRemove(id)) |kv| {
+            if (id > self.max_closed_stream_id) self.max_closed_stream_id = id;
             var stream = kv.value;
             stream.deinit(self.allocator);
         }
@@ -338,13 +343,23 @@ pub const StreamManager = struct {
         self.connection_recv_window = try addWindowDelta(self.connection_recv_window, delta);
     }
 
-    /// Applies initial window size change from SETTINGS to all streams.
+    /// Applies initial window size change from SETTINGS to open/half-closed-remote
+    /// streams per RFC 7540 §6.9.2. Skips streams in states where send window is
+    /// irrelevant. Individual stream overflow is a stream error, not connection error.
     pub fn applyInitialWindowSizeChange(self: *Self, old_size: u32, new_size: u32) !void {
         if (new_size > std.math.maxInt(i32) or old_size > std.math.maxInt(i32)) return error.FlowControlError;
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            try entry.value_ptr.updateSendWindow(delta);
+            const s = entry.value_ptr;
+            // Only adjust streams where we can still send data.
+            if (!s.canSend()) continue;
+            s.updateSendWindow(delta) catch {
+                // RFC 7540 §6.9.2: overflow on a single stream is a
+                // stream error (FLOW_CONTROL_ERROR), not connection error.
+                s.stream_error = error.FlowControlError;
+                s.completed = true;
+            };
         }
     }
 };

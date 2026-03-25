@@ -934,7 +934,7 @@ pub const Server = struct {
                 continue;
             }
 
-            if (h2.stream_manager.activeStreamCount() > h2.stream_manager.max_concurrent_streams) {
+            if (h2.stream_manager.activeStreamCount() >= h2.stream_manager.max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
                 h2.write_mutex.unlock(h2.io);
@@ -1022,7 +1022,7 @@ pub const Server = struct {
             }
 
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
-            if (h2.stream_manager.activeStreamCount() > h2.stream_manager.max_concurrent_streams) {
+            if (h2.stream_manager.activeStreamCount() >= h2.stream_manager.max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
                 h2.write_mutex.unlock(h2.io);
