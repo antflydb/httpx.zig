@@ -108,30 +108,45 @@ pub const Socket = struct {
     }
 
     /// Returns a reader interface for the socket.
-    pub fn reader(self: *Self) std.io.AnyReader {
-        return .{
-            .context = @ptrCast(self),
-            .readFn = struct {
-                fn read(ctx: *const anyopaque, buffer: []u8) !usize {
-                    const s: *Socket = @ptrCast(@constCast(ctx));
-                    return s.recv(buffer);
-                }
-            }.read,
-        };
+    pub fn reader(self: *Self) SocketReader {
+        return .{ .socket = self };
     }
 
     /// Returns a writer interface for the socket.
-    pub fn writer(self: *Self) std.io.AnyWriter {
-        return .{
-            .context = @ptrCast(self),
-            .writeFn = struct {
-                fn write(ctx: *const anyopaque, data: []const u8) !usize {
-                    const s: *Socket = @ptrCast(@constCast(ctx));
-                    return s.send(data);
-                }
-            }.write,
-        };
+    pub fn writer(self: *Self) SocketWriter {
+        return .{ .socket = self };
     }
+
+    pub const SocketReader = struct {
+        socket: *Socket,
+
+        pub fn read(self: SocketReader, buffer: []u8) !usize {
+            return self.socket.recv(buffer);
+        }
+    };
+
+    pub const SocketWriter = struct {
+        socket: *Socket,
+
+        pub fn writeAll(self: SocketWriter, data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                sent += try self.socket.send(data[sent..]);
+            }
+        }
+
+        pub fn print(self: SocketWriter, comptime fmt: []const u8, args: anytype) !void {
+            var buf: [4096]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, fmt, args) catch {
+                // Fallback for oversized output: allocate.
+                const allocated = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return error.OutOfMemory;
+                defer std.heap.page_allocator.free(allocated);
+                try self.writeAll(allocated);
+                return;
+            };
+            try self.writeAll(slice);
+        }
+    };
 };
 
 /// Shared Io.Reader VTable helpers for custom reader adapters.

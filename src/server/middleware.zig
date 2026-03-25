@@ -145,9 +145,9 @@ pub fn logger() Middleware {
         .name = "logger",
         .handler = struct {
             fn handler(ctx: *Context, next: *Next) anyerror!Response {
-                const start = milliTimestamp();
+                const start = milliTimestamp(ctx.io);
                 const response = try next.call(ctx);
-                const duration = milliTimestamp() - start;
+                const duration = milliTimestamp(ctx.io) - start;
 
                 std.debug.print("{s} {s} - {d}ms\n", .{
                     ctx.request.method.toString(),

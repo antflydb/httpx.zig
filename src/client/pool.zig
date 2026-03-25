@@ -101,7 +101,7 @@ pub const Connection = struct {
         errdefer socket.close();
         socket.setKeepAlive(true) catch {};
 
-        const now = milliTimestamp();
+        const now = milliTimestamp(io);
         const conn = try allocator.create(Connection);
         conn.* = .{
             .socket = socket,
@@ -180,7 +180,7 @@ pub const TlsConnection = struct {
         entry.session.attachSocket(&entry.socket);
         try entry.session.handshake(host);
 
-        const now = milliTimestamp();
+        const now = milliTimestamp(io);
         entry.host = host_owned;
         entry.port = port;
         entry.in_use = true;
@@ -298,7 +298,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 defer self.mutex.unlock(self.io);
 
                 // Periodic cleanup: evict stale/broken connections.
-                const now = milliTimestamp();
+                const now = milliTimestamp(self.io);
                 if (now - self.last_cleanup > self.config.health_check_interval_ms) {
                     self.cleanupLocked(now);
                     self.last_cleanup = now;
@@ -389,7 +389,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         pub fn releaseConnection(self: *Self, entry: *Entry) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const now = milliTimestamp();
+            const now = milliTimestamp(self.io);
             entry.release(now);
             self.active_count -|= 1;
             // Opportunistic cleanup on release.
@@ -445,7 +445,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         pub fn cleanup(self: *Self) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            self.cleanupLocked(milliTimestamp());
+            self.cleanupLocked(milliTimestamp(self.io));
         }
 
         fn cleanupLocked(self: *Self, now: i64) void {
@@ -574,7 +574,7 @@ test "Connection health check" {
     defer listener.deinit();
     const bound_addr = listener.getLocalAddress();
 
-    const now = milliTimestamp();
+    const now = milliTimestamp(io);
     var conn = Connection{
         .socket = try Socket.connect(bound_addr, io),
         .host = "localhost",
@@ -615,7 +615,7 @@ test "ConnectionPool mutex prevents data races" {
 }
 
 test "TlsConnection health check basics" {
-    const now = milliTimestamp();
+    const now = milliTimestamp(std.testing.io);
     // We cannot construct a real TlsConnection without a network peer, so
     // test the health-check logic by inspecting flag combinations on a
     // zero-initialized stub (socket/session fields are not touched by the

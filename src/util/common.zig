@@ -1,40 +1,16 @@
 //! Shared utility helpers used across client/server/core modules.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mem = std.mem;
 const arrayListWriter = @import("array_list_writer.zig").arrayListWriter;
 const containsCrLf = @import("../core/headers.zig").containsCrLf;
+const Io = std.Io;
+
 /// Monotonic millisecond timestamp for connection health and deadline tracking.
-pub fn milliTimestamp() i64 {
-    if (builtin.os.tag == .macos) {
-        // mach_absolute_time returns ticks; convert via timebase info.
-        // On Apple Silicon numer/denom == 1/1, on Intel it differs.
-        // Thread-safe init: pack both numer and denom into a single u64 atomic
-        // so readers either see both or neither (no torn read).
-        const cached = struct {
-            var timebase: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-        };
-        var p = cached.timebase.load(.acquire);
-        if (p == 0) {
-            var info: std.c.mach_timebase_info_data = .{ .numer = 0, .denom = 0 };
-            std.c.mach_timebase_info(&info);
-            p = @as(u64, info.numer) << 32 | @as(u64, info.denom);
-            cached.timebase.store(p, .release);
-        }
-        const numer: u32 = @intCast(p >> 32);
-        const denom: u32 = @intCast(p & 0xFFFFFFFF);
-        const ticks: u64 = std.c.mach_absolute_time();
-        // Use 128-bit intermediate to prevent overflow on Intel Macs
-        // where numer > 1 (Apple Silicon has numer/denom == 1/1).
-        const ns: u64 = @intCast(@as(u128, ticks) * numer / denom);
-        return @intCast(ns / std.time.ns_per_ms);
-    } else {
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-        const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        if (rc != 0) return 0;
-        return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
-    }
+/// Uses std.Io.Clock.monotonic for pure-Zig, cross-platform time.
+pub fn milliTimestamp(io: Io) i64 {
+    const now = Io.Clock.awake.now(io);
+    return @intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms));
 }
 
 /// Parsed cookie name/value pair from a Set-Cookie header value.
