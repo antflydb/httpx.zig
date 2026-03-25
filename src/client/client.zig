@@ -74,6 +74,12 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    /// Send a PING health check after this many ms of no frames received on
+    /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
+    h2_read_idle_timeout_ms: u64 = 30_000,
+    /// How long to wait for a PING ACK before declaring the connection dead (ms).
+    /// Similar to Go's http2.Transport.PingTimeout. Only used when read_idle_timeout > 0.
+    h2_ping_timeout_ms: u64 = 15_000,
 };
 
 /// Per-request options.
@@ -112,6 +118,15 @@ const H2PoolEntry = struct {
     recv_group: Io.Group = Io.Group.init,
     /// True when a receive-loop fiber is actively pumping frames.
     recv_running: bool = false,
+    /// Tracks the PING health-check fiber.
+    ping_group: Io.Group = Io.Group.init,
+    /// Monotonic timestamp (ms) of the last received frame, updated by the
+    /// receive loop fiber and read by the ping timer fiber.
+    last_frame_ts: i64 = 0,
+    /// Client config for timeout values (set during creation).
+    read_idle_timeout_ms: u64 = 0,
+    ping_timeout_ms: u64 = 15_000,
+    io: Io = undefined,
 };
 
 /// HTTP Client.
@@ -170,8 +185,10 @@ pub const Client = struct {
             const e = entry.value_ptr.*;
             // Close the socket first so the receive loop's blocking read
             // returns ConnectionClosed, allowing the fiber to exit cleanly.
+            // This also causes the ping timer's waitTimeout to fail.
             e.socket.close();
-            // Wait for the receive-loop fiber to finish before tearing down.
+            // Wait for both fibers to finish before tearing down.
+            e.ping_group.await(self.io) catch {};
             e.recv_group.await(self.io) catch {};
             e.h2.deinit();
             if (e.is_tls) e.session.deinit();
@@ -432,6 +449,7 @@ pub const Client = struct {
             if (self.h2_conns.fetchRemove(key)) |removed| {
                 const e = removed.value;
                 e.socket.close();
+                e.ping_group.await(self.io) catch {};
                 e.recv_group.await(self.io) catch {};
                 e.h2.deinit();
                 if (e.is_tls) e.session.deinit();
@@ -467,6 +485,10 @@ pub const Client = struct {
 
         entry.h2 = H2Connection.initClient(self.allocator, self.io);
         entry.h2.max_stream_data_size = self.config.max_response_size;
+        entry.io = self.io;
+        entry.last_frame_ts = common.milliTimestamp(self.io);
+        entry.read_idle_timeout_ms = self.config.h2_read_idle_timeout_ms;
+        entry.ping_timeout_ms = self.config.h2_ping_timeout_ms;
         errdefer entry.h2.deinit();
 
         // Perform h2 handshake: preface + SETTINGS exchange.
@@ -484,6 +506,10 @@ pub const Client = struct {
         // can share this connection via stream multiplexing.
         if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
             entry.recv_running = true;
+            // Spawn PING health-check fiber alongside the receive loop.
+            if (self.config.h2_read_idle_timeout_ms > 0) {
+                entry.ping_group.concurrent(self.io, h2PingTimerFiber, .{entry}) catch {};
+            }
         } else |_| {
             // No fiber support — fall back to inline frame pumping per request.
         }
@@ -515,6 +541,8 @@ pub const Client = struct {
 
     /// Background receive-loop fiber for multiplexed H2 connections.
     /// Continuously pumps frames until GOAWAY or connection error.
+    /// Updates `last_frame_ts` on each frame so the ping timer fiber
+    /// can detect idle connections.
     fn h2RecvLoopFiber(entry: *H2PoolEntry) Io.Cancelable!void {
         if (entry.is_tls) {
             const r = entry.session.getReader() catch {
@@ -525,11 +553,74 @@ pub const Client = struct {
                 entry.broken = true;
                 return;
             };
-            entry.h2.runReceiveLoop(r, w) catch {};
+            h2RecvLoop(entry, r, w);
         } else {
-            entry.h2.runReceiveLoop(&entry.socket, &entry.socket) catch {};
+            h2RecvLoop(entry, &entry.socket, &entry.socket);
         }
         entry.broken = true;
+    }
+
+    fn h2RecvLoop(entry: *H2PoolEntry, reader: anytype, writer: anytype) void {
+        defer entry.h2.signalAllStreams(error.ConnectionClosed);
+        while (!entry.h2.goaway_received) {
+            _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| switch (err) {
+                error.ConnectionClosed => return,
+                else => return,
+            };
+            entry.last_frame_ts = common.milliTimestamp(entry.io);
+        }
+    }
+
+    /// PING health-check fiber. Runs alongside the receive loop.
+    /// Sleeps for `read_idle_timeout_ms`, then checks if any frames were
+    /// received since the last check. If not, sends a PING and waits for
+    /// ACK within `ping_timeout_ms`. On timeout, closes the socket to
+    /// tear down the connection (similar to Go's http2.Transport health check).
+    fn h2PingTimerFiber(entry: *H2PoolEntry) Io.Cancelable!void {
+        const idle_ms = entry.read_idle_timeout_ms;
+        const ping_ms = entry.ping_timeout_ms;
+        if (idle_ms == 0) return;
+
+        while (!entry.broken) {
+            // Sleep for the idle timeout period.
+            entry.io.sleep(Io.Duration.fromMilliseconds(@intCast(idle_ms)), .awake) catch return;
+
+            if (entry.broken) return;
+
+            // Check if we received any frame during the sleep period.
+            const now = common.milliTimestamp(entry.io);
+            const since_last = now - entry.last_frame_ts;
+            if (since_last < @as(i64, @intCast(idle_ms))) continue;
+
+            // No frames received — send a PING to probe liveness.
+            entry.h2.ping_ack_event.reset();
+
+            {
+                entry.h2.write_mutex.lockUncancelable(entry.io);
+                defer entry.h2.write_mutex.unlock(entry.io);
+                if (entry.is_tls) {
+                    if (entry.session.getWriter()) |w|
+                        entry.h2.sendPing(w, .{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 }) catch {}
+                    else |_| {}
+                } else {
+                    entry.h2.sendPing(&entry.socket, .{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 }) catch {};
+                }
+            }
+
+            // Wait for PING ACK with timeout.
+            const timeout: Io.Timeout = .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(ping_ms)),
+                .clock = .awake,
+            } };
+            entry.h2.ping_ack_event.waitTimeout(entry.io, timeout) catch {
+                // Timeout or canceled — connection is dead.
+                entry.broken = true;
+                entry.socket.close();
+                return;
+            };
+            // ACK received — connection is alive. Update timestamp.
+            entry.last_frame_ts = common.milliTimestamp(entry.io);
+        }
     }
 
     /// Executes a request on a pooled H2 connection. Creates a stream, sends

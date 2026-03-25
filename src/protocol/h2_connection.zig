@@ -82,6 +82,10 @@ pub const H2Connection = struct {
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
     continuation_flags: u8 = 0,
 
+    /// Signaled when a PING ACK is received, allowing a health-check fiber
+    /// to verify liveness of the connection.
+    ping_ack_event: Io.Event = .unset,
+
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
     /// Defaults to half the initial window size. Adjusted when peer SETTINGS
     /// changes INITIAL_WINDOW_SIZE so small windows don't deadlock.
@@ -400,12 +404,21 @@ pub const H2Connection = struct {
         try self.sendSettingsAck(writer);
     }
 
-    /// Handles a received PING frame — echoes back with ACK.
+    /// Handles a received PING frame — echoes back with ACK, or signals
+    /// the ping_ack_event when an ACK is received (for health-check probes).
     pub fn handlePing(self: *Self, frame: *const Frame, writer: anytype) !void {
         if (frame.header.stream_id != 0) return error.ProtocolError;
         if (frame.payload.len != 8) return error.FrameSizeError;
-        if (frame.header.flags & FLAG_ACK != 0) return;
+        if (frame.header.flags & FLAG_ACK != 0) {
+            self.ping_ack_event.set(self.io);
+            return;
+        }
         try self.writeFrame(writer, .ping, FLAG_ACK, 0, frame.payload);
+    }
+
+    /// Sends a PING frame. Caller must hold write_mutex.
+    pub fn sendPing(self: *Self, writer: anytype, opaque_data: [8]u8) !void {
+        try self.writeFrame(writer, .ping, 0, 0, &opaque_data);
     }
 
     /// Handles a received WINDOW_UPDATE frame.
