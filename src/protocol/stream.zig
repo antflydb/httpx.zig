@@ -104,6 +104,10 @@ pub const Stream = struct {
     /// Read cursor into data_buf for incremental consumption.
     read_offset: usize = 0,
 
+    /// Compaction threshold: shift consumed bytes to the front when
+    /// read_offset exceeds this to bound memory usage on long-lived streams.
+    pub const compact_threshold: usize = 64 * 1024;
+
     const Self = @This();
 
     pub fn init(id: u31) Self {
@@ -164,6 +168,19 @@ pub const Stream = struct {
     /// Closes the stream due to RST_STREAM or error.
     pub fn reset(self: *Self) void {
         self.state = .closed;
+    }
+
+    /// Discards consumed bytes (before read_offset) from data_buf.
+    /// Shifts remaining bytes to front and resets read_offset to 0.
+    pub fn compactDataBuf(self: *Self) void {
+        if (self.read_offset == 0) return;
+        const remaining = self.data_buf.items.len - self.read_offset;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.data_buf.items[0..remaining],
+                self.data_buf.items[self.read_offset..]);
+        }
+        self.data_buf.items.len = remaining;
+        self.read_offset = 0;
     }
 
     /// Updates the send window by delta (can be negative for data sent).
@@ -548,6 +565,42 @@ test "RST_STREAM payload" {
     const payload = buildRstStreamPayload(.cancel);
     const error_code = try parseRstStreamPayload(&payload);
     try std.testing.expectEqual(http.Http2ErrorCode.cancel, error_code);
+}
+
+test "compactDataBuf shifts remaining data to front" {
+    const allocator = std.testing.allocator;
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+
+    // Append 128KB of data.
+    const chunk = "A" ** 1024;
+    for (0..128) |_| {
+        try s.data_buf.appendSlice(allocator, chunk);
+    }
+    try std.testing.expectEqual(@as(usize, 128 * 1024), s.data_buf.items.len);
+
+    // Simulate reading 96KB.
+    s.read_offset = 96 * 1024;
+    s.compactDataBuf();
+
+    // Remaining 32KB should be at offset 0.
+    try std.testing.expectEqual(@as(usize, 0), s.read_offset);
+    try std.testing.expectEqual(@as(usize, 32 * 1024), s.data_buf.items.len);
+    // All remaining bytes should be 'A'.
+    for (s.data_buf.items) |b| {
+        try std.testing.expectEqual(@as(u8, 'A'), b);
+    }
+}
+
+test "compactDataBuf is no-op when read_offset is zero" {
+    const allocator = std.testing.allocator;
+    var s = Stream.init(1);
+    defer s.deinit(allocator);
+
+    try s.data_buf.appendSlice(allocator, "hello");
+    s.compactDataBuf();
+    try std.testing.expectEqual(@as(usize, 5), s.data_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.read_offset);
 }
 
 test "PRIORITY payload" {

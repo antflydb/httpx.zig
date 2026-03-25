@@ -655,6 +655,9 @@ pub const Client = struct {
                     const start = self.stream.read_offset;
                     @memcpy(buf[0..n], self.stream.data_buf.items[start..][0..n]);
                     self.stream.read_offset += n;
+                    if (self.stream.read_offset >= Stream.compact_threshold) {
+                        self.stream.compactDataBuf();
+                    }
                     return n;
                 }
                 if (self.stream.completed) return 0;
