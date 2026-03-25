@@ -137,13 +137,7 @@ pub const Socket = struct {
 
         pub fn print(self: SocketWriter, comptime fmt: []const u8, args: anytype) !void {
             var buf: [4096]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, fmt, args) catch {
-                // Fallback for oversized output: allocate.
-                const allocated = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return error.OutOfMemory;
-                defer std.heap.page_allocator.free(allocated);
-                try self.writeAll(allocated);
-                return;
-            };
+            const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory;
             try self.writeAll(slice);
         }
     };
@@ -535,10 +529,9 @@ pub const ChunkedBodyReader = struct {
                             // Accumulate line content (excluding \r and \n) into line_buf.
                             for (buffered[0..nl_pos]) |byte| {
                                 if (byte == '\r') continue;
-                                if (p.line_len < p.line_buf.len) {
-                                    p.line_buf[p.line_len] = byte;
-                                    p.line_len += 1;
-                                }
+                                if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                                p.line_buf[p.line_len] = byte;
+                                p.line_len += 1;
                             }
                             p.ahead_start += nl_pos + 1; // consume through newline
                             break;
@@ -546,10 +539,9 @@ pub const ChunkedBodyReader = struct {
                         // No newline yet — accumulate all buffered bytes into line_buf.
                         for (buffered) |byte| {
                             if (byte == '\r') continue;
-                            if (p.line_len < p.line_buf.len) {
-                                p.line_buf[p.line_len] = byte;
-                                p.line_len += 1;
-                            }
+                            if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                            p.line_buf[p.line_len] = byte;
+                            p.line_len += 1;
                         }
                         p.ahead_start = p.ahead_end; // consume all
 

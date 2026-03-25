@@ -63,6 +63,10 @@ pub const H2Connection = struct {
     /// Accumulated connection-level DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_conn_window_update: u32 = 0,
 
+    /// Maximum bytes of DATA payload allowed per stream. 0 = unlimited.
+    /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
+    max_stream_data_size: usize = 0,
+
     // Reassembly buffer for CONTINUATION frames.
     continuation_stream_id: ?u31 = null,
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -73,6 +77,10 @@ pub const H2Connection = struct {
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
     /// Half the default initial window size (65535 / 2 ≈ 32KB).
     pub const window_update_threshold: u32 = 32768;
+
+    /// Maximum total CONTINUATION reassembly size (64KB).
+    /// Prevents unbounded memory growth from CONTINUATION frame floods.
+    pub const max_continuation_size: usize = 64 * 1024;
 
     // -- Frame flag constants (RFC 7540 §6) --
     pub const FLAG_ACK: u8 = 0x01;
@@ -180,8 +188,13 @@ pub const H2Connection = struct {
             // CONTINUATION reassembly (RFC 7540 §6.10).
             if (self.continuation_stream_id) |cont_id| {
                 if (hdr.frame_type != .continuation or hdr.stream_id != cont_id) {
-                    self.allocator.free(payload);
+                    // payload freed by errdefer above.
                     return error.ProtocolError;
+                }
+                // Cap reassembly to prevent CONTINUATION bombs.
+                if (self.continuation_buf.items.len + payload.len > max_continuation_size) {
+                    // payload freed by errdefer above.
+                    return error.HeaderBlockTooLarge;
                 }
                 try self.continuation_buf.appendSlice(self.allocator, payload);
                 self.allocator.free(payload);
@@ -485,7 +498,13 @@ pub const H2Connection = struct {
     };
 
     pub fn decodeFrameHeaders(self: *Self, payload: []const u8, flags: u8) !DecodeResult {
-        const result = try stream_mod.parseHeadersFramePayload(&self.stream_manager, payload, flags, self.allocator);
+        const result = try stream_mod.parseHeadersFramePayloadWithOptions(
+            &self.stream_manager,
+            payload,
+            flags,
+            self.allocator,
+            .{ .max_table_size = self.local_settings.header_table_size },
+        );
         return .{ .headers = result.headers, .priority = result.priority };
     }
 
@@ -532,6 +551,16 @@ pub const H2Connection = struct {
                 }
             },
             .data => {
+                if (self.max_stream_data_size > 0) {
+                    const new_size = stream.data_buf.items.len + frame.payload.len;
+                    if (new_size > self.max_stream_data_size) {
+                        stream.stream_error = error.StreamDataOverflow;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        return;
+                    }
+                }
                 try stream.data_buf.appendSlice(self.allocator, frame.payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
@@ -650,7 +679,7 @@ pub const H2Connection = struct {
 
     /// Signals all active streams with an error and posts their events/semaphores
     /// so waiting fibers don't hang forever after the receive loop exits.
-    fn signalAllStreams(self: *Self, err: anyerror) void {
+    pub fn signalAllStreams(self: *Self, err: anyerror) void {
         var it = self.stream_manager.streams.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr;
@@ -1735,4 +1764,102 @@ test "batched WINDOW_UPDATE: END_STREAM flushes connection credit" {
     // because it's pointless for a completed stream.
     try std.testing.expectEqual(@as(usize, 13), reply.items.len);
     try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
+}
+
+test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    server.max_stream_data_size = 100; // 100 bytes max
+
+    // Create a stream.
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+
+    // Deliver a DATA frame within limits.
+    var small_frame = Frame{
+        .header = .{ .length = 50, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&([_]u8{0x41} ** 50)),
+    };
+    try server.deliverToMailbox(&small_frame);
+    try std.testing.expectEqual(@as(usize, 50), stream.data_buf.items.len);
+    try std.testing.expect(!stream.completed);
+
+    // Deliver a DATA frame that exceeds the limit.
+    var big_frame = Frame{
+        .header = .{ .length = 60, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&([_]u8{0x42} ** 60)),
+    };
+    try server.deliverToMailbox(&big_frame);
+
+    // Stream should be marked completed with error, data_buf unchanged.
+    try std.testing.expect(stream.completed);
+    try std.testing.expect(stream.stream_error != null);
+    try std.testing.expectEqual(@as(usize, 50), stream.data_buf.items.len);
+}
+
+test "deliverToMailbox allows unlimited DATA when max_stream_data_size is 0" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    // Default: max_stream_data_size = 0 (unlimited).
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+
+    var frame = Frame{
+        .header = .{ .length = 200, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&([_]u8{0x41} ** 200)),
+    };
+    try server.deliverToMailbox(&frame);
+    try std.testing.expectEqual(@as(usize, 200), stream.data_buf.items.len);
+    try std.testing.expect(!stream.completed);
+}
+
+test "CONTINUATION reassembly rejects oversized header block" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Build a HEADERS frame without END_HEADERS to trigger CONTINUATION mode.
+    const headers_payload = [_]u8{0x82}; // :method GET (static index 2)
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+
+    // HEADERS frame (no END_HEADERS flag).
+    const hdr1 = Http2FrameHeader{
+        .length = headers_payload.len,
+        .frame_type = .headers,
+        .flags = 0, // no END_HEADERS
+        .stream_id = 1,
+    };
+    try c2s.appendSlice(allocator, &hdr1.serialize());
+    try c2s.appendSlice(allocator, &headers_payload);
+
+    // CONTINUATION frame with payload exceeding max_continuation_size.
+    const big_payload = try allocator.alloc(u8, H2Connection.max_continuation_size + 1);
+    defer allocator.free(big_payload);
+    @memset(big_payload, 0);
+
+    const cont_hdr = Http2FrameHeader{
+        .length = @intCast(big_payload.len),
+        .frame_type = .continuation,
+        .flags = H2Connection.FLAG_END_HEADERS,
+        .stream_id = 1,
+    };
+    try c2s.appendSlice(allocator, &cont_hdr.serialize());
+    try c2s.appendSlice(allocator, big_payload);
+
+    // Override max_frame_size to allow the large frame through.
+    server.local_settings.max_frame_size = @intCast(big_payload.len + 1);
+
+    var reader = TestReader{ .data = c2s.items };
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const writer = testWriter(&reply, allocator);
+
+    const result = server.readFrame(&reader);
+    try std.testing.expectError(error.HeaderBlockTooLarge, result);
+
+    _ = writer;
 }

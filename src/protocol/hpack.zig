@@ -688,6 +688,10 @@ pub const DecodedHeader = struct {
 pub const DecodeHeadersOptions = struct {
     max_headers: usize = 256,
     max_decoded_size: usize = 256 * 1024, // 256 KB
+    /// Maximum HPACK dynamic table size allowed via size update instructions.
+    /// Per RFC 7541 §4.2, a value exceeding SETTINGS_HEADER_TABLE_SIZE is a
+    /// decoding error. 0 = use default (4096).
+    max_table_size: usize = 0,
 };
 
 /// Decodes a header block using HPACK with default limits.
@@ -763,9 +767,11 @@ pub fn decodeHeadersWithOptions(
             try ctx.dynamic_table.add(name, value_result.value);
             try headers.append(allocator, .{ .name = name, .value = value_result.value });
         } else if (first & 0x20 != 0) {
-            // Dynamic table size update
+            // Dynamic table size update (RFC 7541 §4.2).
             const size_result = try decodeInteger(data[offset..], 5);
             offset += size_result.len;
+            const max_allowed = if (options.max_table_size > 0) options.max_table_size else 4096;
+            if (size_result.value > max_allowed) return error.DecompressionError;
             ctx.dynamic_table.setMaxSize(@intCast(size_result.value));
         } else {
             // Literal without indexing or never indexed
@@ -1324,4 +1330,68 @@ test "HPACK limits allow valid blocks within bounds" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), headers.len);
+}
+
+test "HPACK rejects dynamic table size update exceeding max_table_size" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Encode a dynamic table size update to 8192 (exceeds default 4096).
+    // 0x20 prefix (5-bit) + value 8192.
+    // 8192 = 0x2000. Using 5-bit prefix: first byte = 0x20 | 0x1F = 0x3F,
+    // then multi-byte integer: 8192 - 31 = 8161. Encode as varint.
+    // Actually, let's use encodeInteger helper.
+    var buf: [16]u8 = undefined;
+    // Dynamic table size update: first byte high 3 bits = 001, 5-bit prefix.
+    // Value 8192: prefix mask = 0x1F = 31. Since 8192 >= 31, multi-byte.
+    buf[0] = 0x20 | 0x1F; // 0x3F
+    // 8192 - 31 = 8161
+    // 8161 = 0x1FE1
+    // byte 1: 8161 % 128 = 97 | 0x80 = 0xE1
+    // 8161 / 128 = 63
+    // byte 2: 63 (< 128, no continuation)
+    buf[1] = 0xE1;
+    buf[2] = 63;
+    const data = buf[0..3];
+
+    // With max_table_size = 4096, this should be rejected.
+    const result = decodeHeadersWithOptions(&ctx, data, allocator, .{
+        .max_table_size = 4096,
+    });
+    try std.testing.expectError(error.DecompressionError, result);
+}
+
+test "HPACK accepts dynamic table size update within max_table_size" {
+    const allocator = std.testing.allocator;
+    var ctx = HpackContext.init(allocator);
+    defer ctx.deinit();
+
+    // Encode a dynamic table size update to 2048 (within default 4096).
+    // 0x20 prefix, value 2048. Since 2048 >= 31: multi-byte.
+    var buf: [16]u8 = undefined;
+    buf[0] = 0x3F; // 0x20 | 0x1F
+    // 2048 - 31 = 2017
+    // 2017 % 128 = 97 | 0x80 = 0xE1
+    // 2017 / 128 = 15 (< 128)
+    buf[1] = 0xE1;
+    buf[2] = 15;
+
+    // Follow with a simple indexed header so we get valid output.
+    buf[3] = 0x82; // :method GET
+    const data = buf[0..4];
+
+    const headers = try decodeHeadersWithOptions(&ctx, data, allocator, .{
+        .max_table_size = 4096,
+    });
+    defer {
+        for (headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqual(@as(usize, 2048), ctx.dynamic_table.max_size);
 }

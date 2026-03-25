@@ -739,6 +739,13 @@ pub const Server = struct {
             // client knows it's safe to send the body.
             if (req.headers.get(HeaderName.EXPECT)) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+                    // Reject before telling client to send, if Content-Length exceeds limit.
+                    if (parser.content_length) |cl| {
+                        if (cl > self.config.max_body_size) {
+                            try sock.sendAll("HTTP/1.1 413 Content Too Large\r\n\r\n");
+                            return;
+                        }
+                    }
                     try sock.sendAll("HTTP/1.1 100 Continue\r\n\r\n");
                 }
             }
@@ -869,6 +876,7 @@ pub const Server = struct {
 
         // 3. Create H2 connection and apply peer settings.
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        h2.max_stream_data_size = self.config.max_body_size;
         defer h2.deinit();
         try http.applySettingsPayload(&h2.peer_settings, settings_payload);
 
@@ -959,6 +967,7 @@ pub const Server = struct {
     /// backend doesn't support concurrency).
     fn handleH2Connection(self: *Self, sock: *Socket, initial_data: []const u8) !void {
         var h2 = H2Connection.initServer(self.allocator, self.io);
+        h2.max_stream_data_size = self.config.max_body_size;
         defer h2.deinit();
 
         // Wrap socket in a reader that first yields `initial_data`, then reads from socket.

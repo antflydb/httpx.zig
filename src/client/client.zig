@@ -453,6 +453,7 @@ pub const Client = struct {
         }
 
         entry.h2 = H2Connection.initClient(self.allocator, self.io);
+        entry.h2.max_stream_data_size = self.config.max_response_size;
         errdefer entry.h2.deinit();
 
         // Perform h2 handshake: preface + SETTINGS exchange.
@@ -844,6 +845,7 @@ pub const Client = struct {
     /// send request as HEADERS (+DATA) → read response HEADERS + DATA frames.
     fn executeH2Request(self: *Self, reader: anytype, writer: anytype, req: *Request) !Response {
         var h2 = H2Connection.initClient(self.allocator, self.io);
+        h2.max_stream_data_size = self.config.max_response_size;
         defer h2.deinit();
 
         // 1. Connection preface + SETTINGS.

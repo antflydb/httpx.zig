@@ -377,6 +377,17 @@ pub fn parseHeadersFramePayload(
     flags: u8,
     allocator: Allocator,
 ) !struct { headers: []hpack.DecodedHeader, priority: ?StreamPriority } {
+    return parseHeadersFramePayloadWithOptions(stream_manager, payload, flags, allocator, .{});
+}
+
+/// Parses a HEADERS frame payload with configurable HPACK decode options.
+pub fn parseHeadersFramePayloadWithOptions(
+    stream_manager: *StreamManager,
+    payload: []const u8,
+    flags: u8,
+    allocator: Allocator,
+    hpack_options: hpack.DecodeHeadersOptions,
+) !struct { headers: []hpack.DecodedHeader, priority: ?StreamPriority } {
     var offset: usize = 0;
     var priority: ?StreamPriority = null;
 
@@ -405,10 +416,11 @@ pub fn parseHeadersFramePayload(
     if (pad_length > payload.len - offset) return error.InvalidFrame;
     const header_block_len = payload.len - offset - pad_length;
 
-    const headers = try hpack.decodeHeaders(
+    const headers = try hpack.decodeHeadersWithOptions(
         &stream_manager.hpack_ctx,
         payload[offset .. offset + header_block_len],
         allocator,
+        hpack_options,
     );
 
     return .{ .headers = headers, .priority = priority };
