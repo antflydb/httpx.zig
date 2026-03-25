@@ -126,6 +126,9 @@ pub const Client = struct {
     tls_pool: TlsPool,
     /// Cached HTTP/2 connections keyed by "host:port".
     h2_conns: std.StringHashMapUnmanaged(*H2PoolEntry) = .{},
+    /// Protects h2_conns from concurrent fiber access during connection
+    /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
+    h2_mutex: Io.Mutex = Io.Mutex.init,
 
     const Self = @This();
 
@@ -411,6 +414,9 @@ pub const Client = struct {
     /// The connection preface and SETTINGS exchange happen once on creation;
     /// subsequent requests reuse the same TCP/TLS + H2Connection state.
     fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
+        self.h2_mutex.lockUncancelable(self.io);
+        defer self.h2_mutex.unlock(self.io);
+
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
 

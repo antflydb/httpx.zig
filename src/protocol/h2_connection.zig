@@ -408,7 +408,21 @@ pub const H2Connection = struct {
 
     /// Handles a received WINDOW_UPDATE frame.
     pub fn handleWindowUpdate(self: *Self, frame: *const Frame) !void {
-        const increment = try stream_mod.parseWindowUpdatePayload(frame.payload);
+        const increment = stream_mod.parseWindowUpdatePayload(frame.payload) catch |err| {
+            // RFC 7540 §6.9.1: increment=0 on a stream is a stream error
+            // (PROTOCOL_ERROR), not a connection error. Only connection-level
+            // WINDOW_UPDATE(0) kills the connection.
+            if (err == error.ProtocolError and frame.header.stream_id != 0) {
+                if (self.stream_manager.getStream(frame.header.stream_id)) |s| {
+                    s.stream_error = error.ProtocolError;
+                    s.completed = true;
+                    if (s.data_event) |ev| ev.set(self.io);
+                    if (s.completion_sem) |sem| sem.post(self.io);
+                }
+                return;
+            }
+            return err;
+        };
         if (frame.header.stream_id == 0) {
             try self.stream_manager.updateConnectionSendWindow(@intCast(increment));
         } else {
@@ -791,6 +805,8 @@ pub const H2Connection = struct {
                 }
             },
             .rst_stream => {
+                // RFC 7540 §6.4: RST_STREAM frames MUST be exactly 4 octets.
+                if (frame.payload.len != 4) return error.FrameSizeError;
                 // RFC 7540 §5.1: RST_STREAM on an idle stream is a
                 // connection error (PROTOCOL_ERROR).
                 if (stream.state == .idle) return error.ProtocolError;
@@ -821,16 +837,26 @@ pub const H2Connection = struct {
                 // RFC 7540 §5.1: late frame for a closed stream — send
                 // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
                 error.ClosedStream => {
+                    // Undo connection-level window accumulation: deliverToMailbox
+                    // returned before decrementing connection_recv_window, so the
+                    // credit we accumulated above is unmatched.
+                    if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                        const len: u32 = @intCast(@min(sf.payload.len, @as(usize, @intCast(std.math.maxInt(u32)))));
+                        self.pending_conn_window_update -|= len;
+                    }
                     self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                     return sf.header.stream_id;
                 },
                 else => return err,
             };
             // Flush window credit on stream completion or reset.
-            if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
-                sf.header.frame_type == .rst_stream)
-            {
+            if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
                 try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
+                try self.flushConnWindowUpdate(writer);
+            } else if (sf.header.frame_type == .rst_stream) {
+                // RFC 7540 §5.1: MUST NOT send frames other than PRIORITY on
+                // a closed stream. Skip stream-level WINDOW_UPDATE; only flush
+                // connection-level credit.
                 try self.flushConnWindowUpdate(writer);
             }
             return sf.header.stream_id;
@@ -862,16 +888,22 @@ pub const H2Connection = struct {
                 // ensuring the shared hpack_ctx is not accessed concurrently.
                 self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                     error.ClosedStream => {
+                        if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                            const len: u32 = @intCast(@min(sf.payload.len, @as(usize, @intCast(std.math.maxInt(u32)))));
+                            self.pending_conn_window_update -|= len;
+                        }
                         self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                         return sf.header.stream_id;
                     },
                     else => return err,
                 };
                 // Flush window credit on stream completion or reset.
-                if ((sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) or
-                    sf.header.frame_type == .rst_stream)
-                {
+                if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
                     try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
+                    try self.flushConnWindowUpdate(writer);
+                } else if (sf.header.frame_type == .rst_stream) {
+                    // RFC 7540 §5.1: skip stream-level WINDOW_UPDATE for
+                    // closed streams; only flush connection-level credit.
                     try self.flushConnWindowUpdate(writer);
                 }
                 return sf.header.stream_id;
