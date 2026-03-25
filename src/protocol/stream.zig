@@ -97,6 +97,12 @@ pub const Stream = struct {
     /// Optional semaphore posted by the receive loop when this stream completes.
     /// Owned by the requesting fiber (stack-allocated); the receive loop only calls post().
     completion_sem: ?*Io.Semaphore = null,
+    /// Semaphore posted by the receive loop on every DATA frame and on HEADERS.
+    /// Consumer fibers wait on this to read data incrementally.
+    /// Owned by the consumer fiber; the receive loop only calls post().
+    data_sem: ?*Io.Semaphore = null,
+    /// Read cursor into data_buf for incremental consumption.
+    read_offset: usize = 0,
 
     const Self = @This();
 

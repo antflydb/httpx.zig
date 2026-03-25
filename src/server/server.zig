@@ -88,11 +88,18 @@ pub const ServerConfig = struct {
 /// Request context passed to handlers.
 pub const Context = struct {
     allocator: Allocator,
+    io: Io,
     request: *Request,
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
     data: ?std.StringHashMap(DataEntry) = null,
     max_file_size: usize = types.default_max_body_size,
+
+    // H2 streaming fields (set by the server for H2 streams, null for HTTP/1.1).
+    h2: ?*H2Connection = null,
+    h2_sock: ?*Socket = null,
+    h2_stream_id: u31 = 0,
+    h2_stream_sent: bool = false,
 
     /// Entry in the context data map with an optional destructor for cleanup.
     pub const DataEntry = struct {
@@ -103,9 +110,10 @@ pub const Context = struct {
     const Self = @This();
 
     /// Creates a new context for a request.
-    pub fn init(allocator: Allocator, req: *Request) Self {
+    pub fn init(allocator: Allocator, io: Io, req: *Request) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .request = req,
             .response = ResponseBuilder.init(allocator),
         };
@@ -312,6 +320,55 @@ pub const Context = struct {
         _ = try self.response.header(HeaderName.LOCATION, url);
         return self.response.build();
     }
+
+    /// Writer for server-side HTTP/2 streaming responses.
+    /// Acquired via `ctx.streamH2()`. Each `write()` sends DATA frame(s)
+    /// without END_STREAM. Call `close()` to send END_STREAM.
+    pub const H2StreamWriter = struct {
+        h2: *H2Connection,
+        sock: *Socket,
+        stream_id: u31,
+        io: Io,
+        closed: bool = false,
+
+        /// Sends data as DATA frames without END_STREAM.
+        pub fn write(self: *H2StreamWriter, data: []const u8) !void {
+            if (self.closed) return error.StreamClosed;
+            self.h2.write_mutex.lockUncancelable(self.io);
+            defer self.h2.write_mutex.unlock(self.io);
+            try self.h2.writeData(self.sock, self.stream_id, data, false);
+        }
+
+        /// Sends END_STREAM and marks the writer done.
+        pub fn close(self: *H2StreamWriter) !void {
+            if (self.closed) return;
+            self.closed = true;
+            self.h2.write_mutex.lockUncancelable(self.io);
+            defer self.h2.write_mutex.unlock(self.io);
+            try self.h2.writeData(self.sock, self.stream_id, &.{}, true);
+        }
+    };
+
+    /// Sends HEADERS (without END_STREAM) and returns a writer for incremental
+    /// DATA frames. The handler must call `writer.close()` when done.
+    /// Only available for HTTP/2 streams.
+    pub fn streamH2(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry) !H2StreamWriter {
+        const h2 = self.h2 orelse return error.NotH2;
+        const sock = self.h2_sock orelse return error.NotH2;
+
+        var status_buf: [3]u8 = undefined;
+        const h2_headers = try H2Connection.buildResponseHeaders(
+            status_code, extra_headers, &status_buf, self.allocator,
+        );
+        defer self.allocator.free(h2_headers);
+
+        h2.write_mutex.lockUncancelable(self.io);
+        defer h2.write_mutex.unlock(self.io);
+        try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
+
+        self.h2_stream_sent = true;
+        return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io };
+    }
 };
 
 /// Handler function type.
@@ -467,10 +524,7 @@ pub const Server = struct {
         }
 
         // Wait for all in-flight connections to finish before returning.
-        self.connections.await(self.io) catch |err| switch (err) {
-            error.Canceled => {},
-            else => std.debug.print("Server shutdown error: {}\n", .{err}),
-        };
+        self.connections.await(self.io) catch {};
     }
 
     /// Stops the server immediately, cancelling all in-flight connections.
@@ -547,10 +601,10 @@ pub const Server = struct {
             // Wall-clock deadline prevents slow-loris attacks where an attacker
             // trickles bytes just fast enough to avoid per-recv timeouts.
             const active_timeout = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
-            const deadline_ms: i64 = if (active_timeout > 0) milliTimestamp() + @as(i64, @intCast(active_timeout)) else 0;
+            const deadline_ms: i64 = if (active_timeout > 0) milliTimestamp(self.io) + @as(i64, @intCast(active_timeout)) else 0;
 
             while (!parser.isComplete()) {
-                if (deadline_ms > 0 and milliTimestamp() >= deadline_ms) {
+                if (deadline_ms > 0 and milliTimestamp(self.io) >= deadline_ms) {
                     try self.sendError(&sock, 408);
                     return;
                 }
@@ -617,7 +671,7 @@ pub const Server = struct {
                 return self.handleH2cUpgrade(&sock, &req);
             }
 
-            var ctx = Context.init(self.allocator, &req);
+            var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
             defer ctx.deinit();
 
@@ -686,7 +740,7 @@ pub const Server = struct {
             }
 
             try ensureContentLengthHeader(&response);
-            try ensureDateHeader(&response);
+            try ensureDateHeader(self.io, &response);
 
             try sendBuffered(&sock, &response);
 
@@ -824,10 +878,7 @@ pub const Server = struct {
         var stream_fibers = Io.Group.init;
         defer {
             // Wait for all in-flight handler fibers to finish.
-            stream_fibers.await(self.io) catch |err| switch (err) {
-                error.Canceled => {},
-                else => {},
-            };
+            stream_fibers.await(self.io) catch {};
             // Send GOAWAY with no_error if we haven't already, so the peer
             // can distinguish a clean close from a truncation.
             if (!h2.goaway_sent) {
@@ -933,8 +984,11 @@ pub const Server = struct {
     /// Routes a request through middleware and sends the H2 response.
     /// Shared between normal H2 streams (from HPACK) and h2c upgrade (from HTTP/1.1).
     fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request) !void {
-        var ctx = Context.init(self.allocator, req);
+        var ctx = Context.init(self.allocator, self.io, req);
         ctx.max_file_size = self.config.max_file_size;
+        ctx.h2 = h2;
+        ctx.h2_sock = sock;
+        ctx.h2_stream_id = stream_id;
         defer ctx.deinit();
 
         for (self.pre_route_hooks.items) |hook| {
@@ -960,11 +1014,17 @@ pub const Server = struct {
         var response: Response = undefined;
         if (route_result) |r| {
             response = self.executeMiddleware(&ctx, r.handler) catch {
-                try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
                 return;
             };
         } else {
             response = Response.init(self.allocator, 404);
+        }
+
+        // If the handler used streamH2(), it already sent HEADERS+DATA.
+        if (ctx.h2_stream_sent) {
+            response.deinit();
+            return;
         }
         defer response.deinit();
 
@@ -1027,24 +1087,23 @@ pub const Server = struct {
         defer resp.deinit();
 
         try ensureContentLengthHeader(&resp);
-        try ensureDateHeader(&resp);
+        try ensureDateHeader(self.io, &resp);
 
         try sendBuffered(socket, &resp);
     }
 
     /// Serializes a response through a buffered writer to reduce syscalls.
     fn sendBuffered(socket: *Socket, resp: *Response) !void {
-        var bw = std.io.BufferedWriter(16384, @TypeOf(socket.writer())){ .unbuffered_writer = socket.writer() };
-        try resp.serialize(bw.writer().any());
-        try bw.flush();
+        try resp.serialize(socket.writer());
     }
 
     /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field
     /// in IMF-fixdate format: e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
-    fn ensureDateHeader(response: *Response) !void {
+    fn ensureDateHeader(io: Io, response: *Response) !void {
         if (response.headers.get(HeaderName.DATE) != null) return;
         const epoch = std.time.epoch;
-        const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
+        const now = Io.Clock.real.now(io);
+        const ts: u64 = @intCast(@max(@divFloor(now.nanoseconds, std.time.ns_per_s), 0));
         const es = epoch.EpochSeconds{ .secs = ts };
         const day_secs = es.getDaySeconds();
         const epoch_day = es.getEpochDay();
@@ -1229,7 +1288,7 @@ test "Context response helpers" {
     var req = try Request.init(allocator, .GET, "/test");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, &req);
+    var ctx = Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
     _ = ctx.status(201);
@@ -1253,7 +1312,7 @@ test "Context query parsing" {
     var req = try Request.init(allocator, .GET, "/search?q=zig&lang=en");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, &req);
+    var ctx = Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
     try std.testing.expectEqualStrings("zig", ctx.query("q").?);
@@ -1267,7 +1326,7 @@ test "Context cookie helpers" {
     defer req.deinit();
     try req.headers.set(HeaderName.COOKIE, "session=abc123; theme=dark");
 
-    var ctx = Context.init(allocator, &req);
+    var ctx = Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
     try std.testing.expectEqualStrings("abc123", ctx.cookie("session").?);
@@ -1350,7 +1409,7 @@ test "Context max_file_size default and override" {
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, &req);
+    var ctx = Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
     // Default should match ServerConfig default.
@@ -1366,7 +1425,7 @@ test "Context file rejects path traversal" {
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, &req);
+    var ctx = Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
 
     var response = try ctx.file("../etc/passwd");

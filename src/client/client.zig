@@ -49,6 +49,7 @@ const flate = std.compress.flate;
 const h2_mod = @import("../protocol/h2_connection.zig");
 const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
+const Stream = @import("../protocol/stream.zig").Stream;
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
@@ -373,9 +374,7 @@ pub const Client = struct {
     /// Sends request and reads response over a plain TCP socket.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
-        var bw = std.io.bufferedWriter(socket.writer());
-        try req.serialize(bw.writer().any());
-        try bw.flush();
+        try req.serialize(socket.writer());
         var res = try self.readResponse(socket, req.method);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
@@ -636,6 +635,175 @@ pub const Client = struct {
         }
 
         return res;
+    }
+
+    /// Incremental reader for an HTTP/2 response body.
+    /// Reads DATA frame payloads as they arrive from the receive loop.
+    pub const H2StreamReader = struct {
+        stream: *Stream,
+        io: Io,
+        h2: *H2Connection,
+        data_sem: *Io.Semaphore,
+        allocator: Allocator,
+
+        /// Reads up to `buf.len` bytes. Blocks until data is available. Returns 0 at EOF.
+        pub fn read(self: *H2StreamReader, buf: []u8) !usize {
+            while (true) {
+                const avail = self.stream.data_buf.items.len - self.stream.read_offset;
+                if (avail > 0) {
+                    const n = @min(avail, buf.len);
+                    const start = self.stream.read_offset;
+                    @memcpy(buf[0..n], self.stream.data_buf.items[start..][0..n]);
+                    self.stream.read_offset += n;
+                    return n;
+                }
+                if (self.stream.completed) return 0;
+                if (self.stream.stream_error) |err| return err;
+                self.data_sem.waitUncancelable(self.io);
+            }
+        }
+
+        /// Releases the stream. Must be called when done reading.
+        pub fn close(self: *H2StreamReader) void {
+            self.stream.data_sem = null;
+            self.stream.completion_sem = null;
+            self.h2.stream_manager.removeStream(self.stream.id);
+            self.allocator.destroy(self.data_sem);
+        }
+    };
+
+    /// Response from a streaming H2 request. Contains response headers
+    /// and an incremental reader for the response body.
+    pub const H2StreamResponse = struct {
+        status_code: u16,
+        headers: Headers,
+        reader: H2StreamReader,
+
+        pub fn deinit(self: *H2StreamResponse) void {
+            self.reader.close();
+            self.headers.deinit();
+        }
+    };
+
+    /// Sends an HTTP/2 request and returns response headers + an incremental
+    /// body reader. The caller reads DATA frames as they arrive without
+    /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
+    pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
+        const host = req.uri.host orelse return error.InvalidUri;
+        const is_tls = if (req.uri.scheme) |s| mem.eql(u8, s, "https") else false;
+        const port = req.uri.port orelse if (is_tls) @as(u16, 443) else @as(u16, 80);
+        const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+        if (!entry.recv_running) return error.MultiplexingRequired;
+
+        const h2 = &entry.h2;
+        const stream = try h2.stream_manager.createStream();
+        const stream_id = stream.id;
+
+        // Heap-allocate semaphore for pointer stability.
+        const data_sem = try self.allocator.create(Io.Semaphore);
+        data_sem.* = .{ .permits = 0 };
+        stream.data_sem = data_sem;
+
+        // Build request pseudo-headers.
+        const method_str = if (req.method == .CUSTOM)
+            req.custom_method orelse "CUSTOM"
+        else
+            req.method.toString();
+        const scheme = req.uri.scheme orelse "http";
+        const authority = host;
+        var path_buf = std.ArrayListUnmanaged(u8).empty;
+        defer path_buf.deinit(self.allocator);
+        const alw = arrayListWriter(&path_buf, self.allocator);
+        try alw.writeAll(req.uri.path);
+        if (req.uri.query) |q| {
+            try alw.writeAll("?");
+            try alw.writeAll(q);
+        }
+        const path = path_buf.items;
+
+        var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+        defer extra.deinit(self.allocator);
+        for (req.headers.entries.items) |he| {
+            if (std.ascii.eqlIgnoreCase(he.name, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "connection")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "transfer-encoding")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "upgrade")) continue;
+            try extra.append(self.allocator, .{ .name = he.name, .value = he.value });
+        }
+
+        const h2_headers = try H2Connection.buildRequestHeaders(
+            method_str, path, scheme, authority, extra.items, self.allocator,
+        );
+        defer self.allocator.free(h2_headers);
+
+        const has_body = req.body != null;
+
+        // Send request frames under write mutex.
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            if (entry.is_tls) {
+                const w = try entry.session.getWriter();
+                try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+            } else {
+                try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+            }
+        }
+
+        // Wait for HEADERS response (not END_STREAM).
+        while (!stream.got_headers and !stream.completed) {
+            data_sem.waitUncancelable(self.io);
+        }
+        if (stream.stream_error) |err| {
+            self.allocator.destroy(data_sem);
+            return err;
+        }
+
+        // Decode response headers.
+        const hp = stream.headers_payload orelse {
+            self.allocator.destroy(data_sem);
+            return error.InvalidResponse;
+        };
+        const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
+        defer {
+            for (decoded.headers) |*dh| {
+                self.allocator.free(dh.name);
+                self.allocator.free(dh.value);
+            }
+            self.allocator.free(decoded.headers);
+        }
+
+        var status_code: ?u16 = null;
+        var response_headers = Headers.init(self.allocator);
+        errdefer response_headers.deinit();
+
+        for (decoded.headers) |h| {
+            if (mem.eql(u8, h.name, ":status")) {
+                status_code = std.fmt.parseInt(u16, h.value, 10) catch {
+                    self.allocator.destroy(data_sem);
+                    return error.InvalidResponse;
+                };
+            } else if (h.name.len > 0 and h.name[0] != ':') {
+                try response_headers.append(h.name, h.value);
+            }
+        }
+
+        return .{
+            .status_code = status_code orelse {
+                self.allocator.destroy(data_sem);
+                return error.InvalidResponse;
+            },
+            .headers = response_headers,
+            .reader = .{
+                .stream = stream,
+                .io = self.io,
+                .h2 = h2,
+                .data_sem = data_sem,
+                .allocator = self.allocator,
+            },
+        };
     }
 
     /// Executes a single HTTP/2 request over an already-connected reader/writer pair.

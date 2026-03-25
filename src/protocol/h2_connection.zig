@@ -478,6 +478,7 @@ pub const H2Connection = struct {
                 stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
                 stream.headers_flags = frame.header.flags;
                 stream.got_headers = true;
+                if (stream.data_sem) |sem| sem.post(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
@@ -486,10 +487,12 @@ pub const H2Connection = struct {
             },
             .data => {
                 try stream.data_buf.appendSlice(self.allocator, frame.payload);
+                if (stream.data_sem) |sem| sem.post(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
                     if (stream.completion_sem) |sem| sem.post(self.io);
+                    if (stream.data_sem) |sem| sem.post(self.io);
                 }
             },
             .rst_stream => {
@@ -497,6 +500,7 @@ pub const H2Connection = struct {
                 stream.completed = true;
                 stream.reset();
                 if (stream.completion_sem) |sem| sem.post(self.io);
+                if (stream.data_sem) |sem| sem.post(self.io);
             },
             else => {},
         }
@@ -1226,6 +1230,68 @@ test "mailbox-based request-response round-trip" {
     }
     try std.testing.expectEqualStrings(":status", rdec.headers[0].name);
     try std.testing.expectEqualStrings("201", rdec.headers[0].value);
+}
+
+test "deliverToMailbox incremental DATA without END_STREAM" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+
+    // Deliver a DATA frame without END_STREAM.
+    var payload1 = try allocator.dupe(u8, "chunk1");
+    defer allocator.free(payload1);
+    var frame1 = Frame{
+        .header = .{
+            .length = @intCast(payload1.len),
+            .frame_type = .data,
+            .flags = 0, // no END_STREAM
+            .stream_id = 1,
+        },
+        .payload = payload1,
+    };
+    try server.deliverToMailbox(&frame1);
+
+    // Stream should have data but NOT be completed.
+    try std.testing.expectEqualStrings("chunk1", stream.data_buf.items);
+    try std.testing.expect(!stream.completed);
+    try std.testing.expectEqual(@as(usize, 0), stream.read_offset);
+
+    // Deliver a second DATA frame without END_STREAM.
+    var payload2 = try allocator.dupe(u8, "chunk2");
+    defer allocator.free(payload2);
+    var frame2 = Frame{
+        .header = .{
+            .length = @intCast(payload2.len),
+            .frame_type = .data,
+            .flags = 0,
+            .stream_id = 1,
+        },
+        .payload = payload2,
+    };
+    try server.deliverToMailbox(&frame2);
+
+    try std.testing.expectEqualStrings("chunk1chunk2", stream.data_buf.items);
+    try std.testing.expect(!stream.completed);
+
+    // Deliver a final DATA frame WITH END_STREAM.
+    var payload3 = try allocator.dupe(u8, "chunk3");
+    defer allocator.free(payload3);
+    var frame3 = Frame{
+        .header = .{
+            .length = @intCast(payload3.len),
+            .frame_type = .data,
+            .flags = H2Connection.FLAG_END_STREAM,
+            .stream_id = 1,
+        },
+        .payload = payload3,
+    };
+    try server.deliverToMailbox(&frame3);
+
+    try std.testing.expectEqualStrings("chunk1chunk2chunk3", stream.data_buf.items);
+    try std.testing.expect(stream.completed);
 }
 
 test "h2 round-trip over TCP loopback" {
