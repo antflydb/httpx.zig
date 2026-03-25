@@ -407,3 +407,31 @@ test "socket" {
 test "address" {
     _ = address;
 }
+
+test "tls" {
+    _ = tls;
+}
+
+test "server" {
+    _ = server_mod;
+}
+
+test "router" {
+    _ = router;
+}
+
+test "middleware" {
+    _ = middleware;
+}
+
+test "client" {
+    _ = client_mod;
+}
+
+test "pool" {
+    _ = pool;
+}
+
+test "concurrency" {
+    _ = concurrency;
+}

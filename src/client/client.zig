@@ -279,7 +279,7 @@ pub const Client = struct {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
-                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .monotonic) catch {};
+                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
                     }
                     continue;
                 }
@@ -291,7 +291,7 @@ pub const Client = struct {
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
                 if (delay_ms > 0) {
-                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .monotonic) catch {};
+                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
                 }
                 continue;
             }
@@ -1331,7 +1331,7 @@ test "Client with config" {
 
 test "Response parsing" {
     const allocator = std.testing.allocator;
-    const data = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}";
+    const data = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
 
     var parser = Parser.initResponse(allocator);
     defer parser.deinit();
@@ -1503,6 +1503,56 @@ test "SliceIoReader reads slice data" {
     // Second read should return EndOfStream.
     var iov2 = [_][]u8{out[0..]};
     try std.testing.expectError(error.EndOfStream, reader.reader_iface.readVec(&iov2));
+}
+
+test "H2StreamReader reads pre-buffered data and returns EOF" {
+    const allocator = std.testing.allocator;
+
+    // Set up an H2Connection with a stream that has pre-buffered data.
+    var h2 = H2Connection.initClient(allocator, std.testing.io);
+    defer h2.deinit();
+
+    const stream = try h2.stream_manager.createStream();
+    const stream_id = stream.id;
+
+    // Simulate receive loop having delivered data.
+    try stream.data_buf.appendSlice(allocator, "hello world");
+    stream.completed = true; // END_STREAM already received
+
+    // Create a heap-allocated semaphore (as requestStream would).
+    const data_sem = try allocator.create(Io.Semaphore);
+    data_sem.* = .{ .permits = 0 };
+    stream.data_sem = data_sem;
+
+    var reader = Client.H2StreamReader{
+        .stream = stream,
+        .io = std.testing.io,
+        .h2 = &h2,
+        .data_sem = data_sem,
+        .allocator = allocator,
+    };
+
+    // Read first chunk.
+    var buf: [5]u8 = undefined;
+    const n1 = try reader.read(&buf);
+    try std.testing.expectEqual(@as(usize, 5), n1);
+    try std.testing.expectEqualStrings("hello", &buf);
+
+    // Read second chunk.
+    var buf2: [10]u8 = undefined;
+    const n2 = try reader.read(&buf2);
+    try std.testing.expectEqual(@as(usize, 6), n2);
+    try std.testing.expectEqualStrings(" world", buf2[0..n2]);
+
+    // Next read should return 0 (EOF) since completed=true and no more data.
+    const n3 = try reader.read(&buf2);
+    try std.testing.expectEqual(@as(usize, 0), n3);
+
+    // Clean up — close frees the semaphore and removes the stream.
+    reader.close();
+
+    // Verify stream was removed.
+    try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
 }
 
 // Tests for decompressBody and responseFromParser were removed — these methods

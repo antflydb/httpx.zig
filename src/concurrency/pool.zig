@@ -317,6 +317,6 @@ test "race empty" {
     var client = Client.init(allocator, std.testing.io);
     defer client.deinit();
 
-    const result = race(allocator, &client, &.{});
+    const result = try race(allocator, &client, &.{});
     try std.testing.expect(result == .err);
 }

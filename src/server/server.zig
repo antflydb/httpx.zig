@@ -242,17 +242,17 @@ pub const Context = struct {
             return self.status(403).text("Forbidden");
         }
 
-        const f = std.fs.cwd().openFile(path, .{ .no_follow = true }) catch return self.status(404).text("Not Found");
-        defer f.close();
+        const f = Io.Dir.cwd().openFile(self.io, path, .{}) catch return self.status(404).text("Not Found");
+        defer f.close(self.io);
 
-        const stat = try f.stat();
+        const stat = f.stat(self.io) catch return self.status(404).text("Not Found");
         if (stat.size > self.max_file_size) {
             return self.status(413).text("File Too Large");
         }
 
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
         errdefer self.allocator.free(content);
-        _ = try f.readAll(content);
+        _ = f.readPositionalAll(self.io, content, 0) catch return self.status(500).text("Read Error");
 
         _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
         self.response.body_data = content;
@@ -1440,9 +1440,9 @@ test "Parser max_headers is configurable" {
     defer parser.deinit();
     parser.max_headers = 2;
 
-    // Feed a request with 3 headers — should trigger error state.
-    _ = try parser.feed("GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n");
-    try std.testing.expect(parser.isError());
+    // Feed a request with 3 headers — should trigger TooManyHeaders error.
+    const result = parser.feed("GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n");
+    try std.testing.expectError(error.TooManyHeaders, result);
 }
 
 test "Parser max_body_size is configurable" {
@@ -1454,4 +1454,58 @@ test "Parser max_body_size is configurable" {
     _ = try parser.feed("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
     // Content-Length 10 > max_body_size 4, should be error state.
     try std.testing.expect(parser.isError());
+}
+
+test "Context.streamH2 returns NotH2 for HTTP/1.1 context" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    // h2 fields are null by default (HTTP/1.1 context).
+    try std.testing.expectError(error.NotH2, ctx.streamH2(200, &.{}));
+}
+
+test "H2StreamWriter write and close" {
+    const allocator = std.testing.allocator;
+
+    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    defer h2.deinit();
+
+    // Create a stream so writeData can find it.
+    _ = try h2.stream_manager.getOrCreateStream(1);
+
+    // Write to an in-memory buffer via a TestWriter.
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(allocator);
+    const TestWriter = struct {
+        list: *std.ArrayListUnmanaged(u8),
+        alloc: Allocator,
+        pub fn writeAll(self: @This(), data: []const u8) !void {
+            try self.list.appendSlice(self.alloc, data);
+        }
+    };
+    var sock_stub = TestWriter{ .list = &buf, .alloc = allocator };
+
+    // Cast the stub to a Socket pointer isn't feasible, so test the
+    // underlying H2Connection.writeData directly (what H2StreamWriter calls).
+    // Send DATA without END_STREAM.
+    try h2.writeData(&sock_stub, 1, "chunk1", false);
+    const first_len = buf.items.len;
+    try std.testing.expect(first_len > 6); // 9-byte frame header + "chunk1"
+
+    try h2.writeData(&sock_stub, 1, "chunk2", false);
+    try std.testing.expect(buf.items.len > first_len);
+
+    // Send END_STREAM.
+    try h2.writeData(&sock_stub, 1, &.{}, true);
+
+    // Verify last frame has END_STREAM flag. The frame header is 9 bytes;
+    // the last frame is an empty DATA frame with END_STREAM.
+    // Find the last 9-byte frame header.
+    const last_frame_start = buf.items.len - 9; // empty payload, just header
+    const flags = buf.items[last_frame_start + 4];
+    try std.testing.expect(flags & H2Connection.FLAG_END_STREAM != 0);
 }

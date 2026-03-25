@@ -742,6 +742,62 @@ test "TcpListener accept" {
     defer result.socket.close();
 }
 
+test "Socket.writer writeAll and print over TCP" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
+    // Client writes using SocketWriter.
+    var client = try Socket.connect(bound_addr, io);
+    defer client.close();
+
+    const w = client.writer();
+    try w.writeAll("GET / HTTP/1.1\r\n");
+    try w.print("Host: {s}\r\n", .{"localhost"});
+    try w.writeAll("\r\n");
+
+    // Server reads and verifies.
+    var result = try listener.accept();
+    defer result.socket.close();
+
+    var buf: [256]u8 = undefined;
+    var total: usize = 0;
+    while (total < "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".len) {
+        const n = try result.socket.recv(buf[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", buf[0..total]);
+
+    // Also verify Request.serialize works through SocketWriter.
+    const Request = @import("../core/request.zig").Request;
+    var req = try Request.init(allocator, .GET, "/test");
+    defer req.deinit();
+    try req.headers.set("Host", "example.com");
+
+    var client2 = try Socket.connect(bound_addr, io);
+    defer client2.close();
+    const w2 = client2.writer();
+    try req.serialize(w2);
+
+    var result2 = try listener.accept();
+    defer result2.socket.close();
+
+    var buf2: [512]u8 = undefined;
+    var total2: usize = 0;
+    while (total2 < 4) { // read at least request line
+        const n = try result2.socket.recv(buf2[total2..]);
+        if (n == 0) break;
+        total2 += n;
+    }
+    // Verify the request line was serialized correctly.
+    try std.testing.expect(std.mem.startsWith(u8, buf2[0..total2], "GET /test"));
+}
+
 test "UdpSocket send/recv localhost" {
     const io = std.testing.io;
 

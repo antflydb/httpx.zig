@@ -1294,6 +1294,160 @@ test "deliverToMailbox incremental DATA without END_STREAM" {
     try std.testing.expect(stream.completed);
 }
 
+test "h2 streaming: server sends incremental DATA, client reads chunks" {
+    const allocator = std.testing.allocator;
+
+    // Server: send HEADERS (no END_STREAM) + 3 DATA chunks + END_STREAM.
+    var s2c = std.ArrayListUnmanaged(u8).empty;
+    defer s2c.deinit(allocator);
+    const s2c_w = testWriter(&s2c, allocator);
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    _ = stream;
+
+    var status_buf: [3]u8 = undefined;
+    const resp_headers = try H2Connection.buildResponseHeaders(200, &.{}, &status_buf, allocator);
+    defer allocator.free(resp_headers);
+
+    // Send HEADERS without END_STREAM.
+    try server.sendHeaders(s2c_w, 1, resp_headers, false);
+
+    // Send 3 DATA chunks without END_STREAM.
+    try server.writeData(s2c_w, 1, "chunk1", false);
+    try server.writeData(s2c_w, 1, "chunk2", false);
+    try server.writeData(s2c_w, 1, "chunk3", true); // END_STREAM
+
+    // Client: read the frames and verify incremental delivery.
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+
+    // Client must have stream 1 registered (normally created when sending the request).
+    _ = try client.stream_manager.createStream();
+
+    var reader = TestReader{ .data = s2c.items };
+
+    // Process HEADERS frame.
+    const sid1 = try client.processOneFrame(&reader, s2c_w);
+    try std.testing.expectEqual(@as(?u31, 1), sid1);
+    const cs = client.stream_manager.getStream(1).?;
+    try std.testing.expect(cs.got_headers);
+    try std.testing.expect(!cs.completed);
+
+    // Process first DATA frame — should have "chunk1" but not be completed.
+    _ = try client.processOneFrame(&reader, s2c_w);
+    try std.testing.expectEqualStrings("chunk1", cs.data_buf.items);
+    try std.testing.expect(!cs.completed);
+
+    // Process second DATA frame — accumulated data.
+    _ = try client.processOneFrame(&reader, s2c_w);
+    try std.testing.expectEqualStrings("chunk1chunk2", cs.data_buf.items);
+    try std.testing.expect(!cs.completed);
+
+    // Process third DATA frame with END_STREAM.
+    _ = try client.processOneFrame(&reader, s2c_w);
+    try std.testing.expectEqualStrings("chunk1chunk2chunk3", cs.data_buf.items);
+    try std.testing.expect(cs.completed);
+
+    // Verify read_offset is usable for incremental consumption.
+    try std.testing.expectEqual(@as(usize, 0), cs.read_offset);
+    cs.read_offset = 6; // consumed "chunk1"
+    const remaining = cs.data_buf.items[cs.read_offset..];
+    try std.testing.expectEqualStrings("chunk2chunk3", remaining);
+}
+
+test "h2 streaming over TCP: incremental DATA frames" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_mod = @import("../net/socket.zig");
+    const Socket = socket_mod.Socket;
+    const Address = socket_mod.Address;
+    const TcpListener = socket_mod.TcpListener;
+
+    // 1. Bind listener.
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
+    // 2. Client: connect, send h2 preface + GET request.
+    var client_sock = try Socket.connect(bound_addr, io);
+    defer client_sock.close();
+
+    var client_h2 = H2Connection.initClient(allocator, io);
+    defer client_h2.deinit();
+
+    try client_h2.sendClientPreface(&client_sock);
+    const req_headers = try H2Connection.buildRequestHeaders("GET", "/stream", "http", "localhost", &.{}, allocator);
+    defer allocator.free(req_headers);
+    const stream = try client_h2.stream_manager.createStream();
+    const stream_id = stream.id;
+    try client_h2.sendHeaders(&client_sock, stream_id, req_headers, true);
+
+    // 3. Server: accept, handshake, read request.
+    const accept_result = try listener.accept();
+    var server_sock = accept_result.socket;
+    defer server_sock.close();
+
+    var server_h2 = H2Connection.initServer(allocator, io);
+    defer server_h2.deinit();
+
+    var preface_buf: [24]u8 = undefined;
+    H2Connection.readExact(&server_sock, &preface_buf) catch return;
+    if (!mem.eql(u8, &preface_buf, http.HTTP2_PREFACE)) return error.ProtocolError;
+
+    var settings_frame = try server_h2.readFrame(&server_sock);
+    defer settings_frame.deinit(allocator);
+    try server_h2.handleSettings(&settings_frame, &server_sock);
+    try server_h2.sendSettings(&server_sock);
+
+    // Pump until request stream completes.
+    var completed_sid: ?u31 = null;
+    while (completed_sid == null) {
+        const maybe_sid = try server_h2.processOneFrame(&server_sock, &server_sock);
+        if (maybe_sid) |sid| {
+            const s = server_h2.stream_manager.getStream(sid) orelse continue;
+            if (s.completed) completed_sid = sid;
+        }
+    }
+
+    // 4. Server: send HEADERS (no END_STREAM) + 3 DATA chunks + END_STREAM.
+    var status_buf: [3]u8 = undefined;
+    const resp_headers = try H2Connection.buildResponseHeaders(200, &.{}, &status_buf, allocator);
+    defer allocator.free(resp_headers);
+    try server_h2.sendHeaders(&server_sock, completed_sid.?, resp_headers, false);
+    try server_h2.writeData(&server_sock, completed_sid.?, "aaa", false);
+    try server_h2.writeData(&server_sock, completed_sid.?, "bbb", false);
+    try server_h2.writeData(&server_sock, completed_sid.?, "ccc", true);
+
+    // 5. Client: read frames one at a time, verify incremental data.
+    const cs = client_h2.stream_manager.getStream(stream_id).?;
+
+    // Pump until we get HEADERS + all DATA.
+    while (!cs.completed) {
+        _ = try client_h2.processOneFrame(&client_sock, &client_sock);
+    }
+
+    try std.testing.expect(cs.got_headers);
+    try std.testing.expect(cs.completed);
+    try std.testing.expectEqualStrings("aaabbbccc", cs.data_buf.items);
+
+    // Verify read_offset incremental consumption.
+    var out: [3]u8 = undefined;
+    @memcpy(&out, cs.data_buf.items[cs.read_offset..][0..3]);
+    try std.testing.expectEqualStrings("aaa", &out);
+    cs.read_offset += 3;
+    @memcpy(&out, cs.data_buf.items[cs.read_offset..][0..3]);
+    try std.testing.expectEqualStrings("bbb", &out);
+    cs.read_offset += 3;
+    @memcpy(&out, cs.data_buf.items[cs.read_offset..][0..3]);
+    try std.testing.expectEqualStrings("ccc", &out);
+    cs.read_offset += 3;
+    try std.testing.expectEqual(cs.data_buf.items.len, cs.read_offset);
+}
+
 test "h2 round-trip over TCP loopback" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

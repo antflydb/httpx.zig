@@ -64,7 +64,8 @@ fn comptimeJoin(comptime parts: []const []const u8, comptime sep: []const u8) []
             @memcpy(buf[pos..][0..p.len], p);
             pos += p.len;
         }
-        return &buf;
+        const result = buf;
+        return &result;
     }
 }
 
@@ -206,6 +207,33 @@ pub fn requestId() Middleware {
 test "Middleware creation" {
     const mw = logger();
     try std.testing.expectEqualStrings("logger", mw.name);
+}
+
+test "Logger middleware calls next and returns response" {
+    const allocator = std.testing.allocator;
+    const Request = @import("../core/request.zig").Request;
+
+    var req = try Request.init(allocator, .GET, "/test");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const mw = logger();
+
+    // Build a Next that returns a 200 response.
+    const InnerHandler = struct {
+        fn call(self: *Next, _: *Context) anyerror!Response {
+            _ = self;
+            return Response.init(std.testing.allocator, 200);
+        }
+    };
+    var next = Next{ ._call = InnerHandler.call };
+
+    var response = try mw.handler(&ctx, &next);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
 }
 
 test "CORS middleware" {
