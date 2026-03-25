@@ -478,7 +478,7 @@ pub const H2Connection = struct {
                 stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
                 stream.headers_flags = frame.header.flags;
                 stream.got_headers = true;
-                if (stream.data_sem) |sem| sem.post(self.io);
+                if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
@@ -487,12 +487,12 @@ pub const H2Connection = struct {
             },
             .data => {
                 try stream.data_buf.appendSlice(self.allocator, frame.payload);
-                if (stream.data_sem) |sem| sem.post(self.io);
+                if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
                     if (stream.completion_sem) |sem| sem.post(self.io);
-                    if (stream.data_sem) |sem| sem.post(self.io);
+                    if (stream.data_event) |ev| ev.set(self.io);
                 }
             },
             .rst_stream => {
@@ -500,7 +500,7 @@ pub const H2Connection = struct {
                 stream.completed = true;
                 stream.reset();
                 if (stream.completion_sem) |sem| sem.post(self.io);
-                if (stream.data_sem) |sem| sem.post(self.io);
+                if (stream.data_event) |ev| ev.set(self.io);
             },
             else => {},
         }

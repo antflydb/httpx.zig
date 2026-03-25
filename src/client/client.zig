@@ -643,10 +643,13 @@ pub const Client = struct {
         stream: *Stream,
         io: Io,
         h2: *H2Connection,
-        data_sem: *Io.Semaphore,
+        data_event: *Io.Event,
         allocator: Allocator,
+        read_timeout: Io.Timeout = .none,
 
-        /// Reads up to `buf.len` bytes. Blocks until data is available. Returns 0 at EOF.
+        /// Reads up to `buf.len` bytes. Blocks until data is available.
+        /// Returns 0 at EOF. Returns error.Timeout if no data arrives
+        /// within the configured read_timeout.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
                 const avail = self.stream.data_buf.items.len - self.stream.read_offset;
@@ -662,16 +665,28 @@ pub const Client = struct {
                 }
                 if (self.stream.completed) return 0;
                 if (self.stream.stream_error) |err| return err;
-                self.data_sem.waitUncancelable(self.io);
+
+                // Reset event, re-check buffer (handles race with receive loop),
+                // then wait with timeout.
+                self.data_event.reset();
+                const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
+                if (avail2 > 0) continue;
+                if (self.stream.completed) return 0;
+                if (self.stream.stream_error) |err| return err;
+
+                self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
+                    error.Timeout => return error.Timeout,
+                    error.Canceled => return error.Canceled,
+                };
             }
         }
 
         /// Releases the stream. Must be called when done reading.
         pub fn close(self: *H2StreamReader) void {
-            self.stream.data_sem = null;
+            self.stream.data_event = null;
             self.stream.completion_sem = null;
             self.h2.stream_manager.removeStream(self.stream.id);
-            self.allocator.destroy(self.data_sem);
+            self.allocator.destroy(self.data_event);
         }
     };
 
@@ -702,10 +717,10 @@ pub const Client = struct {
         const stream = try h2.stream_manager.createStream();
         const stream_id = stream.id;
 
-        // Heap-allocate semaphore for pointer stability.
-        const data_sem = try self.allocator.create(Io.Semaphore);
-        data_sem.* = .{ .permits = 0 };
-        stream.data_sem = data_sem;
+        // Heap-allocate event for pointer stability and timed waits.
+        const data_event = try self.allocator.create(Io.Event);
+        data_event.* = .unset;
+        stream.data_event = data_event;
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -755,18 +770,33 @@ pub const Client = struct {
             }
         }
 
-        // Wait for HEADERS response (not END_STREAM).
+        // Wait for HEADERS response (not END_STREAM) with timeout.
+        const header_timeout: Io.Timeout = .{ .duration = .{
+            .raw = Io.Duration.fromSeconds(30),
+            .clock = .awake,
+        } };
         while (!stream.got_headers and !stream.completed) {
-            data_sem.waitUncancelable(self.io);
+            data_event.reset();
+            if (stream.got_headers or stream.completed) break;
+            data_event.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
+                error.Timeout => {
+                    self.allocator.destroy(data_event);
+                    return error.Timeout;
+                },
+                error.Canceled => {
+                    self.allocator.destroy(data_event);
+                    return error.Canceled;
+                },
+            };
         }
         if (stream.stream_error) |err| {
-            self.allocator.destroy(data_sem);
+            self.allocator.destroy(data_event);
             return err;
         }
 
         // Decode response headers.
         const hp = stream.headers_payload orelse {
-            self.allocator.destroy(data_sem);
+            self.allocator.destroy(data_event);
             return error.InvalidResponse;
         };
         const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
@@ -785,7 +815,7 @@ pub const Client = struct {
         for (decoded.headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
                 status_code = std.fmt.parseInt(u16, h.value, 10) catch {
-                    self.allocator.destroy(data_sem);
+                    self.allocator.destroy(data_event);
                     return error.InvalidResponse;
                 };
             } else if (h.name.len > 0 and h.name[0] != ':') {
@@ -795,7 +825,7 @@ pub const Client = struct {
 
         return .{
             .status_code = status_code orelse {
-                self.allocator.destroy(data_sem);
+                self.allocator.destroy(data_event);
                 return error.InvalidResponse;
             },
             .headers = response_headers,
@@ -803,7 +833,7 @@ pub const Client = struct {
                 .stream = stream,
                 .io = self.io,
                 .h2 = h2,
-                .data_sem = data_sem,
+                .data_event = data_event,
                 .allocator = self.allocator,
             },
         };
@@ -1522,16 +1552,16 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     try stream.data_buf.appendSlice(allocator, "hello world");
     stream.completed = true; // END_STREAM already received
 
-    // Create a heap-allocated semaphore (as requestStream would).
-    const data_sem = try allocator.create(Io.Semaphore);
-    data_sem.* = .{ .permits = 0 };
-    stream.data_sem = data_sem;
+    // Create a heap-allocated event (as requestStream would).
+    const data_event = try allocator.create(Io.Event);
+    data_event.* = .unset;
+    stream.data_event = data_event;
 
     var reader = Client.H2StreamReader{
         .stream = stream,
         .io = std.testing.io,
         .h2 = &h2,
-        .data_sem = data_sem,
+        .data_event = data_event,
         .allocator = allocator,
     };
 

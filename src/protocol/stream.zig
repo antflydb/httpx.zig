@@ -100,7 +100,7 @@ pub const Stream = struct {
     /// Semaphore posted by the receive loop on every DATA frame and on HEADERS.
     /// Consumer fibers wait on this to read data incrementally.
     /// Owned by the consumer fiber; the receive loop only calls post().
-    data_sem: ?*Io.Semaphore = null,
+    data_event: ?*Io.Event = null,
     /// Read cursor into data_buf for incremental consumption.
     read_offset: usize = 0,
 
