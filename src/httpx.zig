@@ -84,6 +84,7 @@ pub const hpack = @import("protocol/hpack.zig");
 pub const stream = @import("protocol/stream.zig");
 pub const qpack = @import("protocol/qpack.zig");
 pub const quic = @import("protocol/quic.zig");
+pub const h2_connection = @import("protocol/h2_connection.zig");
 
 pub const socket = @import("net/socket.zig");
 pub const address = @import("net/address.zig");
@@ -158,6 +159,10 @@ pub const HpackStaticTable = hpack.StaticTable;
 pub const HpackDynamicTable = hpack.DynamicTable;
 pub const encodeHpackHeaders = hpack.encodeHeaders;
 pub const decodeHpackHeaders = hpack.decodeHeaders;
+
+// HTTP/2 Connection exports
+pub const H2Connection = h2_connection.H2Connection;
+pub const H2Frame = h2_connection.Frame;
 
 // HTTP/2 Stream exports
 pub const Stream = stream.Stream;
@@ -365,6 +370,10 @@ test "qpack" {
 
 test "quic" {
     _ = quic;
+}
+
+test "h2 connection" {
+    _ = h2_connection;
 }
 
 test "parser" {
