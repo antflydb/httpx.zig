@@ -520,6 +520,10 @@ pub const Client = struct {
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
     fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
         const h2 = &entry.h2;
+        if (h2.goaway_received) {
+            entry.broken = true;
+            return error.ConnectionClosed;
+        }
         const stream = try h2.stream_manager.createStream();
         const stream_id = stream.id;
 
@@ -714,6 +718,10 @@ pub const Client = struct {
         if (!entry.recv_running) return error.MultiplexingRequired;
 
         const h2 = &entry.h2;
+        if (h2.goaway_received) {
+            entry.broken = true;
+            return error.ConnectionClosed;
+        }
         const stream = try h2.stream_manager.createStream();
         const stream_id = stream.id;
 

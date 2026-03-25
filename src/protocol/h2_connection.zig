@@ -584,11 +584,27 @@ pub const H2Connection = struct {
     /// completion semaphores when set). Intended for a background
     /// receive fiber on client-side multiplexed connections.
     pub fn runReceiveLoop(self: *Self, reader: anytype, writer: anytype) !void {
+        defer self.signalAllStreams(error.ConnectionClosed);
         while (!self.goaway_received) {
             _ = self.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
                 else => return err,
             };
+        }
+    }
+
+    /// Signals all active streams with an error and posts their events/semaphores
+    /// so waiting fibers don't hang forever after the receive loop exits.
+    fn signalAllStreams(self: *Self, err: anyerror) void {
+        var it = self.stream_manager.streams.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr;
+            if (!s.completed) {
+                s.stream_error = err;
+                s.completed = true;
+                if (s.data_event) |ev| ev.set(self.io);
+                if (s.completion_sem) |sem| sem.post(self.io);
+            }
         }
     }
 
