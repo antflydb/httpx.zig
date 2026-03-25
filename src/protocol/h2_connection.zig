@@ -181,9 +181,11 @@ pub const H2Connection = struct {
         if (old_table_size != self.peer_settings.header_table_size) {
             self.stream_manager.hpack_ctx.setTableSize(self.peer_settings.header_table_size);
         }
-        // Note: peer_settings.max_concurrent_streams limits how many streams
-        // *we* can initiate to the peer. It does NOT change our own local limit
-        // on how many streams the peer can open to us (local_max_concurrent_streams).
+        // peer_settings.max_concurrent_streams limits how many streams *we*
+        // can initiate. Propagate to stream_manager so createStream enforces it.
+        // This does NOT change our own local limit on how many streams the peer
+        // can open to us (local_max_concurrent_streams).
+        self.stream_manager.max_concurrent_streams = self.peer_settings.max_concurrent_streams;
         // Adapt window update threshold to the local initial window size
         // so small windows don't deadlock (threshold must be <= window size).
         self.window_update_threshold = @max(1, self.local_settings.initial_window_size / 2);
@@ -739,24 +741,36 @@ pub const H2Connection = struct {
                     // Transition idle → open (RFC 7540 §5.1).
                     if (stream.state == .idle) stream.state = .open;
                     stream.got_headers = true;
+
+                    // RFC 7540 §8.1.2.6: Extract content-length for
+                    // END_STREAM validation.
+                    for (dec.headers) |h| {
+                        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
+                            stream.content_length = std.fmt.parseInt(u64, h.value, 10) catch null;
+                            break;
+                        }
+                    }
                 }
 
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
+                    // RFC 7540 §8.1.2.6: HEADERS with END_STREAM and a
+                    // non-zero content-length is a stream error.
+                    if (stream.content_length) |cl| {
+                        if (cl != 0) {
+                            stream.stream_error = error.ContentLengthMismatch;
+                            stream.completed = true;
+                            if (stream.data_event) |ev2| ev2.set(self.io);
+                            if (stream.completion_sem) |sem| sem.post(self.io);
+                            return;
+                        }
+                    }
                     stream.completed = true;
                     stream.receiveEndStream();
                     if (stream.completion_sem) |sem| sem.post(self.io);
                 }
             },
             .data => {
-                // RFC 7540 §5.1: DATA on half-closed-remote or closed is a stream error.
-                if (!stream.canReceive()) {
-                    stream.stream_error = error.StreamClosed;
-                    stream.completed = true;
-                    if (stream.data_event) |ev| ev.set(self.io);
-                    if (stream.completion_sem) |sem| sem.post(self.io);
-                    return;
-                }
                 // RFC 7540 §6.1: Strip padding from DATA frames.
                 const data_payload = blk: {
                     if (frame.header.flags & FLAG_PADDED != 0) {
@@ -767,20 +781,13 @@ pub const H2Connection = struct {
                     }
                     break :blk frame.payload;
                 };
-                if (self.max_stream_data_size > 0) {
-                    const new_size = stream.data_buf.items.len + data_payload.len;
-                    if (new_size > self.max_stream_data_size) {
-                        stream.stream_error = error.StreamDataOverflow;
-                        stream.completed = true;
-                        if (stream.data_event) |ev| ev.set(self.io);
-                        if (stream.completion_sem) |sem| sem.post(self.io);
-                        return;
-                    }
-                }
                 // RFC 7540 §6.9: Decrement receive windows on incoming DATA.
                 // Flow control covers the entire frame payload including padding
                 // (RFC 7540 §6.9: "the entire DATA frame payload is included in
                 // flow control, including the Pad Length and Padding fields").
+                // Decrement BEFORE state/overflow checks so that accumulated
+                // WINDOW_UPDATE credit (from processOneFrame) stays consistent
+                // with recv window accounting regardless of early returns.
                 if (frame.payload.len > 0) {
                     const data_len: i32 = @intCast(@min(frame.payload.len, @as(usize, @intCast(std.math.maxInt(i32)))));
                     stream.updateRecvWindow(-data_len) catch {
@@ -795,13 +802,43 @@ pub const H2Connection = struct {
                     // can send GOAWAY(FLOW_CONTROL_ERROR).
                     try self.stream_manager.updateConnectionRecvWindow(-data_len);
                 }
+                // RFC 7540 §5.1: DATA on half-closed-remote or closed is a stream error.
+                // Checked after recv window decrement so flow control stays consistent.
+                if (!stream.canReceive()) {
+                    stream.stream_error = error.StreamClosed;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    return;
+                }
+                if (self.max_stream_data_size > 0) {
+                    const new_size = stream.data_buf.items.len + data_payload.len;
+                    if (new_size > self.max_stream_data_size) {
+                        stream.stream_error = error.StreamDataOverflow;
+                        stream.completed = true;
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        return;
+                    }
+                }
                 try stream.data_buf.appendSlice(self.allocator, data_payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
+                    // RFC 7540 §8.1.2.6: If content-length was provided,
+                    // the total DATA payload must match exactly.
+                    if (stream.content_length) |expected| {
+                        if (stream.data_buf.items.len != expected) {
+                            stream.stream_error = error.ContentLengthMismatch;
+                            stream.completed = true;
+                            if (stream.data_event) |ev2| ev2.set(self.io);
+                            if (stream.completion_sem) |sem| sem.post(self.io);
+                            return;
+                        }
+                    }
                     stream.completed = true;
                     stream.receiveEndStream();
                     if (stream.completion_sem) |sem| sem.post(self.io);
-                    if (stream.data_event) |ev| ev.set(self.io);
+                    if (stream.data_event) |ev2| ev2.set(self.io);
                 }
             },
             .rst_stream => {

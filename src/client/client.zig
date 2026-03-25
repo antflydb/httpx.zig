@@ -280,7 +280,11 @@ pub const Client = struct {
         var attempt: u32 = 0;
         while (true) {
             var res = self.executeRequestOnce(req, timeout_override_ms) catch |err| {
-                if (policy.retry_on_connection_error and can_retry_method and attempt < policy.max_retries) {
+                // RFC 7540 §6.8: Streams refused via GOAWAY were never
+                // processed and are always safe to retry on a new connection.
+                const is_goaway_refused = (err == error.GoawayRefused);
+                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
+                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
@@ -491,11 +495,15 @@ pub const Client = struct {
     }
 
     /// Reads frames until the server's initial SETTINGS has been received and ACKed.
+    /// Gives up after 64 non-SETTINGS frames to prevent hangs against misbehaving peers.
     fn exchangeH2Settings(self: *Self, h2: *H2Connection, reader: anytype, writer: anytype) !void {
         var settings_received = false;
+        var frame_count: u32 = 0;
         while (!settings_received) {
+            if (frame_count >= 64) return error.ProtocolError;
             var frame = try h2.readFrame(reader);
             defer frame.deinit(self.allocator);
+            frame_count += 1;
             if (frame.header.frame_type == .settings and frame.header.flags & H2Connection.FLAG_ACK == 0) {
                 try h2.handleSettings(&frame, writer);
                 settings_received = true;

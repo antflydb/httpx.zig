@@ -80,6 +80,12 @@ pub const ServerConfig = struct {
     keep_alive: bool = true,
     max_requests_per_connection: u32 = 1000,
     threads: u32 = 0,
+    /// Idle timeout for HTTP/2 connections (ms). The server initiates graceful
+    /// shutdown (GOAWAY) when no streams are active for this duration. 0 = no timeout.
+    h2_idle_timeout_ms: u64 = 300_000,
+    /// Maximum total streams processed on a single H2 connection before sending
+    /// GOAWAY. 0 = unlimited. Prevents unbounded HPACK/state growth.
+    h2_max_requests: u32 = 10_000,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
     /// `std.crypto.tls.Client`; there is no server TLS implementation yet.
     /// Use a TLS-terminating reverse proxy in the meantime.
@@ -1007,12 +1013,29 @@ pub const Server = struct {
         // delivers stream-level frames to per-stream mailboxes. Uses the
         // locked variant so SETTINGS ACK / PING / WINDOW_UPDATE writes are
         // serialized with handler fibers' response writes.
+        var h2_request_count: u32 = 0;
+        var last_activity: i64 = milliTimestamp(self.io);
         while (!h2.goaway_received and self.running) {
+            // H2 idle timeout: initiate graceful shutdown if no streams are
+            // active and idle threshold is exceeded.
+            if (self.config.h2_idle_timeout_ms > 0 and
+                h2.stream_manager.activeStreamCount() == 0)
+            {
+                const idle_ms = milliTimestamp(self.io) - last_activity;
+                if (idle_ms >= @as(i64, @intCast(self.config.h2_idle_timeout_ms))) break;
+            }
+
+            // H2 max requests: send GOAWAY when limit is reached.
+            if (self.config.h2_max_requests > 0 and h2_request_count >= self.config.h2_max_requests) {
+                break;
+            }
+
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
                 error.ConnectionClosed => break,
                 else => return err,
             };
 
+            last_activity = milliTimestamp(self.io);
             const sid = maybe_sid orelse continue;
             const stream = h2.stream_manager.getStream(sid) orelse continue;
 
@@ -1028,6 +1051,8 @@ pub const Server = struct {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
+
+            h2_request_count += 1;
 
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
             if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
@@ -1072,9 +1097,13 @@ pub const Server = struct {
     /// mailbox, routes the request, and sends the response. Dispatched as
     /// soon as HEADERS arrive — the body may still be streaming.
     fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
-        // Ensure cleanup: detach event from stream, free event, remove stream.
-        // Hold write_mutex when NULLing data_event to avoid a race with the
-        // receive loop's deliverToMailbox which reads data_event concurrently.
+        // Ensure cleanup: detach event from stream, remove stream, free event.
+        // All stream map mutations happen under write_mutex so the receive
+        // loop (which holds write_mutex in processOneFrameLocked) cannot
+        // concurrently access data_buf while it's being freed. Removing
+        // the stream atomically with clearing data_event also prevents the
+        // TOCTOU race where the receive loop sees data_event==null on a
+        // still-present stream and double-dispatches a handler fiber.
         defer {
             {
                 h2.write_mutex.lockUncancelable(h2.io);
@@ -1082,9 +1111,9 @@ pub const Server = struct {
                 if (h2.stream_manager.getStream(stream_id)) |s| {
                     s.data_event = null;
                 }
+                h2.stream_manager.removeStream(stream_id);
             }
             self.allocator.destroy(data_event);
-            h2.stream_manager.removeStream(stream_id);
         }
 
         const stream = h2.stream_manager.getStream(stream_id) orelse return;
@@ -1094,23 +1123,56 @@ pub const Server = struct {
         const decoded_headers = stream.request_headers orelse return;
 
         // Extract pseudo-headers → build a Request.
+        // RFC 7540 §8.1.2.1: pseudo-headers MUST appear before regular
+        // headers, MUST NOT be duplicated, :method and :path are required.
         var method_str: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
+        var scheme: ?[]const u8 = null;
+        var past_pseudo = false;
 
         var extra_headers = Headers.init(self.allocator);
         defer extra_headers.deinit();
 
         for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":method")) {
-                method_str = h.value;
-            } else if (mem.eql(u8, h.name, ":path")) {
-                path = h.value;
-            } else if (mem.eql(u8, h.name, ":authority")) {
-                authority = h.value;
-            } else if (mem.eql(u8, h.name, ":scheme")) {
-                // Consumed but not needed for routing.
-            } else if (h.name.len > 0 and h.name[0] != ':') {
+            if (h.name.len > 0 and h.name[0] == ':') {
+                // RFC 7540 §8.1.2.1: pseudo-headers after regular headers
+                // is a stream error (PROTOCOL_ERROR).
+                if (past_pseudo) {
+                    try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                    return;
+                }
+                if (mem.eql(u8, h.name, ":method")) {
+                    if (method_str != null) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                        return;
+                    }
+                    method_str = h.value;
+                } else if (mem.eql(u8, h.name, ":path")) {
+                    if (path != null) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                        return;
+                    }
+                    path = h.value;
+                } else if (mem.eql(u8, h.name, ":authority")) {
+                    if (authority != null) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                        return;
+                    }
+                    authority = h.value;
+                } else if (mem.eql(u8, h.name, ":scheme")) {
+                    if (scheme != null) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                        return;
+                    }
+                    scheme = h.value;
+                } else {
+                    // Unknown pseudo-header → stream error.
+                    try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                    return;
+                }
+            } else {
+                past_pseudo = true;
                 // RFC 7540 §8.1.2.2: Reject connection-specific headers.
                 if (isH2ForbiddenHeader(h.name, h.value)) {
                     try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
@@ -1120,7 +1182,19 @@ pub const Server = struct {
             }
         }
 
-        const req_method = types.Method.fromString(method_str orelse "GET") orelse .GET;
+        // RFC 7540 §8.1.2.3: :method and :path are required for all
+        // request methods except CONNECT.
+        const m_str = method_str orelse {
+            try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+            return;
+        };
+        const is_connect = mem.eql(u8, m_str, "CONNECT");
+        if (!is_connect and path == null) {
+            try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+            return;
+        }
+
+        const req_method = types.Method.fromString(m_str) orelse .GET;
         var req = try Request.init(self.allocator, req_method, path orelse "/");
         defer req.deinit();
         req.version = .HTTP_2;
@@ -1223,6 +1297,9 @@ pub const Server = struct {
             }
             response.body = null;
         }
+
+        // RFC 7231 §7.1.1.2: origin servers SHOULD include a Date header.
+        try ensureDateHeader(self.io, &response);
 
         // Build response headers outside the lock.
         var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;

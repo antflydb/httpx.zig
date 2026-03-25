@@ -107,6 +107,10 @@ pub const Stream = struct {
     /// Read cursor into data_buf for incremental consumption.
     read_offset: usize = 0,
 
+    /// Expected total DATA bytes from content-length header (RFC 7540 §8.1.2.6).
+    /// null = no content-length. Checked against data_buf.items.len at END_STREAM.
+    content_length: ?u64 = null,
+
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,
 
@@ -242,6 +246,7 @@ pub const StreamManager = struct {
     /// frames for closed streams from truly invalid stream IDs.
     max_closed_stream_id: u31 = 0,
 
+
     /// HPACK encoder/decoder context.
     hpack_ctx: hpack.HpackContext,
 
@@ -269,7 +274,12 @@ pub const StreamManager = struct {
     /// The stream is immediately transitioned to `.open` state since locally
     /// initiated streams are open by definition at creation (RFC 7540 §5.1:
     /// sending HEADERS transitions idle → open).
+    /// Returns error.MaxConcurrentStreamsExceeded if the peer's
+    /// max_concurrent_streams limit would be violated (RFC 7540 §6.5.2).
     pub fn createStream(self: *Self) !*Stream {
+        if (self.activeStreamCount() >= self.max_concurrent_streams) {
+            return error.MaxConcurrentStreamsExceeded;
+        }
         const id = if (self.is_client) blk: {
             const id = self.next_client_stream_id;
             if (id > std.math.maxInt(u31) - 2) return error.StreamIdExhausted;
@@ -341,17 +351,10 @@ pub const StreamManager = struct {
         }
     }
 
-    /// Counts currently open streams.
+    /// Returns the number of currently active streams. Streams are active
+    /// from creation until removal via removeStream(). O(1).
     pub fn activeStreamCount(self: *const Self) usize {
-        var count: usize = 0;
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            const state = entry.value_ptr.*.state;
-            if (state != .idle and state != .closed) {
-                count += 1;
-            }
-        }
-        return count;
+        return self.streams.count();
     }
 
     /// Updates connection-level send window.
