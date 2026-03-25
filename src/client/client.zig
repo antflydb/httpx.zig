@@ -2,9 +2,18 @@
 //!
 //! HTTP/1.1 and HTTP/2 client over TCP with optional TLS (HTTPS).
 //!
-//! When `http2_enabled` is set in `ClientConfig`, the client speaks HTTP/2
-//! using "prior knowledge" mode (RFC 7540 §3.4) — it sends the h2 connection
-//! preface directly without ALPN negotiation.
+//! ## HTTP/2 Support
+//!
+//! Set `http2_enabled` or `force_http2` in `ClientConfig`. The client uses
+//! "prior knowledge" mode (RFC 7540 §3.4), sending the h2 connection preface
+//! directly. ALPN negotiation is not available (Zig stdlib limitation).
+//!
+//! One h2 connection is maintained per host:port in `h2_conns`. When the Io
+//! backend supports fibers, a background receive-loop fiber pumps frames
+//! continuously, enabling true stream multiplexing — multiple request fibers
+//! can share the connection, with writes serialized via `write_mutex` and
+//! per-stream completion signaled via `Io.Semaphore`. Without fiber support,
+//! frames are pumped inline (one request at a time).
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;

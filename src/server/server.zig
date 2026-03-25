@@ -7,7 +7,11 @@
 //! - Context-based request handling
 //! - JSON response helpers
 //! - Static file serving
-//! - HTTP/2 via "prior knowledge" (RFC 7540 §3.4) — automatic detection
+//! - HTTP/2 with two entry paths:
+//!   1. **Prior knowledge** (RFC 7540 §3.4): client sends h2 preface directly;
+//!      the server detects it from the first bytes of the connection.
+//!   2. **h2c upgrade** (RFC 7540 §3.2): client sends an HTTP/1.1 request with
+//!      `Upgrade: h2c`; the server responds with 101 and switches to h2.
 //! - Cross-platform (Linux, Windows, macOS)
 //!
 //! ## TLS / HTTPS
@@ -15,8 +19,9 @@
 //! Zig 0.16 `std.crypto.tls` only provides a `Client` — there is no
 //! server-side TLS implementation yet. For HTTPS, deploy behind a TLS-
 //! terminating reverse proxy (e.g. nginx, Caddy, envoy) that forwards
-//! plaintext HTTP/2 (h2c) to this server. The `tls_config` field in
-//! `ServerConfig` is reserved for future direct TLS support.
+//! plaintext HTTP/2 (h2c) or HTTP/1.1 to this server. The `tls_cert_path`
+//! and `tls_key_path` fields in `ServerConfig` are reserved for future
+//! direct TLS support.
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;

@@ -3,16 +3,23 @@
 //! Provides TLS configuration and a session wrapper for HTTPS connections.
 //! This module uses Zig's standard library TLS client (`std.crypto.tls.Client`).
 //!
-//! ## Notes
+//! ## What Works Today
 //!
-//! - **Client-only**: Zig 0.16 `std.crypto.tls` provides `Client` but no
-//!   `Server`. Server-side TLS requires a reverse proxy (nginx, Caddy, etc.)
-//!   that terminates TLS and forwards plaintext h2c to the httpx server.
-//! - **ALPN**: Not currently surfaced by `std.crypto.tls.Client`. HTTP/2
-//!   connections use "prior knowledge" mode (RFC 7540 §3.4) instead.
-//!   The `alpn_protocols` field is set for forward compatibility.
-//! - **`negotiated_protocol`**: Always `null` until the stdlib exposes ALPN.
-//!   When `force_http2` / `http2_enabled` is set, the client assumes h2.
+//! - **Client TLS 1.2/1.3**: Full handshake, certificate verification, SNI.
+//! - **HTTP/2 over TLS**: Set `http2_enabled` or `force_http2` in `ClientConfig`.
+//!   The client sends the h2 connection preface directly ("prior knowledge" mode,
+//!   RFC 7540 §3.4) and multiplexes streams on a single connection.
+//!
+//! ## Stdlib Limitations (Zig 0.16)
+//!
+//! - **No server TLS**: `std.crypto.tls` provides `Client` but no `Server`.
+//!   Deploy the httpx server behind a TLS-terminating reverse proxy (nginx,
+//!   Caddy, etc.) that forwards plaintext h2c or HTTP/1.1 to the server.
+//! - **No ALPN read-back**: `std.crypto.tls.Client` does not expose the
+//!   negotiated ALPN protocol. The `alpn_protocols` field and
+//!   `negotiated_protocol` session field are scaffolded for forward
+//!   compatibility — when the stdlib adds ALPN support, wire it into
+//!   `TlsSession.handshake()` at the marked scaffold site.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
