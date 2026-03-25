@@ -514,6 +514,14 @@ pub const Client = struct {
             // No fiber support — fall back to inline frame pumping per request.
         }
 
+        // If subsequent operations fail, ensure spawned fibers are stopped
+        // before freeing the entry to prevent use-after-free.
+        errdefer if (entry.recv_running) {
+            entry.socket.close();
+            entry.ping_group.await(self.io) catch {};
+            entry.recv_group.await(self.io) catch {};
+        };
+
         const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
         errdefer self.allocator.free(owned_key);
         try self.h2_conns.put(self.allocator, owned_key, entry);
@@ -682,13 +690,20 @@ pub const Client = struct {
         if (entry.recv_running) {
             // Multiplexed mode: background fiber pumps frames; we wait on a
             // per-stream completion semaphore that the receive loop posts.
-            var sem: Io.Semaphore = .{ .permits = 0 };
-            stream.completion_sem = &sem;
+            // Heap-allocated for pointer stability: the receive loop may post
+            // after this function returns on a write error path, so a stack-
+            // allocated semaphore would be use-after-free.
+            const sem = try self.allocator.create(Io.Semaphore);
+            sem.* = .{ .permits = 0 };
+            stream.completion_sem = sem;
             // Re-fetch the stream pointer for cleanup since the backing
             // map may have rehashed while we were blocked on I/O.
-            defer if (h2.stream_manager.getStream(stream_id)) |s| {
-                s.completion_sem = null;
-            };
+            defer {
+                if (h2.stream_manager.getStream(stream_id)) |s| {
+                    s.completion_sem = null;
+                }
+                self.allocator.destroy(sem);
+            }
 
             // Serialize frame writes via the connection's write mutex.
             {

@@ -922,6 +922,9 @@ pub const Server = struct {
         original_req.version = .HTTP_2;
         try self.routeAndRespondH2(&h2, sock, 1, original_req, null);
         h2.stream_manager.removeStream(1);
+        // Stream 1 was fully processed; record it so GOAWAY advertises the
+        // correct last_stream_id and clients don't retry it (RFC 7540 §6.8).
+        h2.last_processed_stream_id = 1;
 
         // 6. Enter the normal H2 receive loop for subsequent requests.
         // Use H2SocketReader to replay any bytes pipelined after the upgrade
@@ -1036,13 +1039,8 @@ pub const Server = struct {
         // Wrap socket in a reader that first yields `initial_data`, then reads from socket.
         var h2_reader = H2SocketReader{ .socket = sock, .initial = initial_data, .initial_pos = 0 };
 
-        // Read the client's SETTINGS frame (follows the preface).
-        var settings_frame = try h2.readFrame(&h2_reader);
-        defer settings_frame.deinit(self.allocator);
-        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
-        try h2.handleSettings(&settings_frame, sock);
-
-        // Send our SETTINGS.
+        // RFC 7540 §3.5: Server SETTINGS MUST be the first frame the server sends.
+        // Send our SETTINGS before reading/ACKing the client's.
         try h2.sendSettings(sock);
 
         // RFC 7540 §6.9.1: SETTINGS INITIAL_WINDOW_SIZE only affects stream-level
@@ -1053,6 +1051,12 @@ pub const Server = struct {
             try h2.sendWindowUpdate(sock, 0, delta);
             try h2.stream_manager.updateConnectionRecvWindow(@intCast(delta));
         }
+
+        // Now read and ACK the client's SETTINGS frame (follows the preface).
+        var settings_frame = try h2.readFrame(&h2_reader);
+        defer settings_frame.deinit(self.allocator);
+        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        try h2.handleSettings(&settings_frame, sock);
 
         // Per-stream handler fibers. Awaited before h2 is deinitialized.
         var stream_fibers = Io.Group.init;
@@ -1173,6 +1177,11 @@ pub const Server = struct {
                 h2.write_mutex.lockUncancelable(h2.io);
                 defer h2.write_mutex.unlock(h2.io);
                 if (h2.stream_manager.getStream(stream_id)) |s| {
+                    // If HEADERS was sent but END_STREAM was not, the peer has a
+                    // half-open stream. Send RST_STREAM so it doesn't wait forever.
+                    if (!s.end_stream_sent and s.state != .idle) {
+                        h2.sendRstStream(sock, stream_id, .internal_error) catch {};
+                    }
                     s.data_event = null;
                 }
                 h2.stream_manager.removeStream(stream_id);

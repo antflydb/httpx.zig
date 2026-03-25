@@ -886,25 +886,24 @@ pub const H2Connection = struct {
 
         const maybe = try self.dispatchFrame(&frame, writer);
         if (maybe) |sf| {
-            if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
-            }
             self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                 // RFC 7540 §5.1: late frame for a closed stream — send
                 // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
+                // No WINDOW_UPDATE accumulation: deliverToMailbox returned
+                // before accepting the data, so no credit was consumed.
                 error.ClosedStream => {
-                    // Undo connection-level window accumulation: deliverToMailbox
-                    // returned before decrementing connection_recv_window, so the
-                    // credit we accumulated above is unmatched.
-                    if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                        const len: u32 = @intCast(@min(sf.payload.len, @as(usize, @intCast(std.math.maxInt(u32)))));
-                        self.pending_conn_window_update -|= len;
-                    }
                     self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                     return sf.header.stream_id;
                 },
                 else => return err,
             };
+            // Accumulate WINDOW_UPDATE *after* successful delivery so the
+            // credit matches the actual recv window decrement in deliverToMailbox.
+            // This avoids permanent window inflation when delivery fails
+            // (ClosedStream) after accumulateWindowUpdate has already flushed.
+            if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
+            }
             // Flush window credit on stream completion or reset.
             if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
                 try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
@@ -937,22 +936,19 @@ pub const H2Connection = struct {
 
             const maybe = try self.dispatchFrame(&frame, writer);
             if (maybe) |sf| {
-                if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                    try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
-                }
                 // deliverToMailbox decodes HPACK + copies payload under lock,
                 // ensuring the shared hpack_ctx is not accessed concurrently.
                 self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                     error.ClosedStream => {
-                        if (sf.header.frame_type == .data and sf.payload.len > 0) {
-                            const len: u32 = @intCast(@min(sf.payload.len, @as(usize, @intCast(std.math.maxInt(u32)))));
-                            self.pending_conn_window_update -|= len;
-                        }
                         self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                         return sf.header.stream_id;
                     },
                     else => return err,
                 };
+                // Accumulate WINDOW_UPDATE *after* successful delivery.
+                if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                    try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
+                }
                 // Flush window credit on stream completion or reset.
                 if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
                     try self.flushStreamWindowUpdate(writer, sf.header.stream_id);
