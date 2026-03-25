@@ -12,7 +12,7 @@
 //! backend supports fibers, a background receive-loop fiber pumps frames
 //! continuously, enabling true stream multiplexing — multiple request fibers
 //! can share the connection, with writes serialized via `write_mutex` and
-//! per-stream completion signaled via `Io.Semaphore`. Without fiber support,
+//! per-stream completion signaled via `Io.Event`. Without fiber support,
 //! frames are pumped inline (one request at a time).
 
 const std = @import("std");
@@ -518,7 +518,7 @@ pub const Client = struct {
     /// the request, pumps frames until complete, and extracts the response.
     ///
     /// In multiplexed mode (recv_running=true), the background receive fiber
-    /// pumps frames while this fiber waits on a per-stream semaphore.
+    /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
     fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
         const h2 = &entry.h2;
@@ -565,7 +565,7 @@ pub const Client = struct {
 
         if (entry.recv_running) {
             // Multiplexed mode: background fiber pumps frames; we wait on a
-            // per-stream semaphore that the receive loop posts on completion.
+            // per-stream completion semaphore that the receive loop posts.
             var sem: Io.Semaphore = .{ .permits = 0 };
             stream.completion_sem = &sem;
             defer stream.completion_sem = null;
@@ -748,6 +748,7 @@ pub const Client = struct {
         const data_event = try self.allocator.create(Io.Event);
         data_event.* = .unset;
         stream.data_event = data_event;
+        errdefer self.allocator.destroy(data_event);
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
@@ -799,33 +800,21 @@ pub const Client = struct {
 
         // Wait for HEADERS response (not END_STREAM) with timeout.
         const header_timeout: Io.Timeout = .{ .duration = .{
-            .raw = Io.Duration.fromSeconds(30),
+            .raw = Io.Duration.fromMilliseconds(self.config.timeouts.read_ms),
             .clock = .awake,
         } };
         while (!stream.got_headers and !stream.completed) {
             data_event.reset();
             if (stream.got_headers or stream.completed) break;
             data_event.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
-                error.Timeout => {
-                    self.allocator.destroy(data_event);
-                    return error.Timeout;
-                },
-                error.Canceled => {
-                    self.allocator.destroy(data_event);
-                    return error.Canceled;
-                },
+                error.Timeout => return error.Timeout,
+                error.Canceled => return error.Canceled,
             };
         }
-        if (stream.stream_error) |err| {
-            self.allocator.destroy(data_event);
-            return err;
-        }
+        if (stream.stream_error) |err| return err;
 
         // Decode response headers.
-        const hp = stream.headers_payload orelse {
-            self.allocator.destroy(data_event);
-            return error.InvalidResponse;
-        };
+        const hp = stream.headers_payload orelse return error.InvalidResponse;
         const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
         defer {
             for (decoded.headers) |*dh| {
@@ -841,20 +830,15 @@ pub const Client = struct {
 
         for (decoded.headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch {
-                    self.allocator.destroy(data_event);
+                status_code = std.fmt.parseInt(u16, h.value, 10) catch
                     return error.InvalidResponse;
-                };
             } else if (h.name.len > 0 and h.name[0] != ':') {
                 try response_headers.append(h.name, h.value);
             }
         }
 
         return .{
-            .status_code = status_code orelse {
-                self.allocator.destroy(data_event);
-                return error.InvalidResponse;
-            },
+            .status_code = status_code orelse return error.InvalidResponse,
             .headers = response_headers,
             .reader = .{
                 .stream = stream,
@@ -1610,7 +1594,7 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     const n3 = try reader.read(&buf2);
     try std.testing.expectEqual(@as(usize, 0), n3);
 
-    // Clean up — close frees the semaphore and removes the stream.
+    // Clean up — close frees the event and removes the stream.
     reader.close();
 
     // Verify stream was removed.
