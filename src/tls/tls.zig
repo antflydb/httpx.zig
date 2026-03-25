@@ -5,11 +5,14 @@
 //!
 //! ## Notes
 //!
-//! - This is a thin wrapper around the stdlib TLS implementation.
-//! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client`.
-//!   HTTP/2 connections use "prior knowledge" mode (RFC 7540 §3.4) instead.
-//! - The `alpn_protocols` field is set to `&.{"h2", "http/1.1"}` when HTTP/2 is
-//!   enabled, for forward compatibility with future stdlib ALPN support.
+//! - **Client-only**: Zig 0.16 `std.crypto.tls` provides `Client` but no
+//!   `Server`. Server-side TLS requires a reverse proxy (nginx, Caddy, etc.)
+//!   that terminates TLS and forwards plaintext h2c to the httpx server.
+//! - **ALPN**: Not currently surfaced by `std.crypto.tls.Client`. HTTP/2
+//!   connections use "prior knowledge" mode (RFC 7540 §3.4) instead.
+//!   The `alpn_protocols` field is set for forward compatibility.
+//! - **`negotiated_protocol`**: Always `null` until the stdlib exposes ALPN.
+//!   When `force_http2` / `http2_enabled` is set, the client assumes h2.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -219,6 +222,12 @@ pub const TlsSession = struct {
 
         self.client = client;
         self.connected = true;
+
+        // Scaffold: read negotiated ALPN protocol from the TLS client.
+        // Zig 0.16 `std.crypto.tls.Client` does not expose this field.
+        // When the stdlib adds ALPN support, wire it in here:
+        //   self.negotiated_protocol = client.alpn_protocol;
+        // Until then, callers that need h2 use "prior knowledge" mode.
     }
 
     /// Reads decrypted data from the session.

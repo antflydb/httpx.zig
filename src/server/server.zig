@@ -7,7 +7,16 @@
 //! - Context-based request handling
 //! - JSON response helpers
 //! - Static file serving
+//! - HTTP/2 via "prior knowledge" (RFC 7540 §3.4) — automatic detection
 //! - Cross-platform (Linux, Windows, macOS)
+//!
+//! ## TLS / HTTPS
+//!
+//! Zig 0.16 `std.crypto.tls` only provides a `Client` — there is no
+//! server-side TLS implementation yet. For HTTPS, deploy behind a TLS-
+//! terminating reverse proxy (e.g. nginx, Caddy, envoy) that forwards
+//! plaintext HTTP/2 (h2c) to this server. The `tls_config` field in
+//! `ServerConfig` is reserved for future direct TLS support.
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
@@ -64,6 +73,11 @@ pub const ServerConfig = struct {
     keep_alive: bool = true,
     max_requests_per_connection: u32 = 1000,
     threads: u32 = 0,
+    /// Reserved for future server-side TLS support. Zig 0.16 only provides
+    /// `std.crypto.tls.Client`; there is no server TLS implementation yet.
+    /// Use a TLS-terminating reverse proxy in the meantime.
+    tls_cert_path: ?[]const u8 = null,
+    tls_key_path: ?[]const u8 = null,
 };
 
 /// Request context passed to handlers.
@@ -701,8 +715,13 @@ pub const Server = struct {
 
     /// Handles an HTTP/2 connection after the 24-byte preface has been consumed.
     /// `initial_data` contains any bytes read beyond the preface from the first recv.
+    ///
+    /// Runs a receive loop that reads frames and delivers them to per-stream
+    /// mailboxes. When a stream is complete, a handler fiber is spawned to
+    /// process the request concurrently (falls back to synchronous if the Io
+    /// backend doesn't support concurrency).
     fn handleH2Connection(self: *Self, sock: *Socket, initial_data: []const u8) !void {
-        var h2 = H2Connection.initServer(self.allocator);
+        var h2 = H2Connection.initServer(self.allocator, self.io);
         defer h2.deinit();
 
         // Wrap socket in a reader that first yields `initial_data`, then reads from socket.
@@ -717,167 +736,184 @@ pub const Server = struct {
         // Send our SETTINGS.
         try h2.sendSettings(sock);
 
-        // Process frames until the connection is done.
-        while (!h2.goaway_received) {
-            var frame = h2.readFrame(&h2_reader) catch |err| switch (err) {
-                error.ConnectionClosed => return,
+        // Per-stream handler fibers. Awaited before h2 is deinitialized.
+        var stream_fibers = Io.Group.init;
+        defer {
+            // Wait for all in-flight handler fibers to finish.
+            stream_fibers.await(self.io) catch |err| switch (err) {
+                error.Canceled => {},
+                else => {},
+            };
+            // Send GOAWAY with no_error if we haven't already, so the peer
+            // can distinguish a clean close from a truncation.
+            if (!h2.goaway_sent) {
+                h2.sendGoaway(sock, .no_error) catch {};
+            }
+        }
+
+        // Receive loop: reads frames, handles connection-level traffic, and
+        // delivers stream-level frames to per-stream mailboxes. Uses the
+        // locked variant so SETTINGS ACK / PING / WINDOW_UPDATE writes are
+        // serialized with handler fibers' response writes.
+        while (!h2.goaway_received and self.running) {
+            const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
+                error.ConnectionClosed => break,
                 else => return err,
             };
-            defer frame.deinit(self.allocator);
 
-            const maybe_stream = try h2.dispatchFrame(&frame, sock);
-            if (maybe_stream == null) continue;
+            const sid = maybe_sid orelse continue;
+            const stream = h2.stream_manager.getStream(sid) orelse continue;
+            if (!stream.completed) continue;
 
-            const sf = maybe_stream.?;
-            if (sf.header.frame_type != .headers) continue;
-
-            // Decode request headers.
-            const decoded = try h2.decodeFrameHeaders(sf.payload, sf.header.flags);
-            defer {
-                for (decoded.headers) |*dh| {
-                    self.allocator.free(dh.name);
-                    self.allocator.free(dh.value);
-                }
-                self.allocator.free(decoded.headers);
+            if (stream.stream_error != null) {
+                h2.stream_manager.removeStream(sid);
+                continue;
             }
 
-            // Extract pseudo-headers → build a Request.
-            var method_str: ?[]const u8 = null;
-            var path: ?[]const u8 = null;
-            var authority: ?[]const u8 = null;
-
-            var extra_headers = Headers.init(self.allocator);
-            defer extra_headers.deinit();
-
-            for (decoded.headers) |h| {
-                if (mem.eql(u8, h.name, ":method")) {
-                    method_str = h.value;
-                } else if (mem.eql(u8, h.name, ":path")) {
-                    path = h.value;
-                } else if (mem.eql(u8, h.name, ":authority")) {
-                    authority = h.value;
-                } else if (mem.eql(u8, h.name, ":scheme")) {
-                    // Consumed but not needed for routing.
-                } else if (h.name.len > 0 and h.name[0] != ':') {
-                    try extra_headers.append(h.name, h.value);
-                }
-            }
-
-            const req_method = types.Method.fromString(method_str orelse "GET") orelse .GET;
-            var req = try Request.init(self.allocator, req_method, path orelse "/");
-            defer req.deinit();
-            req.version = .HTTP_2;
-
-            // Copy headers.
-            for (extra_headers.entries.items) |entry| {
-                try req.headers.appendBorrowed(entry.name, entry.value);
-            }
-            if (authority) |auth| {
-                try req.headers.appendBorrowed("host", auth);
-            }
-
-            // If the HEADERS frame did not have END_STREAM, read DATA frames for the body.
-            const stream_id = sf.header.stream_id;
-            var body_buf = std.ArrayListUnmanaged(u8).empty;
-            defer body_buf.deinit(self.allocator);
-
-            if (sf.header.flags & H2Connection.FLAG_END_STREAM == 0) {
-                // Read DATA frames for this stream.
-                while (true) {
-                    var data_frame = try h2.readFrame(&h2_reader);
-                    defer data_frame.deinit(self.allocator);
-
-                    const maybe_data = try h2.dispatchFrame(&data_frame, sock);
-                    if (maybe_data == null) continue;
-                    const df = maybe_data.?;
-                    if (df.header.stream_id != stream_id) continue;
-
-                    if (df.header.frame_type == .data) {
-                        if (df.payload.len > 0) {
-                            try body_buf.appendSlice(self.allocator, df.payload);
-                            // Send WINDOW_UPDATE to keep flow control open.
-                            try h2.sendWindowUpdate(sock, 0, @intCast(df.payload.len));
-                            try h2.sendWindowUpdate(sock, stream_id, @intCast(df.payload.len));
-                        }
-                        if (df.header.flags & H2Connection.FLAG_END_STREAM != 0) break;
-                    } else if (df.header.frame_type == .rst_stream) {
-                        break;
-                    }
-                }
-            }
-
-            if (body_buf.items.len > 0) {
-                req.body = body_buf.items;
-                req.body_owned = false;
-            }
-
-            // Route and handle the request.
-            var ctx = Context.init(self.allocator, &req);
-            ctx.max_file_size = self.config.max_file_size;
-            defer ctx.deinit();
-
-            for (self.pre_route_hooks.items) |hook| {
-                hook(&ctx) catch {
-                    try self.sendH2Error(&h2, sock, stream_id, 500);
-                    continue;
+            // Spawn a fiber to handle this stream's request. Falls back to
+            // synchronous handling if the Io backend doesn't support fibers.
+            stream_fibers.concurrent(self.io, handleH2StreamFiber, .{ self, &h2, sock, sid }) catch {
+                self.handleH2Stream(&h2, sock, sid) catch |err| {
+                    std.debug.print("H2 stream handler error: {}\n", .{err});
                 };
+            };
+        }
+    }
+
+    /// Fiber entry point for per-stream HTTP/2 request handling.
+    fn handleH2StreamFiber(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31) Io.Cancelable!void {
+        self.handleH2Stream(h2, sock, stream_id) catch |err| {
+            std.debug.print("H2 stream handler error: {}\n", .{err});
+        };
+    }
+
+    /// Handles a single completed HTTP/2 stream: decodes headers from the
+    /// mailbox, routes the request, and sends the response. Acquires
+    /// `h2.write_mutex` for the response write phase.
+    fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31) !void {
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+
+        const hp = stream.headers_payload orelse return;
+
+        const decoded = try h2.decodeFrameHeaders(hp, stream.headers_flags);
+        defer {
+            for (decoded.headers) |*dh| {
+                self.allocator.free(dh.name);
+                self.allocator.free(dh.value);
             }
+            self.allocator.free(decoded.headers);
+        }
 
-            var suppress_body = false;
-            var params_buf: [16]RouteParam = undefined;
-            var route_result = self.router.find(req_method, req.uri.path, &params_buf);
+        // Extract pseudo-headers → build a Request.
+        var method_str: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
 
-            if (route_result == null and req_method == .HEAD) {
-                route_result = self.router.find(.GET, req.uri.path, &params_buf);
-                suppress_body = route_result != null;
+        var extra_headers = Headers.init(self.allocator);
+        defer extra_headers.deinit();
+
+        for (decoded.headers) |h| {
+            if (mem.eql(u8, h.name, ":method")) {
+                method_str = h.value;
+            } else if (mem.eql(u8, h.name, ":path")) {
+                path = h.value;
+            } else if (mem.eql(u8, h.name, ":authority")) {
+                authority = h.value;
+            } else if (mem.eql(u8, h.name, ":scheme")) {
+                // Consumed but not needed for routing.
+            } else if (h.name.len > 0 and h.name[0] != ':') {
+                try extra_headers.append(h.name, h.value);
             }
+        }
 
-            if (route_result) |r| {
-                ctx.params = r.params;
+        const req_method = types.Method.fromString(method_str orelse "GET") orelse .GET;
+        var req = try Request.init(self.allocator, req_method, path orelse "/");
+        defer req.deinit();
+        req.version = .HTTP_2;
+
+        for (extra_headers.entries.items) |entry| {
+            try req.headers.appendBorrowed(entry.name, entry.value);
+        }
+        if (authority) |auth| {
+            try req.headers.appendBorrowed("host", auth);
+        }
+
+        if (stream.data_buf.items.len > 0) {
+            req.body = stream.data_buf.items;
+            req.body_owned = false;
+        }
+
+        // Route and handle the request.
+        var ctx = Context.init(self.allocator, &req);
+        ctx.max_file_size = self.config.max_file_size;
+        defer ctx.deinit();
+
+        for (self.pre_route_hooks.items) |hook| {
+            hook(&ctx) catch {
+                try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                return;
+            };
+        }
+
+        var suppress_body = false;
+        var params_buf: [16]RouteParam = undefined;
+        var route_result = self.router.find(req_method, req.uri.path, &params_buf);
+
+        if (route_result == null and req_method == .HEAD) {
+            route_result = self.router.find(.GET, req.uri.path, &params_buf);
+            suppress_body = route_result != null;
+        }
+
+        if (route_result) |r| {
+            ctx.params = r.params;
+        }
+
+        var response: Response = undefined;
+        if (route_result) |r| {
+            response = self.executeMiddleware(&ctx, r.handler) catch {
+                try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+                return;
+            };
+        } else {
+            response = Response.init(self.allocator, 404);
+        }
+        defer response.deinit();
+
+        if (suppress_body) {
+            if (response.body_owned) {
+                if (response.body) |b| self.allocator.free(b);
+                response.body_owned = false;
             }
+            response.body = null;
+        }
 
-            var response: Response = undefined;
-            if (route_result) |r| {
-                response = self.executeMiddleware(&ctx, r.handler) catch {
-                    try self.sendH2Error(&h2, sock, stream_id, 500);
-                    continue;
-                };
-            } else {
-                response = Response.init(self.allocator, 404);
-            }
-            defer response.deinit();
+        // Build response headers outside the lock.
+        var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+        defer resp_extra.deinit(self.allocator);
 
-            if (suppress_body) {
-                if (response.body_owned) {
-                    if (response.body) |b| self.allocator.free(b);
-                    response.body_owned = false;
-                }
-                response.body = null;
-            }
+        for (response.headers.entries.items) |entry| {
+            try resp_extra.append(self.allocator, .{ .name = entry.name, .value = entry.value });
+        }
 
-            // Send response as h2 HEADERS + DATA.
-            var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
-            defer resp_extra.deinit(self.allocator);
+        var status_buf: [3]u8 = undefined;
+        const h2_headers = try H2Connection.buildResponseHeaders(
+            response.status.code,
+            resp_extra.items,
+            &status_buf,
+            self.allocator,
+        );
+        defer self.allocator.free(h2_headers);
 
-            for (response.headers.entries.items) |entry| {
-                try resp_extra.append(self.allocator, .{ .name = entry.name, .value = entry.value });
-            }
+        const has_body = response.body != null and response.body.?.len > 0;
 
-            var status_buf: [3]u8 = undefined;
-            const h2_headers = try H2Connection.buildResponseHeaders(
-                response.status.code,
-                resp_extra.items,
-                &status_buf,
-                self.allocator,
-            );
-            defer self.allocator.free(h2_headers);
+        // Acquire write mutex for HPACK encoding + frame serialization.
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
 
-            const has_body = response.body != null and response.body.?.len > 0;
-            try h2.sendHeaders(sock, stream_id, h2_headers, !has_body);
+        try h2.sendHeaders(sock, stream_id, h2_headers, !has_body);
 
-            if (has_body) {
-                try h2.writeData(sock, stream_id, response.body.?, true);
-            }
+        if (has_body) {
+            try h2.writeData(sock, stream_id, response.body.?, true);
         }
     }
 
@@ -887,6 +923,13 @@ pub const Server = struct {
         const h2_headers = try H2Connection.buildResponseHeaders(code, &.{}, &status_buf, self.allocator);
         defer self.allocator.free(h2_headers);
         try h2.sendHeaders(writer, stream_id, h2_headers, true);
+    }
+
+    /// Like `sendH2Error` but acquires the write mutex first.
+    fn sendH2ErrorLocked(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
+        h2.write_mutex.lockUncancelable(h2.io);
+        defer h2.write_mutex.unlock(h2.io);
+        try self.sendH2Error(h2, writer, stream_id, code);
     }
 
     /// Sends an error response.

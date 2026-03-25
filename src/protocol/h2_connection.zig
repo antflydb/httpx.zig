@@ -15,6 +15,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const Io = std.Io;
 
 const http = @import("http.zig");
 const stream_mod = @import("stream.zig");
@@ -47,6 +48,7 @@ pub const Frame = struct {
 /// Writer must have `writeAll(data: []const u8) !void`.
 pub const H2Connection = struct {
     allocator: Allocator,
+    io: Io,
     stream_manager: StreamManager,
     local_settings: Http2Settings,
     peer_settings: Http2Settings,
@@ -54,6 +56,9 @@ pub const H2Connection = struct {
     goaway_sent: bool = false,
     goaway_received: bool = false,
     last_peer_stream_id: u31 = 0,
+
+    /// Serializes frame writes so multiple fibers can safely share one connection.
+    write_mutex: Io.Mutex = Io.Mutex.init,
 
     // Reassembly buffer for CONTINUATION frames.
     continuation_stream_id: ?u31 = null,
@@ -70,9 +75,10 @@ pub const H2Connection = struct {
     pub const FLAG_PRIORITY: u8 = 0x20;
 
     /// Creates a client-side HTTP/2 connection.
-    pub fn initClient(allocator: Allocator) Self {
+    pub fn initClient(allocator: Allocator, io: Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .stream_manager = StreamManager.init(allocator, true),
             .local_settings = .{},
             .peer_settings = .{},
@@ -81,9 +87,10 @@ pub const H2Connection = struct {
     }
 
     /// Creates a server-side HTTP/2 connection.
-    pub fn initServer(allocator: Allocator) Self {
+    pub fn initServer(allocator: Allocator, io: Io) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .stream_manager = StreamManager.init(allocator, false),
             .local_settings = .{},
             .peer_settings = .{},
@@ -318,13 +325,35 @@ pub const H2Connection = struct {
         s.reset();
     }
 
-    /// Sends a GOAWAY frame.
+    /// Sends a GOAWAY frame advertising the last stream ID we processed.
     pub fn sendGoaway(self: *Self, writer: anytype, error_code: Http2ErrorCode) !void {
         const last_id = if (self.is_server) self.stream_manager.next_client_stream_id -| 2 else self.stream_manager.next_server_stream_id -| 2;
         const payload = try stream_mod.buildGoawayPayload(@intCast(last_id), error_code, null, self.allocator);
         defer self.allocator.free(payload);
         try self.writeFrame(writer, .goaway, 0, 0, payload);
         self.goaway_sent = true;
+    }
+
+    /// Returns true if the connection is draining (GOAWAY sent or received)
+    /// and no streams are still open.
+    pub fn isDrained(self: *const Self) bool {
+        return (self.goaway_sent or self.goaway_received) and
+            self.stream_manager.activeStreamCount() == 0;
+    }
+
+    /// Initiates graceful shutdown: sends GOAWAY with no_error, then pumps
+    /// frames until all in-flight streams complete or the peer closes.
+    pub fn gracefulShutdown(self: *Self, reader: anytype, writer: anytype) !void {
+        if (!self.goaway_sent) {
+            try self.sendGoaway(writer, .no_error);
+        }
+        // Drain remaining stream frames until all streams are done.
+        while (self.stream_manager.activeStreamCount() > 0) {
+            _ = self.processOneFrame(reader, writer) catch |err| switch (err) {
+                error.ConnectionClosed => return,
+                else => return err,
+            };
+        }
     }
 
     /// Sends a RST_STREAM frame.
@@ -431,6 +460,119 @@ pub const H2Connection = struct {
     }
 
     // ---------------------------------------------------------------
+    // Per-stream mailbox delivery and frame pumping
+    // ---------------------------------------------------------------
+
+    /// Delivers a stream-level frame to the target stream's mailbox.
+    /// Copies payload data so the original frame can be freed afterward.
+    pub fn deliverToMailbox(self: *Self, frame: *const Frame) !void {
+        const sid = frame.header.stream_id;
+        if (sid == 0) return;
+
+        const stream = self.stream_manager.getStream(sid) orelse
+            try self.stream_manager.getOrCreateStream(sid);
+
+        switch (frame.header.frame_type) {
+            .headers => {
+                if (stream.headers_payload) |old| self.allocator.free(old);
+                stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
+                stream.headers_flags = frame.header.flags;
+                stream.got_headers = true;
+                if (frame.header.flags & FLAG_END_STREAM != 0) {
+                    stream.completed = true;
+                    stream.receiveEndStream();
+                }
+            },
+            .data => {
+                try stream.data_buf.appendSlice(self.allocator, frame.payload);
+                if (frame.header.flags & FLAG_END_STREAM != 0) {
+                    stream.completed = true;
+                    stream.receiveEndStream();
+                }
+            },
+            .rst_stream => {
+                stream.stream_error = error.StreamReset;
+                stream.completed = true;
+                stream.reset();
+            },
+            else => {},
+        }
+    }
+
+    /// Reads one frame, handles connection-level frames internally, and
+    /// delivers stream-level frames to the per-stream mailbox. Sends
+    /// WINDOW_UPDATE for received DATA to keep flow control open.
+    /// Returns the stream ID that received data, or null.
+    pub fn processOneFrame(self: *Self, reader: anytype, writer: anytype) !?u31 {
+        var frame = try self.readFrame(reader);
+        defer frame.deinit(self.allocator);
+
+        const maybe = try self.dispatchFrame(&frame, writer);
+        if (maybe) |sf| {
+            if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                const inc: u31 = @intCast(sf.payload.len);
+                try self.sendWindowUpdate(writer, 0, inc);
+                try self.sendWindowUpdate(writer, sf.header.stream_id, inc);
+            }
+            try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+            return sf.header.stream_id;
+        }
+        return null;
+    }
+
+    /// Like `processOneFrame` but acquires `write_mutex` around any frame
+    /// writes (SETTINGS ACK, PING echo, WINDOW_UPDATE). Use this when
+    /// handler fibers may be writing concurrently on the same connection.
+    pub fn processOneFrameLocked(self: *Self, reader: anytype, writer: anytype) !?u31 {
+        // Read without the lock — reading blocks on I/O and must not prevent
+        // handler fibers from writing responses.
+        var frame = try self.readFrame(reader);
+        defer frame.deinit(self.allocator);
+
+        // Lock for writes: dispatchFrame may send SETTINGS ACK or PING echo,
+        // and we may send WINDOW_UPDATE for DATA frames.
+        {
+            self.write_mutex.lockUncancelable(self.io);
+            defer self.write_mutex.unlock(self.io);
+
+            const maybe = try self.dispatchFrame(&frame, writer);
+            if (maybe) |sf| {
+                if (sf.header.frame_type == .data and sf.payload.len > 0) {
+                    const inc: u31 = @intCast(sf.payload.len);
+                    try self.sendWindowUpdate(writer, 0, inc);
+                    try self.sendWindowUpdate(writer, sf.header.stream_id, inc);
+                }
+                // deliverToMailbox copies payload, safe to call under lock.
+                try self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload });
+                return sf.header.stream_id;
+            }
+        }
+        return null;
+    }
+
+    /// Pumps frames until the given stream has received its HEADERS.
+    pub fn awaitStreamHeaders(self: *Self, reader: anytype, writer: anytype, stream_id: u31) !void {
+        while (true) {
+            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+            if (stream.got_headers) return;
+            if (stream.stream_error) |err| return err;
+            _ = try self.processOneFrame(reader, writer);
+        }
+    }
+
+    /// Pumps frames until the given stream is complete (END_STREAM or error).
+    pub fn awaitStreamComplete(self: *Self, reader: anytype, writer: anytype, stream_id: u31) !void {
+        while (true) {
+            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+            if (stream.completed) {
+                if (stream.stream_error) |err| return err;
+                return;
+            }
+            _ = try self.processOneFrame(reader, writer);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // I/O helpers — work with any duck-typed reader/writer
     // ---------------------------------------------------------------
 
@@ -515,7 +657,7 @@ test "connection preface round-trip" {
     var wire = std.ArrayListUnmanaged(u8).empty;
     defer wire.deinit(allocator);
 
-    var client = H2Connection.initClient(allocator);
+    var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
 
     // Client writes preface + SETTINGS.
@@ -523,7 +665,7 @@ test "connection preface round-trip" {
     try client.sendClientPreface(writer);
 
     // Server reads and validates preface.
-    var server = H2Connection.initServer(allocator);
+    var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
 
     var reader = TestReader{ .data = wire.items };
@@ -544,7 +686,7 @@ test "SETTINGS exchange" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
     conn.local_settings.max_concurrent_streams = 42;
 
@@ -558,7 +700,7 @@ test "SETTINGS exchange" {
     try std.testing.expect(frame.header.flags & H2Connection.FLAG_ACK == 0);
 
     // Apply settings on peer side.
-    var peer = H2Connection.initServer(allocator);
+    var peer = H2Connection.initServer(allocator, std.testing.io);
     defer peer.deinit();
     try peer.applyPeerSettings(frame.payload);
     try std.testing.expectEqual(@as(u32, 42), peer.peer_settings.max_concurrent_streams);
@@ -571,7 +713,7 @@ test "SETTINGS ACK" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
     try conn.sendSettingsAck(writer);
 
@@ -591,7 +733,7 @@ test "PING echo" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initServer(allocator);
+    var conn = H2Connection.initServer(allocator, std.testing.io);
     defer conn.deinit();
 
     const ping_data = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -626,7 +768,7 @@ test "GOAWAY handling" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
 
     // Build a GOAWAY frame (last_stream_id=7, no_error).
@@ -651,7 +793,7 @@ test "WINDOW_UPDATE handling" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
 
     const initial_window = conn.stream_manager.connection_send_window;
@@ -674,7 +816,7 @@ test "HEADERS with CONTINUATION reassembly" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
 
     // HEADERS frame without END_HEADERS + CONTINUATION with END_HEADERS.
@@ -700,7 +842,7 @@ test "single HEADERS frame (no CONTINUATION)" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
 
     try conn.writeFrame(writer, .headers, H2Connection.FLAG_END_HEADERS | H2Connection.FLAG_END_STREAM, 1, "complete");
@@ -720,7 +862,7 @@ test "writeHeaders splits at MAX_FRAME_SIZE" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initClient(allocator);
+    var conn = H2Connection.initClient(allocator, std.testing.io);
     defer conn.deinit();
     conn.peer_settings.max_frame_size = 10;
 
@@ -728,7 +870,7 @@ test "writeHeaders splits at MAX_FRAME_SIZE" {
     try conn.writeHeaders(writer, 1, block, true);
 
     // Read back with CONTINUATION reassembly.
-    var conn2 = H2Connection.initClient(allocator);
+    var conn2 = H2Connection.initClient(allocator, std.testing.io);
     defer conn2.deinit();
     conn2.local_settings.max_frame_size = 16384; // Allow reading large reassembled payload.
 
@@ -748,7 +890,7 @@ test "dispatchFrame routes correctly" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var conn = H2Connection.initServer(allocator);
+    var conn = H2Connection.initServer(allocator, std.testing.io);
     defer conn.deinit();
 
     try conn.sendSettings(writer);
@@ -803,7 +945,7 @@ test "HPACK encode + decode round-trip via sendHeaders/decodeFrameHeaders" {
     defer wire.deinit(allocator);
     const writer = testWriter(&wire, allocator);
 
-    var client = H2Connection.initClient(allocator);
+    var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
 
     const h2_headers = [_]hpack.HeaderEntry{
@@ -815,7 +957,7 @@ test "HPACK encode + decode round-trip via sendHeaders/decodeFrameHeaders" {
     try client.sendHeaders(writer, 1, &h2_headers, true);
 
     // Decode on server side.
-    var server = H2Connection.initServer(allocator);
+    var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
 
     var reader = TestReader{ .data = wire.items };
@@ -852,7 +994,7 @@ test "full HTTP/2 request-response round-trip" {
     defer c2s.deinit(allocator);
     const c2s_w = testWriter(&c2s, allocator);
 
-    var client = H2Connection.initClient(allocator);
+    var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
 
     try client.sendClientPreface(c2s_w);
@@ -868,7 +1010,7 @@ test "full HTTP/2 request-response round-trip" {
     try client.sendHeaders(c2s_w, 1, &req_headers, true); // END_STREAM (no body)
 
     // --- Server reads preface + SETTINGS + request ---
-    var server = H2Connection.initServer(allocator);
+    var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
 
     var s_reader = TestReader{ .data = c2s.items };
@@ -968,4 +1110,104 @@ test "full HTTP/2 request-response round-trip" {
     // Verify the response.
     try std.testing.expectEqualStrings("200", got_status.?);
     try std.testing.expectEqualStrings("Hello, HTTP/2!", got_body.items);
+}
+
+test "mailbox-based request-response round-trip" {
+    const allocator = std.testing.allocator;
+
+    // --- Client sends preface + SETTINGS + request ---
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+
+    try client.sendClientPreface(c2s_w);
+
+    _ = try client.stream_manager.createStream();
+    const req_headers = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/api/data" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try client.sendHeaders(c2s_w, 1, &req_headers, false);
+    try client.writeData(c2s_w, 1, "request body", true);
+
+    // --- Server reads via mailbox pattern ---
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    var s_reader = TestReader{ .data = c2s.items };
+    try server.readClientPreface(&s_reader);
+
+    var s2c = std.ArrayListUnmanaged(u8).empty;
+    defer s2c.deinit(allocator);
+    const s2c_w = testWriter(&s2c, allocator);
+
+    // Read client SETTINGS.
+    var settings_frame = try server.readFrame(&s_reader);
+    try server.handleSettings(&settings_frame, s2c_w);
+    settings_frame.deinit(allocator);
+
+    try server.sendSettings(s2c_w);
+
+    // Pump frames until stream 1 is complete.
+    while (true) {
+        _ = try server.processOneFrame(&s_reader, s2c_w);
+        if (server.stream_manager.getStream(1)) |s| {
+            if (s.completed) break;
+        }
+    }
+
+    // Verify mailbox contents.
+    const s1 = server.stream_manager.getStream(1).?;
+    try std.testing.expect(s1.got_headers);
+    try std.testing.expect(s1.completed);
+    try std.testing.expect(s1.headers_payload != null);
+    try std.testing.expectEqualStrings("request body", s1.data_buf.items);
+
+    // Decode headers from mailbox.
+    const dec = try server.decodeFrameHeaders(s1.headers_payload.?, s1.headers_flags);
+    defer {
+        for (dec.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(dec.headers);
+    }
+    try std.testing.expectEqualStrings(":method", dec.headers[0].name);
+    try std.testing.expectEqualStrings("POST", dec.headers[0].value);
+    try std.testing.expectEqualStrings("/api/data", dec.headers[1].value);
+
+    // --- Server sends response, client reads via awaitStreamComplete ---
+    var status_buf: [3]u8 = undefined;
+    const resp_headers = try H2Connection.buildResponseHeaders(201, &.{}, &status_buf, allocator);
+    defer allocator.free(resp_headers);
+
+    _ = try server.stream_manager.getOrCreateStream(1);
+    try server.sendHeaders(s2c_w, 1, resp_headers, false);
+    try server.writeData(s2c_w, 1, "response body", true);
+
+    // Client uses awaitStreamComplete.
+    var c_reader = TestReader{ .data = s2c.items };
+    try client.awaitStreamComplete(&c_reader, c2s_w, 1);
+
+    const cs1 = client.stream_manager.getStream(1).?;
+    try std.testing.expect(cs1.completed);
+    try std.testing.expect(cs1.got_headers);
+    try std.testing.expectEqualStrings("response body", cs1.data_buf.items);
+
+    // Decode response headers from mailbox.
+    const rdec = try client.decodeFrameHeaders(cs1.headers_payload.?, cs1.headers_flags);
+    defer {
+        for (rdec.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(rdec.headers);
+    }
+    try std.testing.expectEqualStrings(":status", rdec.headers[0].name);
+    try std.testing.expectEqualStrings("201", rdec.headers[0].value);
 }

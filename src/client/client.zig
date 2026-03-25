@@ -52,7 +52,13 @@ pub const ClientConfig = struct {
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     verify_ssl: bool = true,
+    /// Enable HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
+    /// The client sends the h2 preface directly without ALPN negotiation.
+    /// When Zig's stdlib exposes ALPN, this will additionally negotiate h2.
     http2_enabled: bool = false,
+    /// Alias for `http2_enabled`. When true, the client always speaks HTTP/2
+    /// to every host, regardless of ALPN (which the stdlib doesn't support yet).
+    force_http2: bool = false,
     http3_enabled: bool = false,
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
@@ -82,6 +88,16 @@ pub const Interceptor = struct {
     context: ?*anyopaque = null,
 };
 
+/// A pooled HTTP/2 connection: socket + optional TLS + H2Connection state.
+/// Heap-allocated for pointer stability (TlsSession stores internal pointers).
+const H2PoolEntry = struct {
+    socket: Socket,
+    session: TlsSession,
+    h2: H2Connection,
+    is_tls: bool,
+    broken: bool = false,
+};
+
 /// HTTP Client.
 pub const Client = struct {
     allocator: Allocator,
@@ -92,6 +108,8 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
+    /// Cached HTTP/2 connections keyed by "host:port".
+    h2_conns: std.StringHashMapUnmanaged(*H2PoolEntry) = .{},
 
     const Self = @This();
 
@@ -126,6 +144,18 @@ pub const Client = struct {
         self.cookies.deinit(self.allocator);
         self.pool.deinit();
         self.tls_pool.deinit();
+
+        // Clean up cached HTTP/2 connections.
+        var h2_it = self.h2_conns.iterator();
+        while (h2_it.next()) |entry| {
+            const e = entry.value_ptr.*;
+            e.h2.deinit();
+            if (e.is_tls) e.session.deinit();
+            e.socket.close();
+            self.allocator.destroy(e);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.h2_conns.deinit(self.allocator);
     }
 
     /// Adds an interceptor to the client.
@@ -272,30 +302,17 @@ pub const Client = struct {
         };
 
         // HTTP/2 "prior knowledge" path (RFC 7540 §3.4).
-        if (self.config.http2_enabled) {
-            if (req.uri.isTls()) {
-                const addr = try Address.resolve(self.io, host, port);
-                var socket = try Socket.connect(addr, self.io);
-                defer socket.close();
-                try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
-
-                var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
-                tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
-                var session = TlsSession.init(tls_cfg, self.io);
-                defer session.deinit();
-                session.attachSocket(&socket);
-                try session.handshake(host);
-
-                const r = try session.getReader();
-                const w = try session.getWriter();
-                return self.executeH2Request(r, w, req);
-            }
-
-            const addr = try Address.resolve(self.io, host, port);
-            var socket = try Socket.connect(addr, self.io);
-            defer socket.close();
-            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
-            return self.executeH2Request(&socket, &socket, req);
+        // Reuses a pooled connection per host when available.
+        if (self.config.http2_enabled or self.config.force_http2) {
+            const is_tls = req.uri.isTls();
+            const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+            const result = self.executeH2OnPooled(entry, req) catch |err| {
+                entry.broken = true;
+                return err;
+            };
+            // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
+            if (entry.h2.goaway_received) entry.broken = true;
+            return result;
         }
 
         if (req.uri.isTls()) {
@@ -372,12 +389,187 @@ pub const Client = struct {
         return self.executeOnTls(&session, req, null);
     }
 
+    /// Gets or creates a pooled HTTP/2 connection for the given host:port.
+    /// The connection preface and SETTINGS exchange happen once on creation;
+    /// subsequent requests reuse the same TCP/TLS + H2Connection state.
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
+        var key_buf: [280]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
+
+        // Return existing healthy connection.
+        if (self.h2_conns.get(key)) |entry| {
+            if (!entry.broken) return entry;
+            // Remove and destroy broken entry.
+            if (self.h2_conns.fetchRemove(key)) |removed| {
+                const e = removed.value;
+                e.h2.deinit();
+                if (e.is_tls) e.session.deinit();
+                e.socket.close();
+                self.allocator.destroy(e);
+                self.allocator.free(removed.key);
+            }
+        }
+
+        // Create a new connection.
+        const entry = try self.allocator.create(H2PoolEntry);
+        errdefer self.allocator.destroy(entry);
+
+        const addr = try Address.resolve(self.io, host, port);
+        entry.socket = try Socket.connect(addr, self.io);
+        errdefer entry.socket.close();
+
+        entry.is_tls = is_tls;
+        entry.broken = false;
+
+        if (is_tls) {
+            var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+            tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
+            entry.session = TlsSession.init(tls_cfg, self.io);
+            errdefer entry.session.deinit();
+            entry.session.attachSocket(&entry.socket);
+            try entry.session.handshake(host);
+        } else {
+            // Initialize a dummy session (deinit is safe on un-handshaked session).
+            entry.session = TlsSession.init(TlsConfig.init(self.allocator), self.io);
+        }
+
+        entry.h2 = H2Connection.initClient(self.allocator, self.io);
+        errdefer entry.h2.deinit();
+
+        // Perform h2 handshake: preface + SETTINGS exchange.
+        if (is_tls) {
+            const w = try entry.session.getWriter();
+            try entry.h2.sendClientPreface(w);
+            const r = try entry.session.getReader();
+            try self.exchangeH2Settings(&entry.h2, r, w);
+        } else {
+            try entry.h2.sendClientPreface(&entry.socket);
+            try self.exchangeH2Settings(&entry.h2, &entry.socket, &entry.socket);
+        }
+
+        const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
+        errdefer self.allocator.free(owned_key);
+        try self.h2_conns.put(self.allocator, owned_key, entry);
+        return entry;
+    }
+
+    /// Reads frames until the server's initial SETTINGS has been received and ACKed.
+    fn exchangeH2Settings(self: *Self, h2: *H2Connection, reader: anytype, writer: anytype) !void {
+        var settings_received = false;
+        while (!settings_received) {
+            var frame = try h2.readFrame(reader);
+            defer frame.deinit(self.allocator);
+            if (frame.header.frame_type == .settings and frame.header.flags & H2Connection.FLAG_ACK == 0) {
+                try h2.handleSettings(&frame, writer);
+                settings_received = true;
+            } else {
+                _ = try h2.dispatchFrame(&frame, writer);
+            }
+        }
+    }
+
+    /// Executes a request on a pooled H2 connection. Creates a stream, sends
+    /// the request, pumps frames until complete, and extracts the response.
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
+        const h2 = &entry.h2;
+        const stream = try h2.stream_manager.createStream();
+        const stream_id = stream.id;
+
+        // Build request pseudo-headers.
+        const method_str = if (req.method == .CUSTOM)
+            req.custom_method orelse "CUSTOM"
+        else
+            req.method.toString();
+        const scheme = req.uri.scheme orelse "http";
+        const authority = req.uri.host orelse return error.InvalidUri;
+        var path_buf = std.ArrayListUnmanaged(u8).empty;
+        defer path_buf.deinit(self.allocator);
+        const alw = arrayListWriter(&path_buf, self.allocator);
+        try alw.writeAll(req.uri.path);
+        if (req.uri.query) |q| {
+            try alw.writeAll("?");
+            try alw.writeAll(q);
+        }
+        const path = path_buf.items;
+
+        var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+        defer extra.deinit(self.allocator);
+        for (req.headers.entries.items) |he| {
+            if (std.ascii.eqlIgnoreCase(he.name, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "connection")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "transfer-encoding")) continue;
+            if (std.ascii.eqlIgnoreCase(he.name, "upgrade")) continue;
+            try extra.append(self.allocator, .{ .name = he.name, .value = he.value });
+        }
+
+        const h2_headers = try H2Connection.buildRequestHeaders(
+            method_str, path, scheme, authority, extra.items, self.allocator,
+        );
+        defer self.allocator.free(h2_headers);
+
+        const has_body = req.body != null;
+
+        // Send + await using the appropriate reader/writer.
+        if (entry.is_tls) {
+            const r = try entry.session.getReader();
+            const w = try entry.session.getWriter();
+            try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+            if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+            try h2.awaitStreamComplete(r, w, stream_id);
+        } else {
+            try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+            if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+            try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
+        }
+
+        // Extract response from mailbox.
+        const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
+        defer h2.stream_manager.removeStream(stream_id);
+        if (s.stream_error) |err| return err;
+
+        const hp = s.headers_payload orelse return error.InvalidResponse;
+        const decoded = try h2.decodeFrameHeaders(hp, s.headers_flags);
+        defer {
+            for (decoded.headers) |*dh| {
+                self.allocator.free(dh.name);
+                self.allocator.free(dh.value);
+            }
+            self.allocator.free(decoded.headers);
+        }
+
+        var status_code: ?u16 = null;
+        var response_headers = Headers.init(self.allocator);
+        errdefer response_headers.deinit();
+
+        for (decoded.headers) |h| {
+            if (mem.eql(u8, h.name, ":status")) {
+                status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
+            } else if (h.name.len > 0 and h.name[0] != ':') {
+                try response_headers.append(h.name, h.value);
+            }
+        }
+
+        const code = status_code orelse return error.InvalidResponse;
+        var res = Response.init(self.allocator, code);
+        res.version = .HTTP_2;
+        res.headers.deinit();
+        res.headers = response_headers;
+
+        if (s.data_buf.items.len > 0) {
+            if (s.data_buf.items.len > self.config.max_response_size) return error.ResponseTooLarge;
+            res.body = try self.allocator.dupe(u8, s.data_buf.items);
+            res.body_owned = true;
+        }
+
+        return res;
+    }
+
     /// Executes a single HTTP/2 request over an already-connected reader/writer pair.
     ///
     /// Performs the full h2 lifecycle: connection preface → SETTINGS exchange →
     /// send request as HEADERS (+DATA) → read response HEADERS + DATA frames.
     fn executeH2Request(self: *Self, reader: anytype, writer: anytype, req: *Request) !Response {
-        var h2 = H2Connection.initClient(self.allocator);
+        var h2 = H2Connection.initClient(self.allocator, self.io);
         defer h2.deinit();
 
         // 1. Connection preface + SETTINGS.
@@ -447,61 +639,29 @@ pub const Client = struct {
             try h2.writeData(writer, stream_id, body, true);
         }
 
-        // 5. Read response frames until we have HEADERS + all DATA.
-        var res_headers: ?[]hpack.DecodedHeader = null;
-        defer if (res_headers) |hdrs| {
-            for (hdrs) |*h| {
-                self.allocator.free(h.name);
-                self.allocator.free(h.value);
+        // 5. Pump frames until the stream is complete (HEADERS + DATA + END_STREAM).
+        //    processOneFrame handles connection-level frames and WINDOW_UPDATE internally.
+        try h2.awaitStreamComplete(reader, writer, stream_id);
+
+        // 6. Extract response from per-stream mailbox.
+        const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
+        if (s.stream_error) |err| return err;
+
+        const hp = s.headers_payload orelse return error.InvalidResponse;
+        const decoded = try h2.decodeFrameHeaders(hp, s.headers_flags);
+        defer {
+            for (decoded.headers) |*dh| {
+                self.allocator.free(dh.name);
+                self.allocator.free(dh.value);
             }
-            self.allocator.free(hdrs);
-        };
-        var body_buf = std.ArrayListUnmanaged(u8).empty;
-        defer body_buf.deinit(self.allocator);
-        var end_stream = false;
-
-        while (!end_stream) {
-            var frame = try h2.readFrame(reader);
-            defer frame.deinit(self.allocator);
-
-            // Let H2Connection handle connection-level frames (SETTINGS ACK, PING, etc.)
-            const maybe_stream_frame = try h2.dispatchFrame(&frame, writer);
-            if (maybe_stream_frame == null) continue;
-
-            const sf = maybe_stream_frame.?;
-            if (sf.header.stream_id != stream_id) continue;
-
-            switch (sf.header.frame_type) {
-                .headers => {
-                    const decoded = try h2.decodeFrameHeaders(sf.payload, sf.header.flags);
-                    res_headers = decoded.headers;
-                    if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
-                },
-                .data => {
-                    if (sf.payload.len > 0) {
-                        if (body_buf.items.len + sf.payload.len > self.config.max_response_size)
-                            return error.ResponseTooLarge;
-                        try body_buf.appendSlice(self.allocator, sf.payload);
-                        try h2.sendWindowUpdate(writer, 0, @intCast(sf.payload.len));
-                        try h2.sendWindowUpdate(writer, stream_id, @intCast(sf.payload.len));
-                    }
-                    if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
-                },
-                .rst_stream => {
-                    try h2.handleRstStream(&frame);
-                    return error.StreamReset;
-                },
-                else => {},
-            }
+            self.allocator.free(decoded.headers);
         }
 
-        // 6. Build Response from decoded headers + body.
-        const hdrs = res_headers orelse return error.InvalidResponse;
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (hdrs) |h| {
+        for (decoded.headers) |h| {
             if (mem.eql(u8, h.name, ":status")) {
                 status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
             } else if (h.name.len > 0 and h.name[0] != ':') {
@@ -515,8 +675,9 @@ pub const Client = struct {
         res.headers.deinit();
         res.headers = response_headers;
 
-        if (body_buf.items.len > 0) {
-            res.body = try body_buf.toOwnedSlice(self.allocator);
+        if (s.data_buf.items.len > 0) {
+            if (s.data_buf.items.len > self.config.max_response_size) return error.ResponseTooLarge;
+            res.body = try self.allocator.dupe(u8, s.data_buf.items);
             res.body_owned = true;
         }
 

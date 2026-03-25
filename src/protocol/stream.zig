@@ -78,6 +78,22 @@ pub const Stream = struct {
     /// Response headers (decoded).
     response_headers: ?[]hpack.DecodedHeader = null,
 
+    // -- Per-stream mailbox for multiplexed I/O --
+    // The receive loop writes here; request fibers read.
+
+    /// Raw HEADERS frame payload (HPACK-encoded), set by the receive loop.
+    headers_payload: ?[]u8 = null,
+    /// Flags from the HEADERS frame (contains END_STREAM, etc).
+    headers_flags: u8 = 0,
+    /// Accumulated DATA frame payloads for this stream.
+    data_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Error from RST_STREAM or connection error, set by the receive loop.
+    stream_error: ?anyerror = null,
+    /// True once the receive loop has delivered HEADERS for this stream.
+    got_headers: bool = false,
+    /// True once all frames for this stream have been received (END_STREAM or error).
+    completed: bool = false,
+
     const Self = @This();
 
     pub fn init(id: u31) Self {
@@ -87,6 +103,8 @@ pub const Stream = struct {
     pub fn deinit(self: *Self, allocator: Allocator) void {
         self.send_buffer.deinit(allocator);
         self.recv_buffer.deinit(allocator);
+        self.data_buf.deinit(allocator);
+        if (self.headers_payload) |hp| allocator.free(hp);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.response_headers);
     }
