@@ -13,6 +13,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const Io = std.Io;
 
 const http = @import("http.zig");
 const hpack = @import("hpack.zig");
@@ -93,6 +94,9 @@ pub const Stream = struct {
     got_headers: bool = false,
     /// True once all frames for this stream have been received (END_STREAM or error).
     completed: bool = false,
+    /// Optional semaphore posted by the receive loop when this stream completes.
+    /// Owned by the requesting fiber (stack-allocated); the receive loop only calls post().
+    completion_sem: ?*Io.Semaphore = null,
 
     const Self = @This();
 

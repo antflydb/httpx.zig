@@ -481,6 +481,7 @@ pub const H2Connection = struct {
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
+                    if (stream.completion_sem) |sem| sem.post(self.io);
                 }
             },
             .data => {
@@ -488,12 +489,14 @@ pub const H2Connection = struct {
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
                     stream.receiveEndStream();
+                    if (stream.completion_sem) |sem| sem.post(self.io);
                 }
             },
             .rst_stream => {
                 stream.stream_error = error.StreamReset;
                 stream.completed = true;
                 stream.reset();
+                if (stream.completion_sem) |sem| sem.post(self.io);
             },
             else => {},
         }
@@ -569,6 +572,19 @@ pub const H2Connection = struct {
                 return;
             }
             _ = try self.processOneFrame(reader, writer);
+        }
+    }
+
+    /// Continuously pumps frames until GOAWAY or connection error.
+    /// Delivers stream-level frames to per-stream mailboxes (posting
+    /// completion semaphores when set). Intended for a background
+    /// receive fiber on client-side multiplexed connections.
+    pub fn runReceiveLoop(self: *Self, reader: anytype, writer: anytype) !void {
+        while (!self.goaway_received) {
+            _ = self.processOneFrameLocked(reader, writer) catch |err| switch (err) {
+                error.ConnectionClosed => return,
+                else => return err,
+            };
         }
     }
 

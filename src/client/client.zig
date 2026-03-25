@@ -90,12 +90,18 @@ pub const Interceptor = struct {
 
 /// A pooled HTTP/2 connection: socket + optional TLS + H2Connection state.
 /// Heap-allocated for pointer stability (TlsSession stores internal pointers).
+/// When fiber support is available, a background receive-loop fiber pumps
+/// frames continuously, enabling true stream multiplexing on one connection.
 const H2PoolEntry = struct {
     socket: Socket,
     session: TlsSession,
     h2: H2Connection,
     is_tls: bool,
     broken: bool = false,
+    /// Tracks the background receive-loop fiber (if spawned).
+    recv_group: Io.Group = Io.Group.init,
+    /// True when a receive-loop fiber is actively pumping frames.
+    recv_running: bool = false,
 };
 
 /// HTTP Client.
@@ -149,6 +155,8 @@ pub const Client = struct {
         var h2_it = self.h2_conns.iterator();
         while (h2_it.next()) |entry| {
             const e = entry.value_ptr.*;
+            // Wait for the receive-loop fiber to finish before tearing down.
+            e.recv_group.await(self.io) catch {};
             e.h2.deinit();
             if (e.is_tls) e.session.deinit();
             e.socket.close();
@@ -402,6 +410,7 @@ pub const Client = struct {
             // Remove and destroy broken entry.
             if (self.h2_conns.fetchRemove(key)) |removed| {
                 const e = removed.value;
+                e.recv_group.await(self.io) catch {};
                 e.h2.deinit();
                 if (e.is_tls) e.session.deinit();
                 e.socket.close();
@@ -447,6 +456,14 @@ pub const Client = struct {
             try self.exchangeH2Settings(&entry.h2, &entry.socket, &entry.socket);
         }
 
+        // Spawn a background receive-loop fiber so multiple request fibers
+        // can share this connection via stream multiplexing.
+        if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
+            entry.recv_running = true;
+        } else |_| {
+            // No fiber support — fall back to inline frame pumping per request.
+        }
+
         const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
         errdefer self.allocator.free(owned_key);
         try self.h2_conns.put(self.allocator, owned_key, entry);
@@ -468,8 +485,31 @@ pub const Client = struct {
         }
     }
 
+    /// Background receive-loop fiber for multiplexed H2 connections.
+    /// Continuously pumps frames until GOAWAY or connection error.
+    fn h2RecvLoopFiber(entry: *H2PoolEntry) Io.Cancelable!void {
+        if (entry.is_tls) {
+            const r = entry.session.getReader() catch {
+                entry.broken = true;
+                return;
+            };
+            const w = entry.session.getWriter() catch {
+                entry.broken = true;
+                return;
+            };
+            entry.h2.runReceiveLoop(r, w) catch {};
+        } else {
+            entry.h2.runReceiveLoop(&entry.socket, &entry.socket) catch {};
+        }
+        entry.broken = true;
+    }
+
     /// Executes a request on a pooled H2 connection. Creates a stream, sends
     /// the request, pumps frames until complete, and extracts the response.
+    ///
+    /// In multiplexed mode (recv_running=true), the background receive fiber
+    /// pumps frames while this fiber waits on a per-stream semaphore.
+    /// In fallback mode, frames are pumped inline via awaitStreamComplete.
     fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
         const h2 = &entry.h2;
         const stream = try h2.stream_manager.createStream();
@@ -509,17 +549,42 @@ pub const Client = struct {
 
         const has_body = req.body != null;
 
-        // Send + await using the appropriate reader/writer.
-        if (entry.is_tls) {
-            const r = try entry.session.getReader();
-            const w = try entry.session.getWriter();
-            try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-            if (req.body) |body| try h2.writeData(w, stream_id, body, true);
-            try h2.awaitStreamComplete(r, w, stream_id);
+        if (entry.recv_running) {
+            // Multiplexed mode: background fiber pumps frames; we wait on a
+            // per-stream semaphore that the receive loop posts on completion.
+            var sem: Io.Semaphore = .{ .permits = 0 };
+            stream.completion_sem = &sem;
+            defer stream.completion_sem = null;
+
+            // Serialize frame writes via the connection's write mutex.
+            {
+                h2.write_mutex.lockUncancelable(self.io);
+                defer h2.write_mutex.unlock(self.io);
+                if (entry.is_tls) {
+                    const w = try entry.session.getWriter();
+                    try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                    if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                } else {
+                    try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                    if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                }
+            }
+
+            // Wait for the receive loop to deliver the response.
+            sem.waitUncancelable(self.io);
         } else {
-            try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-            if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
-            try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
+            // Fallback mode: pump frames inline (no fiber support).
+            if (entry.is_tls) {
+                const r = try entry.session.getReader();
+                const w = try entry.session.getWriter();
+                try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                if (req.body) |body| try h2.writeData(w, stream_id, body, true);
+                try h2.awaitStreamComplete(r, w, stream_id);
+            } else {
+                try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
+                try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
+            }
         }
 
         // Extract response from mailbox.
