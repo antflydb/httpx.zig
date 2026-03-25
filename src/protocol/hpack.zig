@@ -354,11 +354,13 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
     }
 
     var i: usize = 1;
-    var m: u6 = 0;
+    var m: u7 = 0;
 
     while (i < data.len) {
         const b = data[i];
-        value += @as(u64, b & 0x7F) << m;
+        // 7 value bits at position m occupy bits [m, m+6]; must fit in u64.
+        if (m > 57) return error.IntegerOverflow;
+        value += @as(u64, b & 0x7F) << @intCast(m);
         i += 1;
 
         if (b & 0x80 == 0) {
@@ -366,7 +368,6 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u4) !struct { value: u64, le
         }
 
         m += 7;
-        if (m > 63) return error.IntegerOverflow;
     }
 
     return error.UnexpectedEof;
@@ -831,6 +832,12 @@ test "HPACK integer decoding" {
     const result2 = try decodeInteger(&data2, 5);
     try std.testing.expectEqual(@as(u64, 1337), result2.value);
     try std.testing.expectEqual(@as(usize, 3), result2.len);
+}
+
+test "HPACK integer decoding rejects overflow" {
+    // 10 continuation bytes with high bits set forces m past 63 before shift.
+    const data = [_]u8{ 0x1F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    try std.testing.expectError(error.IntegerOverflow, decodeInteger(&data, 5));
 }
 
 test "HPACK static table lookup" {

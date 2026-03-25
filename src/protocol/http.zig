@@ -147,10 +147,21 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
         const setting = std.enums.fromInt(Http2SettingId, id) orelse continue;
         switch (setting) {
             .header_table_size => settings.header_table_size = value,
-            .enable_push => settings.enable_push = (value != 0),
+            .enable_push => {
+                if (value > 1) return error.ProtocolError;
+                settings.enable_push = (value != 0);
+            },
             .max_concurrent_streams => settings.max_concurrent_streams = value,
-            .initial_window_size => settings.initial_window_size = value,
-            .max_frame_size => settings.max_frame_size = value,
+            .initial_window_size => {
+                // RFC 7540 §6.5.2: MUST be [0, 2^31-1].
+                if (value > 0x7FFFFFFF) return error.FlowControlError;
+                settings.initial_window_size = value;
+            },
+            .max_frame_size => {
+                // RFC 7540 §6.5.2: MUST be [16384, 16777215].
+                if (value < 16384 or value > 16777215) return error.ProtocolError;
+                settings.max_frame_size = value;
+            },
             .max_header_list_size => settings.max_header_list_size = value,
         }
     }
@@ -450,4 +461,35 @@ test "decodeH2cSettings decodes base64url SETTINGS payload" {
     var settings = Http2ConnectionSettings{};
     try applySettingsPayload(&settings, payload);
     try std.testing.expectEqual(@as(u32, 100), settings.max_concurrent_streams);
+}
+
+test "applySettingsPayload rejects invalid ENABLE_PUSH" {
+    var settings = Http2ConnectionSettings{};
+    // ENABLE_PUSH (id=2) with value=2 (must be 0 or 1).
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.enable_push), .big);
+    std.mem.writeInt(u32, payload[2..6], 2, .big);
+    try std.testing.expectError(error.ProtocolError, applySettingsPayload(&settings, &payload));
+}
+
+test "applySettingsPayload rejects invalid INITIAL_WINDOW_SIZE" {
+    var settings = Http2ConnectionSettings{};
+    // INITIAL_WINDOW_SIZE (id=4) with value=0x80000000 (exceeds 2^31-1).
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.initial_window_size), .big);
+    std.mem.writeInt(u32, payload[2..6], 0x80000000, .big);
+    try std.testing.expectError(error.FlowControlError, applySettingsPayload(&settings, &payload));
+}
+
+test "applySettingsPayload rejects invalid MAX_FRAME_SIZE" {
+    var settings = Http2ConnectionSettings{};
+    // MAX_FRAME_SIZE (id=5) with value=0 (below 16384 minimum).
+    var payload: [6]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intFromEnum(Http2SettingId.max_frame_size), .big);
+    std.mem.writeInt(u32, payload[2..6], 0, .big);
+    try std.testing.expectError(error.ProtocolError, applySettingsPayload(&settings, &payload));
+
+    // Also reject values above 16777215.
+    std.mem.writeInt(u32, payload[2..6], 16777216, .big);
+    try std.testing.expectError(error.ProtocolError, applySettingsPayload(&settings, &payload));
 }

@@ -21,7 +21,7 @@ const hpack = @import("hpack.zig");
 /// Overflow-guarded window delta addition per RFC 7540 §6.9.1.
 fn addWindowDelta(current: i32, delta: i32) error{FlowControlError}!i32 {
     const next = @as(i64, current) + delta;
-    if (next > std.math.maxInt(i32)) return error.FlowControlError;
+    if (next > std.math.maxInt(i32) or next < std.math.minInt(i32)) return error.FlowControlError;
     return @intCast(next);
 }
 
@@ -630,4 +630,17 @@ test "PRIORITY payload" {
     try std.testing.expectEqual(priority.dependency, parsed.dependency);
     try std.testing.expectEqual(priority.weight, parsed.weight);
     try std.testing.expectEqual(priority.exclusive, parsed.exclusive);
+}
+
+test "addWindowDelta rejects overflow" {
+    try std.testing.expectError(error.FlowControlError, addWindowDelta(std.math.maxInt(i32), 1));
+}
+
+test "addWindowDelta rejects underflow" {
+    try std.testing.expectError(error.FlowControlError, addWindowDelta(std.math.minInt(i32), -1));
+}
+
+test "addWindowDelta accepts valid delta" {
+    const result = try addWindowDelta(1000, -500);
+    try std.testing.expectEqual(@as(i32, 500), result);
 }

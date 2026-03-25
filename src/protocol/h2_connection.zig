@@ -193,7 +193,9 @@ pub const H2Connection = struct {
                 }
                 // Cap reassembly to prevent CONTINUATION bombs.
                 if (self.continuation_buf.items.len + payload.len > max_continuation_size) {
-                    // payload freed by errdefer above.
+                    // payload freed by errdefer above. Reset reassembly state.
+                    self.continuation_stream_id = null;
+                    self.continuation_buf.clearRetainingCapacity();
                     return error.HeaderBlockTooLarge;
                 }
                 try self.continuation_buf.appendSlice(self.allocator, payload);
@@ -389,16 +391,24 @@ pub const H2Connection = struct {
         // Connection-level accumulator.
         self.pending_conn_window_update += len;
         if (self.pending_conn_window_update >= window_update_threshold) {
-            try self.sendWindowUpdate(writer, 0, @intCast(self.pending_conn_window_update));
-            self.pending_conn_window_update = 0;
+            try self.flushWindowAccumulator(writer, 0, &self.pending_conn_window_update);
         }
         // Stream-level accumulator.
         if (self.stream_manager.getStream(stream_id)) |s| {
             s.pending_window_update += len;
             if (s.pending_window_update >= window_update_threshold) {
-                try self.sendWindowUpdate(writer, stream_id, @intCast(s.pending_window_update));
-                s.pending_window_update = 0;
+                try self.flushWindowAccumulator(writer, stream_id, &s.pending_window_update);
             }
+        }
+    }
+
+    /// Sends WINDOW_UPDATE(s) to drain an accumulator, capping each
+    /// increment at maxInt(u31) per RFC 7540 §6.9.
+    fn flushWindowAccumulator(self: *Self, writer: anytype, stream_id: u31, accum: *u32) !void {
+        while (accum.* > 0) {
+            const inc: u31 = @intCast(@min(accum.*, std.math.maxInt(u31)));
+            try self.sendWindowUpdate(writer, stream_id, inc);
+            accum.* -= inc;
         }
     }
 
@@ -406,8 +416,7 @@ pub const H2Connection = struct {
     /// stream completion to avoid leaving credit below the threshold.
     fn flushConnWindowUpdate(self: *Self, writer: anytype) !void {
         if (self.pending_conn_window_update > 0) {
-            try self.sendWindowUpdate(writer, 0, @intCast(self.pending_conn_window_update));
-            self.pending_conn_window_update = 0;
+            try self.flushWindowAccumulator(writer, 0, &self.pending_conn_window_update);
         }
     }
 
@@ -520,8 +529,11 @@ pub const H2Connection = struct {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
 
-        const stream = self.stream_manager.getStream(sid) orelse
-            try self.stream_manager.getOrCreateStream(sid);
+        const stream = self.stream_manager.getStream(sid) orelse blk: {
+            // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
+            if (self.goaway_received) return error.ProtocolError;
+            break :blk try self.stream_manager.getOrCreateStream(sid);
+        };
 
         switch (frame.header.frame_type) {
             .headers => {
@@ -1861,5 +1873,58 @@ test "CONTINUATION reassembly rejects oversized header block" {
     const result = server.readFrame(&reader);
     try std.testing.expectError(error.HeaderBlockTooLarge, result);
 
+    // Verify continuation state was reset so connection can recover.
+    try std.testing.expect(server.continuation_stream_id == null);
+    try std.testing.expectEqual(@as(usize, 0), server.continuation_buf.items.len);
+
     _ = writer;
+}
+
+test "deliverToMailbox refuses new streams after GOAWAY" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Simulate receiving GOAWAY.
+    server.goaway_received = true;
+
+    // Try to deliver a HEADERS frame for a new stream.
+    var frame = Frame{
+        .header = .{ .length = 1, .frame_type = .headers, .flags = H2Connection.FLAG_END_HEADERS | H2Connection.FLAG_END_STREAM, .stream_id = 3 },
+        .payload = @constCast(&[_]u8{0x82}), // :method GET
+    };
+    const result = server.deliverToMailbox(&frame);
+    try std.testing.expectError(error.ProtocolError, result);
+
+    // Existing stream should still work.
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    server.goaway_received = true; // re-set after getOrCreateStream
+
+    var data_frame = Frame{
+        .header = .{ .length = 5, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast("hello"),
+    };
+    try server.deliverToMailbox(&data_frame);
+    try std.testing.expectEqual(@as(usize, 5), stream.data_buf.items.len);
+}
+
+test "window accumulator handles values exceeding u31 max" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Set accumulator to a value that exceeds u31 max.
+    server.pending_conn_window_update = std.math.maxInt(u31) + 100;
+
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(allocator);
+    const writer = testWriter(&reply, allocator);
+
+    try server.flushConnWindowUpdate(writer);
+
+    // Should have sent multiple WINDOW_UPDATE frames and drained to 0.
+    try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
+    // At least 2 frames (one for maxInt(u31), one for remainder).
+    try std.testing.expect(reply.items.len >= 2 * 13);
 }

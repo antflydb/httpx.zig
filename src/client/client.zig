@@ -414,7 +414,8 @@ pub const Client = struct {
 
         // Return existing healthy connection.
         if (self.h2_conns.get(key)) |entry| {
-            if (!entry.broken) return entry;
+            if (!entry.broken and !entry.h2.goaway_received) return entry;
+            if (entry.h2.goaway_received) entry.broken = true;
             // Remove and destroy broken entry.
             if (self.h2_conns.fetchRemove(key)) |removed| {
                 const e = removed.value;
@@ -665,16 +666,16 @@ pub const Client = struct {
                     }
                     return n;
                 }
-                if (self.stream.completed) return 0;
                 if (self.stream.stream_error) |err| return err;
+                if (self.stream.completed) return 0;
 
                 // Reset event, re-check buffer (handles race with receive loop),
                 // then wait with timeout.
                 self.data_event.reset();
                 const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
                 if (avail2 > 0) continue;
-                if (self.stream.completed) return 0;
                 if (self.stream.stream_error) |err| return err;
+                if (self.stream.completed) return 0;
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,

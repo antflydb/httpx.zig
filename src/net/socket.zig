@@ -484,6 +484,7 @@ pub const ChunkedBodyReader = struct {
         }
         // Refill the read-ahead buffer in bulk.
         try p.fillAhead();
+        if (p.ahead_start >= p.ahead_end) return error.EndOfStream;
         const b = p.ahead_buf[p.ahead_start];
         p.ahead_start += 1;
         return b;
