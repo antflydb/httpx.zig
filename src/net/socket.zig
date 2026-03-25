@@ -60,6 +60,12 @@ pub const Socket = struct {
         }
     }
 
+    /// Alias for sendAll — provides the `writeAll` interface expected by
+    /// duck-typed writers (e.g. H2Connection).
+    pub fn writeAll(self: *Self, data: []const u8) !void {
+        return self.sendAll(data);
+    }
+
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
         var bufs = [_][]u8{buffer};

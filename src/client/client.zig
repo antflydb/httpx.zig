@@ -1,10 +1,10 @@
 //! HTTP Client Implementation for httpx.zig
 //!
-//! HTTP/1.1 client over TCP with optional TLS (HTTPS).
+//! HTTP/1.1 and HTTP/2 client over TCP with optional TLS (HTTPS).
 //!
-//! Notes:
-//! - HTTP/2 and HTTP/3 types exist in `src/protocol/http.zig`, but this client
-//!   currently speaks HTTP/1.1.
+//! When `http2_enabled` is set in `ClientConfig`, the client speaks HTTP/2
+//! using "prior knowledge" mode (RFC 7540 §3.4) — it sends the h2 connection
+//! preface directly without ALPN negotiation.
 
 const std = @import("std");
 const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
@@ -37,6 +37,9 @@ const TlsPool = @import("pool.zig").TlsPool;
 const TlsConnection = @import("pool.zig").TlsConnection;
 const common = @import("../util/common.zig");
 const flate = std.compress.flate;
+const h2_mod = @import("../protocol/h2_connection.zig");
+const H2Connection = h2_mod.H2Connection;
+const hpack = @import("../protocol/hpack.zig");
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
@@ -268,6 +271,33 @@ pub const Client = struct {
             break :blk self.config.timeouts.write_ms;
         };
 
+        // HTTP/2 "prior knowledge" path (RFC 7540 §3.4).
+        if (self.config.http2_enabled) {
+            if (req.uri.isTls()) {
+                const addr = try Address.resolve(self.io, host, port);
+                var socket = try Socket.connect(addr, self.io);
+                defer socket.close();
+                try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+
+                var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+                tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
+                var session = TlsSession.init(tls_cfg, self.io);
+                defer session.deinit();
+                session.attachSocket(&socket);
+                try session.handshake(host);
+
+                const r = try session.getReader();
+                const w = try session.getWriter();
+                return self.executeH2Request(r, w, req);
+            }
+
+            const addr = try Address.resolve(self.io, host, port);
+            var socket = try Socket.connect(addr, self.io);
+            defer socket.close();
+            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+            return self.executeH2Request(&socket, &socket, req);
+        }
+
         if (req.uri.isTls()) {
             if (self.config.keep_alive) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
@@ -340,6 +370,157 @@ pub const Client = struct {
         session.attachSocket(socket);
         try session.handshake(host);
         return self.executeOnTls(&session, req, null);
+    }
+
+    /// Executes a single HTTP/2 request over an already-connected reader/writer pair.
+    ///
+    /// Performs the full h2 lifecycle: connection preface → SETTINGS exchange →
+    /// send request as HEADERS (+DATA) → read response HEADERS + DATA frames.
+    fn executeH2Request(self: *Self, reader: anytype, writer: anytype, req: *Request) !Response {
+        var h2 = H2Connection.initClient(self.allocator);
+        defer h2.deinit();
+
+        // 1. Connection preface + SETTINGS.
+        try h2.sendClientPreface(writer);
+
+        // 2. Read server's SETTINGS, dispatch connection-level frames until we
+        //    get past the initial handshake.
+        var settings_received = false;
+        while (!settings_received) {
+            var frame = try h2.readFrame(reader);
+            defer frame.deinit(self.allocator);
+            if (frame.header.frame_type == .settings and frame.header.flags & H2Connection.FLAG_ACK == 0) {
+                try h2.handleSettings(&frame, writer);
+                settings_received = true;
+            } else {
+                _ = try h2.dispatchFrame(&frame, writer);
+            }
+        }
+
+        // 3. Open a new stream and build request pseudo-headers.
+        const stream = try h2.stream_manager.createStream();
+        const stream_id = stream.id;
+
+        const method_str = if (req.method == .CUSTOM)
+            req.custom_method orelse "CUSTOM"
+        else
+            req.method.toString();
+        const scheme = req.uri.scheme orelse "http";
+        const authority = req.uri.host orelse return error.InvalidUri;
+        var path_buf = std.ArrayListUnmanaged(u8).empty;
+        defer path_buf.deinit(self.allocator);
+        const alw = arrayListWriter(&path_buf, self.allocator);
+        try alw.writeAll(req.uri.path);
+        if (req.uri.query) |q| {
+            try alw.writeAll("?");
+            try alw.writeAll(q);
+        }
+        const path = path_buf.items;
+
+        // Collect regular headers, skipping HTTP/2 connection-specific ones.
+        var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+        defer extra.deinit(self.allocator);
+        for (req.headers.entries.items) |entry| {
+            const lower = entry.name;
+            if (std.ascii.eqlIgnoreCase(lower, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(lower, "connection")) continue;
+            if (std.ascii.eqlIgnoreCase(lower, "transfer-encoding")) continue;
+            if (std.ascii.eqlIgnoreCase(lower, "upgrade")) continue;
+            try extra.append(self.allocator, .{ .name = entry.name, .value = entry.value });
+        }
+
+        const h2_headers = try H2Connection.buildRequestHeaders(
+            method_str,
+            path,
+            scheme,
+            authority,
+            extra.items,
+            self.allocator,
+        );
+        defer self.allocator.free(h2_headers);
+
+        const has_body = req.body != null;
+        try h2.sendHeaders(writer, stream_id, h2_headers, !has_body);
+
+        // 4. Send body as DATA frame(s) if present.
+        if (req.body) |body| {
+            try h2.writeData(writer, stream_id, body, true);
+        }
+
+        // 5. Read response frames until we have HEADERS + all DATA.
+        var res_headers: ?[]hpack.DecodedHeader = null;
+        defer if (res_headers) |hdrs| {
+            for (hdrs) |*h| {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            }
+            self.allocator.free(hdrs);
+        };
+        var body_buf = std.ArrayListUnmanaged(u8).empty;
+        defer body_buf.deinit(self.allocator);
+        var end_stream = false;
+
+        while (!end_stream) {
+            var frame = try h2.readFrame(reader);
+            defer frame.deinit(self.allocator);
+
+            // Let H2Connection handle connection-level frames (SETTINGS ACK, PING, etc.)
+            const maybe_stream_frame = try h2.dispatchFrame(&frame, writer);
+            if (maybe_stream_frame == null) continue;
+
+            const sf = maybe_stream_frame.?;
+            if (sf.header.stream_id != stream_id) continue;
+
+            switch (sf.header.frame_type) {
+                .headers => {
+                    const decoded = try h2.decodeFrameHeaders(sf.payload, sf.header.flags);
+                    res_headers = decoded.headers;
+                    if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
+                },
+                .data => {
+                    if (sf.payload.len > 0) {
+                        if (body_buf.items.len + sf.payload.len > self.config.max_response_size)
+                            return error.ResponseTooLarge;
+                        try body_buf.appendSlice(self.allocator, sf.payload);
+                        try h2.sendWindowUpdate(writer, 0, @intCast(sf.payload.len));
+                        try h2.sendWindowUpdate(writer, stream_id, @intCast(sf.payload.len));
+                    }
+                    if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
+                },
+                .rst_stream => {
+                    try h2.handleRstStream(&frame);
+                    return error.StreamReset;
+                },
+                else => {},
+            }
+        }
+
+        // 6. Build Response from decoded headers + body.
+        const hdrs = res_headers orelse return error.InvalidResponse;
+        var status_code: ?u16 = null;
+        var response_headers = Headers.init(self.allocator);
+        errdefer response_headers.deinit();
+
+        for (hdrs) |h| {
+            if (mem.eql(u8, h.name, ":status")) {
+                status_code = std.fmt.parseInt(u16, h.value, 10) catch return error.InvalidResponse;
+            } else if (h.name.len > 0 and h.name[0] != ':') {
+                try response_headers.append(h.name, h.value);
+            }
+        }
+
+        const code = status_code orelse return error.InvalidResponse;
+        var res = Response.init(self.allocator, code);
+        res.version = .HTTP_2;
+        res.headers.deinit();
+        res.headers = response_headers;
+
+        if (body_buf.items.len > 0) {
+            res.body = try body_buf.toOwnedSlice(self.allocator);
+            res.body_owned = true;
+        }
+
+        return res;
     }
 
     /// Unified response reader parameterized on the read source.

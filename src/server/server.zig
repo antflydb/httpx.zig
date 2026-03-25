@@ -33,6 +33,9 @@ const RouteParam = @import("router.zig").RouteParam;
 const middleware_mod = @import("middleware.zig");
 const Middleware = middleware_mod.Middleware;
 const common = @import("../util/common.zig");
+const h2_mod = @import("../protocol/h2_connection.zig");
+const H2Connection = h2_mod.H2Connection;
+const hpack = @import("../protocol/hpack.zig");
 
 pub const CookieOptions = common.CookieOptions;
 pub const SameSite = common.SameSite;
@@ -492,6 +495,23 @@ pub const Server = struct {
         var sock = socket;
         defer sock.close();
 
+        // Set initial timeout once; only update when transitioning to keep-alive.
+        if (self.config.request_timeout_ms > 0) {
+            try sock.setRecvTimeout(self.config.request_timeout_ms);
+            try sock.setSendTimeout(self.config.request_timeout_ms);
+        }
+
+        // Peek at the first bytes to detect HTTP/2 "prior knowledge" (RFC 7540 §3.4).
+        // The h2 preface is "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes).
+        var peek_buf: [8192]u8 = undefined;
+        const first_n = try sock.recv(&peek_buf);
+        if (first_n == 0) return;
+
+        if (first_n >= 24 and mem.eql(u8, peek_buf[0..24], http.HTTP2_PREFACE)) {
+            return self.handleH2Connection(&sock, peek_buf[24..first_n]);
+        }
+
+        // HTTP/1.1 path — feed the already-read bytes to the parser.
         var parser = Parser.init(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_body_size;
@@ -499,11 +519,7 @@ pub const Server = struct {
 
         var first_request = true;
         var request_count: u32 = 0;
-        // Set initial timeout once; only update when transitioning to keep-alive.
-        if (self.config.request_timeout_ms > 0) {
-            try sock.setRecvTimeout(self.config.request_timeout_ms);
-            try sock.setSendTimeout(self.config.request_timeout_ms);
-        }
+        var first_recv_done = true; // We already did the first recv.
         while (self.running) {
 
             var buffer: [8192]u8 = undefined;
@@ -519,7 +535,13 @@ pub const Server = struct {
                     try self.sendError(&sock, 408);
                     return;
                 }
-                const n = try sock.recv(&buffer);
+                // On the very first iteration, feed the bytes we already read
+                // during protocol detection instead of doing another recv.
+                const n = if (first_recv_done) blk: {
+                    @memcpy(buffer[0..first_n], peek_buf[0..first_n]);
+                    first_recv_done = false;
+                    break :blk first_n;
+                } else try sock.recv(&buffer);
                 if (n == 0) return;
                 _ = parser.feed(buffer[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
@@ -675,6 +697,196 @@ pub const Server = struct {
                 }
             }
         }
+    }
+
+    /// Handles an HTTP/2 connection after the 24-byte preface has been consumed.
+    /// `initial_data` contains any bytes read beyond the preface from the first recv.
+    fn handleH2Connection(self: *Self, sock: *Socket, initial_data: []const u8) !void {
+        var h2 = H2Connection.initServer(self.allocator);
+        defer h2.deinit();
+
+        // Wrap socket in a reader that first yields `initial_data`, then reads from socket.
+        var h2_reader = H2SocketReader{ .socket = sock, .initial = initial_data, .initial_pos = 0 };
+
+        // Read the client's SETTINGS frame (follows the preface).
+        var settings_frame = try h2.readFrame(&h2_reader);
+        defer settings_frame.deinit(self.allocator);
+        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        try h2.handleSettings(&settings_frame, sock);
+
+        // Send our SETTINGS.
+        try h2.sendSettings(sock);
+
+        // Process frames until the connection is done.
+        while (!h2.goaway_received) {
+            var frame = h2.readFrame(&h2_reader) catch |err| switch (err) {
+                error.ConnectionClosed => return,
+                else => return err,
+            };
+            defer frame.deinit(self.allocator);
+
+            const maybe_stream = try h2.dispatchFrame(&frame, sock);
+            if (maybe_stream == null) continue;
+
+            const sf = maybe_stream.?;
+            if (sf.header.frame_type != .headers) continue;
+
+            // Decode request headers.
+            const decoded = try h2.decodeFrameHeaders(sf.payload, sf.header.flags);
+            defer {
+                for (decoded.headers) |*dh| {
+                    self.allocator.free(dh.name);
+                    self.allocator.free(dh.value);
+                }
+                self.allocator.free(decoded.headers);
+            }
+
+            // Extract pseudo-headers → build a Request.
+            var method_str: ?[]const u8 = null;
+            var path: ?[]const u8 = null;
+            var authority: ?[]const u8 = null;
+
+            var extra_headers = Headers.init(self.allocator);
+            defer extra_headers.deinit();
+
+            for (decoded.headers) |h| {
+                if (mem.eql(u8, h.name, ":method")) {
+                    method_str = h.value;
+                } else if (mem.eql(u8, h.name, ":path")) {
+                    path = h.value;
+                } else if (mem.eql(u8, h.name, ":authority")) {
+                    authority = h.value;
+                } else if (mem.eql(u8, h.name, ":scheme")) {
+                    // Consumed but not needed for routing.
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try extra_headers.append(h.name, h.value);
+                }
+            }
+
+            const req_method = types.Method.fromString(method_str orelse "GET") orelse .GET;
+            var req = try Request.init(self.allocator, req_method, path orelse "/");
+            defer req.deinit();
+            req.version = .HTTP_2;
+
+            // Copy headers.
+            for (extra_headers.entries.items) |entry| {
+                try req.headers.appendBorrowed(entry.name, entry.value);
+            }
+            if (authority) |auth| {
+                try req.headers.appendBorrowed("host", auth);
+            }
+
+            // If the HEADERS frame did not have END_STREAM, read DATA frames for the body.
+            const stream_id = sf.header.stream_id;
+            var body_buf = std.ArrayListUnmanaged(u8).empty;
+            defer body_buf.deinit(self.allocator);
+
+            if (sf.header.flags & H2Connection.FLAG_END_STREAM == 0) {
+                // Read DATA frames for this stream.
+                while (true) {
+                    var data_frame = try h2.readFrame(&h2_reader);
+                    defer data_frame.deinit(self.allocator);
+
+                    const maybe_data = try h2.dispatchFrame(&data_frame, sock);
+                    if (maybe_data == null) continue;
+                    const df = maybe_data.?;
+                    if (df.header.stream_id != stream_id) continue;
+
+                    if (df.header.frame_type == .data) {
+                        if (df.payload.len > 0) {
+                            try body_buf.appendSlice(self.allocator, df.payload);
+                            // Send WINDOW_UPDATE to keep flow control open.
+                            try h2.sendWindowUpdate(sock, 0, @intCast(df.payload.len));
+                            try h2.sendWindowUpdate(sock, stream_id, @intCast(df.payload.len));
+                        }
+                        if (df.header.flags & H2Connection.FLAG_END_STREAM != 0) break;
+                    } else if (df.header.frame_type == .rst_stream) {
+                        break;
+                    }
+                }
+            }
+
+            if (body_buf.items.len > 0) {
+                req.body = body_buf.items;
+                req.body_owned = false;
+            }
+
+            // Route and handle the request.
+            var ctx = Context.init(self.allocator, &req);
+            ctx.max_file_size = self.config.max_file_size;
+            defer ctx.deinit();
+
+            for (self.pre_route_hooks.items) |hook| {
+                hook(&ctx) catch {
+                    try self.sendH2Error(&h2, sock, stream_id, 500);
+                    continue;
+                };
+            }
+
+            var suppress_body = false;
+            var params_buf: [16]RouteParam = undefined;
+            var route_result = self.router.find(req_method, req.uri.path, &params_buf);
+
+            if (route_result == null and req_method == .HEAD) {
+                route_result = self.router.find(.GET, req.uri.path, &params_buf);
+                suppress_body = route_result != null;
+            }
+
+            if (route_result) |r| {
+                ctx.params = r.params;
+            }
+
+            var response: Response = undefined;
+            if (route_result) |r| {
+                response = self.executeMiddleware(&ctx, r.handler) catch {
+                    try self.sendH2Error(&h2, sock, stream_id, 500);
+                    continue;
+                };
+            } else {
+                response = Response.init(self.allocator, 404);
+            }
+            defer response.deinit();
+
+            if (suppress_body) {
+                if (response.body_owned) {
+                    if (response.body) |b| self.allocator.free(b);
+                    response.body_owned = false;
+                }
+                response.body = null;
+            }
+
+            // Send response as h2 HEADERS + DATA.
+            var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+            defer resp_extra.deinit(self.allocator);
+
+            for (response.headers.entries.items) |entry| {
+                try resp_extra.append(self.allocator, .{ .name = entry.name, .value = entry.value });
+            }
+
+            var status_buf: [3]u8 = undefined;
+            const h2_headers = try H2Connection.buildResponseHeaders(
+                response.status.code,
+                resp_extra.items,
+                &status_buf,
+                self.allocator,
+            );
+            defer self.allocator.free(h2_headers);
+
+            const has_body = response.body != null and response.body.?.len > 0;
+            try h2.sendHeaders(sock, stream_id, h2_headers, !has_body);
+
+            if (has_body) {
+                try h2.writeData(sock, stream_id, response.body.?, true);
+            }
+        }
+    }
+
+    /// Sends an HTTP/2 error response (just a HEADERS frame with :status).
+    fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
+        var status_buf: [3]u8 = undefined;
+        const h2_headers = try H2Connection.buildResponseHeaders(code, &.{}, &status_buf, self.allocator);
+        defer self.allocator.free(h2_headers);
+        try h2.sendHeaders(writer, stream_id, h2_headers, true);
     }
 
     /// Sends an error response.
@@ -844,6 +1056,25 @@ fn isEncodedDot(path: []const u8, i: usize) bool {
     if (path[i + 1] != '2') return false;
     return path[i + 2] == 'e' or path[i + 2] == 'E';
 }
+
+/// Duck-typed reader for h2 connection handling: yields `initial` bytes first,
+/// then reads from the underlying socket via `recv`.
+const H2SocketReader = struct {
+    socket: *Socket,
+    initial: []const u8,
+    initial_pos: usize,
+
+    pub fn read(self: *H2SocketReader, buf: []u8) !usize {
+        if (self.initial_pos < self.initial.len) {
+            const avail = self.initial.len - self.initial_pos;
+            const n = @min(avail, buf.len);
+            @memcpy(buf[0..n], self.initial[self.initial_pos .. self.initial_pos + n]);
+            self.initial_pos += n;
+            return n;
+        }
+        return self.socket.recv(buf);
+    }
+};
 
 fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
     const items = headers.iterator();

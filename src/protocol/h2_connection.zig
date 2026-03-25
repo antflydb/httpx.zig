@@ -841,3 +841,131 @@ test "HPACK encode + decode round-trip via sendHeaders/decodeFrameHeaders" {
     try std.testing.expectEqualStrings(":authority", decoded.headers[3].name);
     try std.testing.expectEqualStrings("example.com", decoded.headers[3].value);
 }
+
+test "full HTTP/2 request-response round-trip" {
+    const allocator = std.testing.allocator;
+
+    // Simulate client → server → client using in-memory buffers.
+
+    // --- Client sends preface + SETTINGS + request ---
+    var c2s = std.ArrayListUnmanaged(u8).empty; // client-to-server wire
+    defer c2s.deinit(allocator);
+    const c2s_w = testWriter(&c2s, allocator);
+
+    var client = H2Connection.initClient(allocator);
+    defer client.deinit();
+
+    try client.sendClientPreface(c2s_w);
+
+    // Create stream and send request HEADERS (GET /).
+    _ = try client.stream_manager.createStream();
+    const req_headers = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try client.sendHeaders(c2s_w, 1, &req_headers, true); // END_STREAM (no body)
+
+    // --- Server reads preface + SETTINGS + request ---
+    var server = H2Connection.initServer(allocator);
+    defer server.deinit();
+
+    var s_reader = TestReader{ .data = c2s.items };
+    try server.readClientPreface(&s_reader);
+
+    // Read client's SETTINGS.
+    var s2c = std.ArrayListUnmanaged(u8).empty; // server-to-client wire
+    defer s2c.deinit(allocator);
+    const s2c_w = testWriter(&s2c, allocator);
+
+    var settings_frame = try server.readFrame(&s_reader);
+    try server.handleSettings(&settings_frame, s2c_w); // sends ACK
+    settings_frame.deinit(allocator);
+
+    // Send server SETTINGS.
+    try server.sendSettings(s2c_w);
+
+    // Read the request HEADERS frame.
+    var req_frame = try server.readFrame(&s_reader);
+    defer req_frame.deinit(allocator);
+
+    try std.testing.expectEqual(Http2FrameType.headers, req_frame.header.frame_type);
+    try std.testing.expect(req_frame.header.flags & H2Connection.FLAG_END_STREAM != 0);
+
+    const decoded = try server.decodeFrameHeaders(req_frame.payload, req_frame.header.flags);
+    defer {
+        for (decoded.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded.headers);
+    }
+
+    // Verify server got the right request.
+    try std.testing.expectEqual(@as(usize, 4), decoded.headers.len);
+    try std.testing.expectEqualStrings("GET", decoded.headers[0].value);
+    try std.testing.expectEqualStrings("/", decoded.headers[1].value);
+
+    // --- Server sends response ---
+    var status_buf: [3]u8 = undefined;
+    const resp_extra = [_]hpack.HeaderEntry{
+        .{ .name = "content-type", .value = "text/plain" },
+    };
+    const resp_headers = try H2Connection.buildResponseHeaders(200, &resp_extra, &status_buf, allocator);
+    defer allocator.free(resp_headers);
+
+    // Server accepts client-initiated stream 1.
+    _ = try server.stream_manager.getOrCreateStream(1);
+    const stream_id: u31 = 1;
+
+    try server.sendHeaders(s2c_w, stream_id, resp_headers, false);
+    const body = "Hello, HTTP/2!";
+    try server.writeData(s2c_w, stream_id, body, true);
+
+    // --- Client reads response ---
+    var c_reader = TestReader{ .data = s2c.items };
+
+    // Read and dispatch connection-level frames until we get the response HEADERS.
+    var got_status: ?[]const u8 = null;
+    var got_body = std.ArrayListUnmanaged(u8).empty;
+    defer got_body.deinit(allocator);
+    var resp_decoded: ?[]hpack.DecodedHeader = null;
+    defer if (resp_decoded) |hdrs| {
+        for (hdrs) |*h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(hdrs);
+    };
+
+    var end_stream = false;
+    while (!end_stream) {
+        var frame = try client.readFrame(&c_reader);
+        defer frame.deinit(allocator);
+
+        const maybe = try client.dispatchFrame(&frame, c2s_w);
+        if (maybe == null) continue;
+
+        const sf = maybe.?;
+        switch (sf.header.frame_type) {
+            .headers => {
+                const dec = try client.decodeFrameHeaders(sf.payload, sf.header.flags);
+                resp_decoded = dec.headers;
+                for (dec.headers) |h| {
+                    if (mem.eql(u8, h.name, ":status")) got_status = h.value;
+                }
+                if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
+            },
+            .data => {
+                if (sf.payload.len > 0) try got_body.appendSlice(allocator, sf.payload);
+                if (sf.header.flags & H2Connection.FLAG_END_STREAM != 0) end_stream = true;
+            },
+            else => {},
+        }
+    }
+
+    // Verify the response.
+    try std.testing.expectEqualStrings("200", got_status.?);
+    try std.testing.expectEqualStrings("Hello, HTTP/2!", got_body.items);
+}

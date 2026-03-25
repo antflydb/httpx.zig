@@ -6,9 +6,10 @@
 //! ## Notes
 //!
 //! - This is a thin wrapper around the stdlib TLS implementation.
-//! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client` in a
-//!   way this library uses for HTTP/2/HTTP/3 protocol selection.
-//! - The higher-level HTTP client currently speaks HTTP/1.1 over TLS.
+//! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client`.
+//!   HTTP/2 connections use "prior knowledge" mode (RFC 7540 §3.4) instead.
+//! - The `alpn_protocols` field is set to `&.{"h2", "http/1.1"}` when HTTP/2 is
+//!   enabled, for forward compatibility with future stdlib ALPN support.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -113,6 +114,11 @@ pub const TlsSession = struct {
 
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
     client: ?std.crypto.tls.Client = null,
+
+    /// Protocol negotiated via ALPN (e.g. "h2", "http/1.1").
+    /// Currently always null because `std.crypto.tls.Client` does not expose
+    /// the negotiated protocol. Set manually when using "prior knowledge" mode.
+    negotiated_protocol: ?[]const u8 = null,
 
     const Self = @This();
 
