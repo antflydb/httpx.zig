@@ -33,6 +33,7 @@ pub const HeaderName = struct {
     pub const COOKIE = "Cookie";
     pub const DATE = "Date";
     pub const ETAG = "ETag";
+    pub const EXPECT = "Expect";
     pub const EXPIRES = "Expires";
     pub const HOST = "Host";
     pub const IF_MATCH = "If-Match";

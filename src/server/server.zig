@@ -59,6 +59,7 @@ pub const ServerConfig = struct {
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
     keep_alive: bool = true,
+    max_requests_per_connection: u32 = 1000,
     threads: u32 = 0,
 };
 
@@ -450,15 +451,31 @@ pub const Server = struct {
         };
     }
 
-    /// Stops the server.
+    /// Stops the server immediately, cancelling all in-flight connections.
     pub fn stop(self: *Self) void {
         self.running = false;
-        // Cancel all in-flight connection fibers.
         self.connections.cancel(self.io);
         if (self.listener) |*l| {
             l.deinit();
             self.listener = null;
         }
+    }
+
+    /// Gracefully shuts down the server: stops accepting new connections and
+    /// waits up to `timeout_ms` for in-flight requests to complete before
+    /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
+    pub fn shutdown(self: *Self, timeout_ms: u64) void {
+        self.running = false;
+        if (self.listener) |*l| {
+            l.deinit();
+            self.listener = null;
+        }
+        // Give in-flight connections time to finish.
+        if (timeout_ms > 0) {
+            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .monotonic) catch {};
+        }
+        // Force-cancel any remaining connections.
+        self.connections.cancel(self.io);
     }
 
     /// Fiber entry point for concurrent connection handling.
@@ -481,9 +498,11 @@ pub const Server = struct {
         parser.max_headers = self.config.max_headers;
 
         var first_request = true;
+        var request_count: u32 = 0;
         // Set initial timeout once; only update when transitioning to keep-alive.
         if (self.config.request_timeout_ms > 0) {
             try sock.setRecvTimeout(self.config.request_timeout_ms);
+            try sock.setSendTimeout(self.config.request_timeout_ms);
         }
         while (self.running) {
 
@@ -542,6 +561,14 @@ pub const Server = struct {
             if (parser.getBody().len > 0) {
                 req.body = parser.getBody();
                 req.body_owned = false;
+            }
+
+            // RFC 7231 §5.1.1: Respond to Expect: 100-continue so the
+            // client knows it's safe to send the body.
+            if (req.headers.get(HeaderName.EXPECT)) |expect| {
+                if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+                    try sock.sendAll("HTTP/1.1 100 Continue\r\n\r\n");
+                }
             }
 
             var ctx = Context.init(self.allocator, &req);
@@ -613,10 +640,31 @@ pub const Server = struct {
             }
 
             try ensureContentLengthHeader(&response);
+            try ensureDateHeader(&response);
 
             try sendBuffered(&sock, &response);
 
             if (!keep_alive) return;
+
+            // Drain any unread request body before reusing the connection
+            // for the next request, similar to Go's net/http finishRequest.
+            if (parser.content_length) |cl| {
+                const body_read = parser.getBody().len;
+                var remaining: u64 = if (cl > body_read) cl - body_read else 0;
+                const max_drain: u64 = 256 * 1024; // Match Go's 256 KB limit.
+                if (remaining > max_drain) return; // Too much to drain; close.
+                var drain_buf: [8192]u8 = undefined;
+                while (remaining > 0) {
+                    const to_read = @min(remaining, drain_buf.len);
+                    const n = sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    if (n == 0) return;
+                    remaining -= n;
+                }
+            }
+
+            request_count += 1;
+            if (request_count >= self.config.max_requests_per_connection) return;
+
             if (first_request) {
                 first_request = false;
                 // Transition to keep-alive timeout (only one setsockopt call).
@@ -635,15 +683,47 @@ pub const Server = struct {
         defer resp.deinit();
 
         try ensureContentLengthHeader(&resp);
+        try ensureDateHeader(&resp);
 
         try sendBuffered(socket, &resp);
     }
 
     /// Serializes a response through a buffered writer to reduce syscalls.
     fn sendBuffered(socket: *Socket, resp: *Response) !void {
-        var bw = std.io.bufferedWriter(socket.writer());
+        var bw = std.io.BufferedWriter(16384, @TypeOf(socket.writer())){ .unbuffered_writer = socket.writer() };
         try resp.serialize(bw.writer().any());
         try bw.flush();
+    }
+
+    /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field
+    /// in IMF-fixdate format: e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
+    fn ensureDateHeader(response: *Response) !void {
+        if (response.headers.get(HeaderName.DATE) != null) return;
+        const epoch = std.time.epoch;
+        const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
+        const es = epoch.EpochSeconds{ .secs = ts };
+        const day_secs = es.getDaySeconds();
+        const epoch_day = es.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+
+        // Day of week: 1970-01-01 was Thursday (index 4).
+        const dow_names = [7][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+        const mon_names = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        const dow = dow_names[epoch_day.day % 7];
+        const mon = mon_names[month_day.month.numeric() - 1];
+
+        var buf: [30]u8 = undefined;
+        const date_str = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+            dow,
+            month_day.day_index + 1,
+            mon,
+            year_day.year,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+        }) catch return;
+        try response.headers.set("Date", date_str);
     }
 
     fn ensureContentLengthHeader(response: *Response) !void {
