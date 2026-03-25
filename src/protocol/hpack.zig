@@ -682,19 +682,32 @@ pub fn encodeHeaders(
             buf[0] |= 0x80; // Set indexed bit
             try out.appendSlice(allocator, buf[0..n]);
         } else if (StaticTable.findName(header.name)) |name_index| {
-            // Literal header with indexed name
+            // Literal header with indexed name — the name on the wire comes from
+            // the static table (already lowercase), but store the lowercase form
+            // in the dynamic table so future references are also lowercase.
+            var idx_lower_buf: [256]u8 = undefined;
+            const idx_lower_name = if (header.name.len <= idx_lower_buf.len) blk: {
+                for (header.name, 0..) |c, i| idx_lower_buf[i] = std.ascii.toLower(c);
+                break :blk idx_lower_buf[0..header.name.len];
+            } else header.name;
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(name_index, 6, &buf);
             buf[0] |= 0x40; // Incremental indexing
             try out.appendSlice(allocator, buf[0..n]);
             try encodeString(header.value, true, allocator, &out);
-            try ctx.dynamic_table.add(header.name, header.value);
+            try ctx.dynamic_table.add(idx_lower_name, header.value);
         } else {
-            // Literal header with literal name
+            // Literal header with literal name.
+            // RFC 7540 §8.1.2: header field names MUST be lowercase in HTTP/2.
+            var lower_buf: [256]u8 = undefined;
+            const lower_name = if (header.name.len <= lower_buf.len) blk: {
+                for (header.name, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+                break :blk lower_buf[0..header.name.len];
+            } else header.name;
             try out.append(allocator, 0x40); // Incremental indexing, index=0
-            try encodeString(header.name, true, allocator, &out);
+            try encodeString(lower_name, true, allocator, &out);
             try encodeString(header.value, true, allocator, &out);
-            try ctx.dynamic_table.add(header.name, header.value);
+            try ctx.dynamic_table.add(lower_name, header.value);
         }
     }
 

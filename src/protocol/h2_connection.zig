@@ -156,8 +156,11 @@ pub const H2Connection = struct {
     // SETTINGS (RFC 7540 §6.5)
     // ---------------------------------------------------------------
 
-    /// Sends our local SETTINGS frame.
+    /// Sends our local SETTINGS frame. Also syncs `local_max_concurrent_streams`
+    /// so the enforcement limit matches what we advertise to the peer.
     pub fn sendSettings(self: *Self, writer: anytype) !void {
+        // Sync enforcement limit with what we advertise.
+        self.local_max_concurrent_streams = self.local_settings.max_concurrent_streams;
         var payload_buf = std.ArrayListUnmanaged(u8).empty;
         defer payload_buf.deinit(self.allocator);
         try http.encodeSettingsPayload(self.local_settings, self.allocator, &payload_buf);

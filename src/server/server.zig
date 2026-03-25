@@ -86,6 +86,14 @@ pub const ServerConfig = struct {
     /// Maximum total streams processed on a single H2 connection before sending
     /// GOAWAY. 0 = unlimited. Prevents unbounded HPACK/state growth.
     h2_max_requests: u32 = 10_000,
+    /// HTTP/2 initial window size advertised in SETTINGS. Controls how much DATA
+    /// a client can send per stream before waiting for WINDOW_UPDATE. The default
+    /// 1MB allows large request bodies without excessive round-trips. RFC 7540
+    /// default is 65535 which forces ~160 round-trips for a 10MB upload.
+    h2_initial_window_size: u32 = 1_048_576,
+    /// HTTP/2 max concurrent streams advertised in SETTINGS. Controls how many
+    /// in-flight requests a client can have on one connection. 0 = use default (100).
+    h2_max_concurrent_streams: u32 = 100,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
     /// `std.crypto.tls.Client`; there is no server TLS implementation yet.
     /// Use a TLS-terminating reverse proxy in the meantime.
@@ -894,11 +902,20 @@ pub const Server = struct {
         // 3. Create H2 connection and apply peer settings.
         var h2 = H2Connection.initServer(self.allocator, self.io);
         h2.max_stream_data_size = self.config.max_body_size;
+        h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
+        h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
         defer h2.deinit();
         try http.applySettingsPayload(&h2.peer_settings, settings_payload);
 
         // 4. Send server SETTINGS.
         try h2.sendSettings(sock);
+
+        // Increase connection-level recv window (same as handleH2Connection).
+        if (self.config.h2_initial_window_size > 65535) {
+            const delta: u31 = @intCast(self.config.h2_initial_window_size - 65535);
+            try h2.sendWindowUpdate(sock, 0, delta);
+            try h2.stream_manager.updateConnectionRecvWindow(@intCast(delta));
+        }
 
         // 5. Handle the original HTTP/1.1 request as stream 1.
         _ = try h2.stream_manager.getOrCreateStream(1);
@@ -1004,6 +1021,8 @@ pub const Server = struct {
     fn handleH2Connection(self: *Self, sock: *Socket, initial_data: []const u8) !void {
         var h2 = H2Connection.initServer(self.allocator, self.io);
         h2.max_stream_data_size = self.config.max_body_size;
+        h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
+        h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
         defer h2.deinit();
 
         // Set socket recv timeout so the receive loop unblocks periodically,
@@ -1025,6 +1044,15 @@ pub const Server = struct {
 
         // Send our SETTINGS.
         try h2.sendSettings(sock);
+
+        // RFC 7540 §6.9.1: SETTINGS INITIAL_WINDOW_SIZE only affects stream-level
+        // windows. Increase the connection-level recv window to match so large
+        // request bodies don't stall on connection-level flow control.
+        if (self.config.h2_initial_window_size > 65535) {
+            const delta: u31 = @intCast(self.config.h2_initial_window_size - 65535);
+            try h2.sendWindowUpdate(sock, 0, delta);
+            try h2.stream_manager.updateConnectionRecvWindow(@intCast(delta));
+        }
 
         // Per-stream handler fibers. Awaited before h2 is deinitialized.
         var stream_fibers = Io.Group.init;
