@@ -834,13 +834,16 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
+                stream.total_data_received += data_payload.len;
                 try stream.data_buf.appendSlice(self.allocator, data_payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     // RFC 7540 §8.1.2.6: If content-length was provided,
-                    // the total DATA payload must match exactly.
+                    // the total DATA payload must match exactly. Uses
+                    // total_data_received (not data_buf.items.len) because
+                    // compactDataBuf() may have shrunk data_buf.
                     if (stream.content_length) |expected| {
-                        if (stream.data_buf.items.len != expected) {
+                        if (stream.total_data_received != expected) {
                             stream.stream_error = error.ContentLengthMismatch;
                             stream.completed = true;
                             if (stream.data_event) |ev2| ev2.set(self.io);

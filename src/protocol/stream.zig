@@ -108,8 +108,13 @@ pub const Stream = struct {
     read_offset: usize = 0,
 
     /// Expected total DATA bytes from content-length header (RFC 7540 §8.1.2.6).
-    /// null = no content-length. Checked against data_buf.items.len at END_STREAM.
+    /// null = no content-length. Checked against total_data_received at END_STREAM.
     content_length: ?u64 = null,
+
+    /// Total DATA bytes received on this stream (unaffected by compaction).
+    /// Used for content-length validation instead of data_buf.items.len,
+    /// which shrinks when compactDataBuf() discards consumed bytes.
+    total_data_received: u64 = 0,
 
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,

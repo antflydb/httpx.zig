@@ -920,6 +920,11 @@ pub const Server = struct {
         if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
         try h2.handleSettings(&settings_frame, sock);
 
+        // Set socket recv timeout for idle detection (same as handleH2Connection).
+        if (self.config.h2_idle_timeout_ms > 0) {
+            sock.setRecvTimeout(self.config.h2_idle_timeout_ms) catch {};
+        }
+
         // Run the standard H2 frame loop.
         var stream_fibers = Io.Group.init;
         defer {
@@ -929,12 +934,28 @@ pub const Server = struct {
         // Wake all blocked handler fibers before awaiting them (reverse defer order).
         defer h2.signalAllStreams(error.ConnectionClosed);
 
+        // Count stream 1 (the upgraded request) toward h2_max_requests.
+        var h2c_request_count: u32 = 1;
+        var last_activity: i64 = milliTimestamp(self.io);
         while (!h2.goaway_received and self.running) {
+            // H2 idle timeout (mirrors handleH2Connection).
+            if (self.config.h2_idle_timeout_ms > 0 and
+                h2.stream_manager.activeStreamCount() == 0)
+            {
+                const idle_ms = milliTimestamp(self.io) - last_activity;
+                if (idle_ms >= @as(i64, @intCast(self.config.h2_idle_timeout_ms))) break;
+            }
+            if (self.config.h2_max_requests > 0 and h2c_request_count >= self.config.h2_max_requests) {
+                break;
+            }
+
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
                 error.ConnectionClosed => break,
+                error.RecvFailed => continue,
                 else => return err,
             };
 
+            last_activity = milliTimestamp(self.io);
             const sid = maybe_sid orelse continue;
             const stream = h2.stream_manager.getStream(sid) orelse continue;
 
@@ -952,6 +973,8 @@ pub const Server = struct {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
+
+            h2c_request_count += 1;
 
             const data_event = self.allocator.create(Io.Event) catch {
                 h2.write_mutex.lockUncancelable(h2.io);
@@ -982,6 +1005,14 @@ pub const Server = struct {
         var h2 = H2Connection.initServer(self.allocator, self.io);
         h2.max_stream_data_size = self.config.max_body_size;
         defer h2.deinit();
+
+        // Set socket recv timeout so the receive loop unblocks periodically,
+        // allowing the idle timeout check to re-evaluate. Without this,
+        // processOneFrameLocked blocks indefinitely on I/O and the idle
+        // check at the top of the loop never re-executes.
+        if (self.config.h2_idle_timeout_ms > 0) {
+            sock.setRecvTimeout(self.config.h2_idle_timeout_ms) catch {};
+        }
 
         // Wrap socket in a reader that first yields `initial_data`, then reads from socket.
         var h2_reader = H2SocketReader{ .socket = sock, .initial = initial_data, .initial_pos = 0 };
@@ -1032,6 +1063,9 @@ pub const Server = struct {
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
                 error.ConnectionClosed => break,
+                // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
+                // RecvFailed. Re-enter the loop so the idle check runs.
+                error.RecvFailed => continue,
                 else => return err,
             };
 
@@ -1052,9 +1086,9 @@ pub const Server = struct {
                 continue;
             }
 
-            h2_request_count += 1;
-
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
+            // Check before incrementing h2_request_count so refused streams
+            // don't drain the h2_max_requests budget.
             if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
@@ -1062,6 +1096,8 @@ pub const Server = struct {
                 h2.stream_manager.removeStream(sid);
                 continue;
             }
+
+            h2_request_count += 1;
 
             // Install data_event before spawning the fiber so the receive
             // loop can signal it for subsequent DATA frames.

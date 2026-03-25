@@ -557,11 +557,17 @@ pub const Client = struct {
         } else {
             h2RecvLoop(entry, &entry.socket, &entry.socket);
         }
-        entry.broken = true;
+        // h2RecvLoop's defer already sets entry.broken = true
     }
 
     fn h2RecvLoop(entry: *H2PoolEntry, reader: anytype, writer: anytype) void {
+        // Mark broken BEFORE signaling streams so that retrying request fibers
+        // (woken by signalAllStreams) see entry.broken=true and don't reuse
+        // this dead connection.
         defer entry.h2.signalAllStreams(error.ConnectionClosed);
+        defer {
+            entry.broken = true;
+        }
         while (!entry.h2.goaway_received) {
             _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
@@ -911,10 +917,13 @@ pub const Client = struct {
         }
 
         // Wait for HEADERS response (not END_STREAM) with timeout.
-        const header_timeout: Io.Timeout = .{ .duration = .{
-            .raw = Io.Duration.fromMilliseconds(self.config.timeouts.read_ms),
-            .clock = .awake,
-        } };
+        const header_timeout: Io.Timeout = if (self.config.timeouts.read_ms > 0)
+            .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(@intCast(self.config.timeouts.read_ms)),
+                .clock = .awake,
+            } }
+        else
+            .none;
         while (!stream.got_headers and !stream.completed) {
             data_event.reset();
             if (stream.got_headers or stream.completed) break;
