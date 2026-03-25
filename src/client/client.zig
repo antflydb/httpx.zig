@@ -573,7 +573,11 @@ pub const Client = struct {
             // per-stream completion semaphore that the receive loop posts.
             var sem: Io.Semaphore = .{ .permits = 0 };
             stream.completion_sem = &sem;
-            defer stream.completion_sem = null;
+            // Re-fetch the stream pointer for cleanup since the backing
+            // map may have rehashed while we were blocked on I/O.
+            defer if (h2.stream_manager.getStream(stream_id)) |s| {
+                s.completion_sem = null;
+            };
 
             // Serialize frame writes via the connection's write mutex.
             {

@@ -78,6 +78,9 @@ pub const Stream = struct {
     request_headers: ?[]hpack.DecodedHeader = null,
     /// Response headers (decoded).
     response_headers: ?[]hpack.DecodedHeader = null,
+    /// Trailing headers (RFC 7540 §8.1), decoded from a second HEADERS frame
+    /// received after DATA. Stored separately to avoid overwriting request_headers.
+    trailer_headers: ?[]hpack.DecodedHeader = null,
 
     // -- Per-stream mailbox for multiplexed I/O --
     // The receive loop writes here; request fibers read.
@@ -124,6 +127,7 @@ pub const Stream = struct {
         if (self.headers_payload) |hp| allocator.free(hp);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.response_headers);
+        freeDecodedHeaders(allocator, self.trailer_headers);
     }
 
     /// Checks if sending data is allowed in current state.

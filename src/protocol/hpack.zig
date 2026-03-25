@@ -786,7 +786,7 @@ pub fn decodeHeadersWithOptions(
 
             total_decoded_size += name.len + value_result.value.len;
             if (total_decoded_size > options.max_decoded_size) {
-                allocator.free(name);
+                // name is freed by errdefer; only free value here.
                 allocator.free(value_result.value);
                 return error.HeaderBlockTooLarge;
             }
@@ -824,7 +824,7 @@ pub fn decodeHeadersWithOptions(
 
             total_decoded_size += name.len + value_result.value.len;
             if (total_decoded_size > options.max_decoded_size) {
-                allocator.free(name);
+                // name is freed by errdefer; only free value here.
                 allocator.free(value_result.value);
                 return error.HeaderBlockTooLarge;
             }

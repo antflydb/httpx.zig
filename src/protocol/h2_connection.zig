@@ -637,7 +637,10 @@ pub const H2Connection = struct {
             payload,
             flags,
             self.allocator,
-            .{ .max_table_size = self.local_settings.header_table_size },
+            .{
+                .max_table_size = self.local_settings.header_table_size,
+                .max_decoded_size = self.local_settings.max_header_list_size,
+            },
         );
         return .{ .headers = result.headers, .priority = result.priority };
     }
@@ -684,31 +687,33 @@ pub const H2Connection = struct {
 
         switch (frame.header.frame_type) {
             .headers => {
-                // Store raw HPACK payload (useful for debugging / tests).
-                if (stream.headers_payload) |old| self.allocator.free(old);
-                stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
-                stream.headers_flags = frame.header.flags;
-
                 // Decode HPACK immediately in the receive loop. This is the
                 // only safe place since hpack_ctx is connection-scoped and
                 // stateful — concurrent decodes corrupt the dynamic table.
-                stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
-                stream.request_headers = null;
                 const dec = self.decodeFrameHeaders(frame.payload, frame.header.flags) catch |err| {
-                    // Clean up the duped payload on decode failure.
-                    if (stream.headers_payload) |hp| {
-                        self.allocator.free(hp);
-                        stream.headers_payload = null;
-                    }
                     return err;
                 };
-                stream.request_headers = dec.headers;
                 if (dec.priority) |p| stream.priority = p;
 
-                // Transition idle → open (RFC 7540 §5.1).
-                if (stream.state == .idle) stream.state = .open;
+                if (stream.got_headers) {
+                    // RFC 7540 §8.1: Trailing HEADERS after DATA frames.
+                    // Store separately to avoid overwriting the initial headers.
+                    stream_mod.freeDecodedHeaders(self.allocator, stream.trailer_headers);
+                    stream.trailer_headers = dec.headers;
+                } else {
+                    // Initial HEADERS — store raw payload and decoded headers.
+                    if (stream.headers_payload) |old| self.allocator.free(old);
+                    stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
+                    stream.headers_flags = frame.header.flags;
 
-                stream.got_headers = true;
+                    stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
+                    stream.request_headers = dec.headers;
+
+                    // Transition idle → open (RFC 7540 §5.1).
+                    if (stream.state == .idle) stream.state = .open;
+                    stream.got_headers = true;
+                }
+
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
@@ -725,8 +730,18 @@ pub const H2Connection = struct {
                     if (stream.completion_sem) |sem| sem.post(self.io);
                     return;
                 }
+                // RFC 7540 §6.1: Strip padding from DATA frames.
+                const data_payload = blk: {
+                    if (frame.header.flags & FLAG_PADDED != 0) {
+                        if (frame.payload.len < 1) return error.ProtocolError;
+                        const pad_len: usize = frame.payload[0];
+                        if (pad_len + 1 > frame.payload.len) return error.ProtocolError;
+                        break :blk frame.payload[1 .. frame.payload.len - pad_len];
+                    }
+                    break :blk frame.payload;
+                };
                 if (self.max_stream_data_size > 0) {
-                    const new_size = stream.data_buf.items.len + frame.payload.len;
+                    const new_size = stream.data_buf.items.len + data_payload.len;
                     if (new_size > self.max_stream_data_size) {
                         stream.stream_error = error.StreamDataOverflow;
                         stream.completed = true;
@@ -736,6 +751,9 @@ pub const H2Connection = struct {
                     }
                 }
                 // RFC 7540 §6.9: Decrement receive windows on incoming DATA.
+                // Flow control covers the entire frame payload including padding
+                // (RFC 7540 §6.9: "the entire DATA frame payload is included in
+                // flow control, including the Pad Length and Padding fields").
                 if (frame.payload.len > 0) {
                     const data_len: i32 = @intCast(@min(frame.payload.len, @as(usize, @intCast(std.math.maxInt(i32)))));
                     stream.updateRecvWindow(-data_len) catch {
@@ -750,7 +768,7 @@ pub const H2Connection = struct {
                     // can send GOAWAY(FLOW_CONTROL_ERROR).
                     try self.stream_manager.updateConnectionRecvWindow(-data_len);
                 }
-                try stream.data_buf.appendSlice(self.allocator, frame.payload);
+                try stream.data_buf.appendSlice(self.allocator, data_payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
                     stream.completed = true;
@@ -760,6 +778,9 @@ pub const H2Connection = struct {
                 }
             },
             .rst_stream => {
+                // RFC 7540 §5.1: RST_STREAM on an idle stream is a
+                // connection error (PROTOCOL_ERROR).
+                if (stream.state == .idle) return error.ProtocolError;
                 stream.stream_error = error.StreamReset;
                 stream.completed = true;
                 stream.reset();
@@ -2495,6 +2516,201 @@ test "MAX_CONCURRENT_STREAMS off-by-one fixed: >= not >" {
     try std.testing.expectEqual(@as(usize, 2), manager.activeStreamCount());
     // With >= check, 2 active streams meets the limit of 2.
     try std.testing.expect(manager.activeStreamCount() >= manager.max_concurrent_streams);
+}
+
+test "PADDED DATA: padding stripped from application data" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+
+    // Build a padded DATA frame: pad_length=3, data="hello", padding=3 zero bytes.
+    // Wire: [pad_len:1][data:5][padding:3] = 9 bytes total.
+    const padded_payload = [_]u8{3} ++ "hello".* ++ [_]u8{ 0, 0, 0 };
+    var frame = Frame{
+        .header = .{
+            .length = @intCast(padded_payload.len),
+            .frame_type = .data,
+            .flags = H2Connection.FLAG_PADDED,
+            .stream_id = 1,
+        },
+        .payload = @constCast(&padded_payload),
+    };
+    try server.deliverToMailbox(&frame);
+
+    // Application should see only "hello", not the padding.
+    try std.testing.expectEqualStrings("hello", stream.data_buf.items);
+}
+
+test "PADDED DATA: flow control covers entire frame including padding" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const initial_recv = stream.recv_window;
+    const initial_conn_recv = server.stream_manager.connection_recv_window;
+
+    // 9-byte padded frame: 1 byte pad_len + 5 data + 3 padding.
+    const padded_payload = [_]u8{3} ++ "hello".* ++ [_]u8{ 0, 0, 0 };
+    var frame = Frame{
+        .header = .{
+            .length = @intCast(padded_payload.len),
+            .frame_type = .data,
+            .flags = H2Connection.FLAG_PADDED,
+            .stream_id = 1,
+        },
+        .payload = @constCast(&padded_payload),
+    };
+    try server.deliverToMailbox(&frame);
+
+    // RFC 7540 §6.9: flow control covers entire payload including padding (9 bytes).
+    try std.testing.expectEqual(initial_recv - 9, stream.recv_window);
+    try std.testing.expectEqual(initial_conn_recv - 9, server.stream_manager.connection_recv_window);
+    // But only the actual data is delivered to the application.
+    try std.testing.expectEqual(@as(usize, 5), stream.data_buf.items.len);
+}
+
+test "PADDED DATA: invalid padding length rejected as ProtocolError" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+
+    // pad_length=10 but total payload is only 6 bytes — invalid.
+    const bad_payload = [_]u8{ 10, 'h', 'e', 'l', 'l', 'o' };
+    var frame = Frame{
+        .header = .{
+            .length = @intCast(bad_payload.len),
+            .frame_type = .data,
+            .flags = H2Connection.FLAG_PADDED,
+            .stream_id = 1,
+        },
+        .payload = @constCast(&bad_payload),
+    };
+    try std.testing.expectError(error.ProtocolError, server.deliverToMailbox(&frame));
+}
+
+test "trailer HEADERS stored separately from initial headers" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Encode initial headers.
+    const init_headers = [_]hpack.HeaderEntry{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    const init_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &init_headers, allocator);
+    defer allocator.free(init_encoded);
+
+    // Deliver initial HEADERS.
+    var init_frame = Frame{
+        .header = .{
+            .length = @intCast(init_encoded.len),
+            .frame_type = .headers,
+            .flags = H2Connection.FLAG_END_HEADERS,
+            .stream_id = 1,
+        },
+        .payload = init_encoded,
+    };
+    try server.deliverToMailbox(&init_frame);
+
+    const stream = server.stream_manager.getStream(1).?;
+    try std.testing.expect(stream.got_headers);
+    try std.testing.expect(!stream.completed);
+    try std.testing.expect(stream.request_headers != null);
+    try std.testing.expect(stream.trailer_headers == null);
+
+    // Encode trailer headers.
+    const trailer_hdrs = [_]hpack.HeaderEntry{
+        .{ .name = "grpc-status", .value = "0" },
+    };
+    const trailer_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &trailer_hdrs, allocator);
+    defer allocator.free(trailer_encoded);
+
+    // Deliver trailing HEADERS with END_STREAM.
+    var trailer_frame = Frame{
+        .header = .{
+            .length = @intCast(trailer_encoded.len),
+            .frame_type = .headers,
+            .flags = H2Connection.FLAG_END_HEADERS | H2Connection.FLAG_END_STREAM,
+            .stream_id = 1,
+        },
+        .payload = trailer_encoded,
+    };
+    try server.deliverToMailbox(&trailer_frame);
+
+    // Initial headers should be preserved.
+    try std.testing.expect(stream.request_headers != null);
+    try std.testing.expectEqual(@as(usize, 4), stream.request_headers.?.len);
+    try std.testing.expectEqualStrings(":method", stream.request_headers.?[0].name);
+
+    // Trailers stored separately.
+    try std.testing.expect(stream.trailer_headers != null);
+    try std.testing.expectEqual(@as(usize, 1), stream.trailer_headers.?.len);
+    try std.testing.expectEqualStrings("grpc-status", stream.trailer_headers.?[0].name);
+    try std.testing.expectEqualStrings("0", stream.trailer_headers.?[0].value);
+
+    // Stream should be completed.
+    try std.testing.expect(stream.completed);
+}
+
+test "RST_STREAM on idle stream is connection error" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Create a stream but leave it in idle state (no HEADERS received).
+    _ = try server.stream_manager.getOrCreateStream(1);
+
+    // Send RST_STREAM for the idle stream.
+    const rst_payload = stream_mod.buildRstStreamPayload(.cancel);
+    var frame = Frame{
+        .header = .{
+            .length = 4,
+            .frame_type = .rst_stream,
+            .flags = 0,
+            .stream_id = 1,
+        },
+        .payload = @constCast(&rst_payload),
+    };
+    // RFC 7540 §5.1: RST_STREAM on idle stream must be a connection error.
+    try std.testing.expectError(error.ProtocolError, server.deliverToMailbox(&frame));
+}
+
+test "SETTINGS_MAX_HEADER_LIST_SIZE enforced in HPACK decode" {
+    const allocator = std.testing.allocator;
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+    // Set a very small header list size limit.
+    server.local_settings.max_header_list_size = 32;
+
+    // Encode headers that exceed 32 bytes when decoded
+    // (name + value per header, RFC 7541 §4.1 doesn't add the 32-byte overhead
+    // in our implementation — just raw name+value sizes).
+    const headers = [_]hpack.HeaderEntry{
+        .{ .name = "x-long-header", .value = "this-value-is-quite-long-indeed" },
+    };
+    const encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Decoding should fail because total decoded size > 32 bytes.
+    const result = server.decodeFrameHeaders(encoded, H2Connection.FLAG_END_HEADERS);
+    try std.testing.expectError(error.HeaderBlockTooLarge, result);
 }
 
 test "applyInitialWindowSizeChange skips closed streams" {
