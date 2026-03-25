@@ -647,6 +647,7 @@ pub const Client = struct {
         stream: *Stream,
         io: Io,
         h2: *H2Connection,
+        entry: *H2PoolEntry,
         data_event: *Io.Event,
         allocator: Allocator,
         read_timeout: Io.Timeout = .none,
@@ -685,11 +686,27 @@ pub const Client = struct {
             }
         }
 
-        /// Releases the stream. Must be called when done reading.
+        /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
+        /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
+            const stream_id = self.stream.id;
+            const completed = self.stream.completed;
             self.stream.data_event = null;
             self.stream.completion_sem = null;
-            self.h2.stream_manager.removeStream(self.stream.id);
+
+            if (!completed) {
+                self.h2.write_mutex.lockUncancelable(self.io);
+                defer self.h2.write_mutex.unlock(self.io);
+                if (self.entry.is_tls) {
+                    if (self.entry.session.getWriter()) |w|
+                        self.h2.sendRstStream(w, stream_id, .cancel) catch {}
+                    else |_| {}
+                } else {
+                    self.h2.sendRstStream(&self.entry.socket, stream_id, .cancel) catch {};
+                }
+            }
+
+            self.h2.stream_manager.removeStream(stream_id);
             self.allocator.destroy(self.data_event);
         }
     };
@@ -841,6 +858,7 @@ pub const Client = struct {
                 .stream = stream,
                 .io = self.io,
                 .h2 = h2,
+                .entry = entry,
                 .data_event = data_event,
                 .allocator = self.allocator,
             },
@@ -1569,6 +1587,7 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
         .stream = stream,
         .io = std.testing.io,
         .h2 = &h2,
+        .entry = undefined, // Not dereferenced: stream.completed=true so close() skips RST_STREAM.
         .data_event = data_event,
         .allocator = allocator,
     };
