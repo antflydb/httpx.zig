@@ -559,3 +559,33 @@ test "RouteGroup routes use owned pattern strings" {
     const result = router.find(.GET, "/api/users", &pbuf);
     try std.testing.expect(result != null);
 }
+
+test "RouteGroup convenience methods" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            return error.TestUnexpectedResult;
+        }
+    }.h;
+
+    var api = router.group("/api");
+    try api.get("/get", handler);
+    try api.post("/post", handler);
+    try api.put("/put", handler);
+    try api.delete("/delete", handler);
+    try api.patch("/patch", handler);
+    try api.head("/head", handler);
+    try api.options("/options", handler);
+
+    try std.testing.expect(router.find(.GET, "/api/get", &pbuf) != null);
+    try std.testing.expect(router.find(.POST, "/api/post", &pbuf) != null);
+    try std.testing.expect(router.find(.PUT, "/api/put", &pbuf) != null);
+    try std.testing.expect(router.find(.DELETE, "/api/delete", &pbuf) != null);
+    try std.testing.expect(router.find(.PATCH, "/api/patch", &pbuf) != null);
+    try std.testing.expect(router.find(.HEAD, "/api/head", &pbuf) != null);
+    try std.testing.expect(router.find(.OPTIONS, "/api/options", &pbuf) != null);
+}

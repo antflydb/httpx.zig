@@ -242,7 +242,116 @@ test "CORS middleware" {
     try std.testing.expectEqualStrings("cors", mw.name);
 }
 
-test "Helmet middleware" {
+test "CORS middleware sets headers and handles preflight" {
+    const allocator = std.testing.allocator;
+    const Request = @import("../core/request.zig").Request;
+
+    // Preflight request (OPTIONS).
+    var req = try Request.init(allocator, .OPTIONS, "/api");
+    defer req.deinit();
+    try req.headers.set("Origin", "https://example.com");
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const mw = cors(.{});
+    const InnerHandler = struct {
+        fn call(self: *Next, _: *Context) anyerror!Response {
+            _ = self;
+            return Response.init(std.testing.allocator, 200);
+        }
+    };
+    var next = Next{ ._call = InnerHandler.call };
+
+    var response = try mw.handler(&ctx, &next);
+    defer response.deinit();
+
+    // Preflight returns 204.
+    try std.testing.expectEqual(@as(u16, 204), response.status.code);
+    // CORS headers are on the built response.
+    try std.testing.expect(response.headers.contains(HeaderName.ACCESS_CONTROL_ALLOW_ORIGIN));
+    try std.testing.expect(response.headers.contains(HeaderName.ACCESS_CONTROL_ALLOW_METHODS));
+}
+
+test "CORS origin matching returns matching origin" {
+    const allocator = std.testing.allocator;
+    const Request = @import("../core/request.zig").Request;
+
+    var req = try Request.init(allocator, .GET, "/api");
+    defer req.deinit();
+    try req.headers.set("Origin", "https://allowed.com");
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const mw = cors(.{ .allowed_origins = &[_][]const u8{ "https://allowed.com", "https://other.com" } });
+    const InnerHandler = struct {
+        fn call(self: *Next, inner_ctx: *Context) anyerror!Response {
+            _ = self;
+            return inner_ctx.text("");
+        }
+    };
+    var next = Next{ ._call = InnerHandler.call };
+
+    var response = try mw.handler(&ctx, &next);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    // Should reflect the matched origin, not "*".
+    try std.testing.expectEqualStrings("https://allowed.com", response.headers.get(HeaderName.ACCESS_CONTROL_ALLOW_ORIGIN).?);
+}
+
+test "Helmet middleware sets security headers" {
+    const allocator = std.testing.allocator;
+    const Request = @import("../core/request.zig").Request;
+
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
     const mw = helmet();
-    try std.testing.expectEqualStrings("helmet", mw.name);
+    const InnerHandler = struct {
+        fn call(self: *Next, inner_ctx: *Context) anyerror!Response {
+            _ = self;
+            return inner_ctx.text("");
+        }
+    };
+    var next = Next{ ._call = InnerHandler.call };
+
+    var response = try mw.handler(&ctx, &next);
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("nosniff", response.headers.get(HeaderName.X_CONTENT_TYPE_OPTIONS).?);
+    try std.testing.expectEqualStrings("SAMEORIGIN", response.headers.get(HeaderName.X_FRAME_OPTIONS).?);
+    try std.testing.expectEqualStrings("0", response.headers.get(HeaderName.X_XSS_PROTECTION).?);
+    try std.testing.expectEqualStrings("strict-origin-when-cross-origin", response.headers.get(HeaderName.REFERRER_POLICY).?);
+}
+
+test "requestId middleware sets X-Request-ID header" {
+    const allocator = std.testing.allocator;
+    const Request = @import("../core/request.zig").Request;
+
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const mw = requestId();
+    const InnerHandler = struct {
+        fn call(self: *Next, inner_ctx: *Context) anyerror!Response {
+            _ = self;
+            return inner_ctx.text("");
+        }
+    };
+    var next = Next{ ._call = InnerHandler.call };
+
+    var response = try mw.handler(&ctx, &next);
+    defer response.deinit();
+
+    const id = response.headers.get(HeaderName.X_REQUEST_ID);
+    try std.testing.expect(id != null);
+    try std.testing.expectEqual(@as(usize, 16), id.?.len);
 }

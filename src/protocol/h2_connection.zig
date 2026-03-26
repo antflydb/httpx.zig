@@ -173,10 +173,11 @@ pub const H2Connection = struct {
     pub fn sendSettings(self: *Self, writer: anytype) !void {
         // Sync enforcement limit with what we advertise.
         self.local_max_concurrent_streams = self.local_settings.max_concurrent_streams;
-        var payload_buf = std.ArrayListUnmanaged(u8).empty;
-        defer payload_buf.deinit(self.allocator);
-        try http.encodeSettingsPayload(self.local_settings, self.allocator, &payload_buf);
-        try self.writeFrame(writer, .settings, 0, 0, payload_buf.items);
+        // 6 settings × 6 bytes each = 36 bytes max — use a stack buffer to
+        // avoid heap allocation for this tiny, fixed-size payload.
+        var buf: [6 * 6]u8 = undefined;
+        const payload = http.encodeSettingsPayloadBuf(self.local_settings, &buf);
+        try self.writeFrame(writer, .settings, 0, 0, payload);
     }
 
     /// Sends a SETTINGS ACK (empty SETTINGS with ACK flag).
@@ -1516,10 +1517,7 @@ test "HPACK encode + decode round-trip via sendHeaders/decodeFrameHeaders" {
 
     const decoded = try server.decodeFrameHeaders(frame.payload, frame.header.flags);
     defer {
-        for (decoded.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
+        for (decoded.headers) |h| h.deinit(allocator);
         allocator.free(decoded.headers);
     }
 
@@ -1585,10 +1583,7 @@ test "full HTTP/2 request-response round-trip" {
 
     const decoded = try server.decodeFrameHeaders(req_frame.payload, req_frame.header.flags);
     defer {
-        for (decoded.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
+        for (decoded.headers) |h| h.deinit(allocator);
         allocator.free(decoded.headers);
     }
 
@@ -1622,10 +1617,7 @@ test "full HTTP/2 request-response round-trip" {
     defer got_body.deinit(allocator);
     var resp_decoded: ?[]hpack.DecodedHeader = null;
     defer if (resp_decoded) |hdrs| {
-        for (hdrs) |*h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
+        for (hdrs) |h| h.deinit(allocator);
         allocator.free(hdrs);
     };
 

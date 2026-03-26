@@ -468,18 +468,23 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             }
             // Remove empty buckets to prevent unbounded map growth from
             // connections to many distinct hosts over the pool's lifetime.
-            // Collect all empty keys first — removing during iteration is UB.
-            var empty_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer empty_keys.deinit(self.allocator);
+            // Collect keys into a stack buffer to avoid heap allocation under
+            // the mutex. If there are more empty buckets than the buffer can
+            // hold, the remaining ones will be cleaned up on the next cycle.
+            var empty_buf: [32][]const u8 = undefined;
+            var empty_count: usize = 0;
             {
                 var remove_it = self.host_map.iterator();
                 while (remove_it.next()) |entry| {
                     if (entry.value_ptr.items.len == 0) {
-                        empty_keys.append(self.allocator, entry.key_ptr.*) catch break;
+                        if (empty_count < empty_buf.len) {
+                            empty_buf[empty_count] = entry.key_ptr.*;
+                            empty_count += 1;
+                        }
                     }
                 }
             }
-            for (empty_keys.items) |key| {
+            for (empty_buf[0..empty_count]) |key| {
                 if (self.host_map.fetchRemove(key)) |removed| {
                     var list = removed.value;
                     list.deinit(self.allocator);

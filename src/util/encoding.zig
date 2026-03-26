@@ -132,6 +132,17 @@ pub const PercentEncoding = struct {
 
         var i: usize = 0;
         while (i < input.len) {
+            // Find the start of a special character (% or + if applicable).
+            const run_start = i;
+            while (i < input.len and input[i] != '%' and (!plus_as_space or input[i] != '+')) {
+                i += 1;
+            }
+            // Append the plain run in bulk.
+            if (i > run_start) {
+                try result.appendSlice(allocator, input[run_start..i]);
+            }
+            if (i >= input.len) break;
+
             if (input[i] == '%' and i + 2 < input.len) {
                 const hex = input[i + 1 .. i + 3];
                 if (std.fmt.parseInt(u8, hex, 16)) |byte| {
@@ -249,4 +260,42 @@ test "Form data encoding" {
     defer allocator.free(encoded);
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "name=John%20Doe") != null);
+}
+
+test "Percent decoding form data plus-as-space" {
+    const allocator = std.testing.allocator;
+
+    const decoded = try PercentEncoding.decodeFormData(allocator, "hello+world%21");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello world!", decoded);
+}
+
+test "Percent decoding truncated sequence" {
+    const allocator = std.testing.allocator;
+
+    // Trailing "%2" with no third hex digit — should pass through literally.
+    const decoded = try PercentEncoding.decode(allocator, "abc%2");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("abc%2", decoded);
+}
+
+test "Percent decoding invalid hex" {
+    const allocator = std.testing.allocator;
+
+    // "%ZZ" is not valid hex — should pass through literally.
+    const decoded = try PercentEncoding.decode(allocator, "abc%ZZdef");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("abc%ZZdef", decoded);
+}
+
+test "Hex decode odd-length input" {
+    const allocator = std.testing.allocator;
+    const result = Hex.decode(allocator, "abc");
+    try std.testing.expectError(error.InvalidHex, result);
+}
+
+test "Hex decode invalid character" {
+    const allocator = std.testing.allocator;
+    const result = Hex.decode(allocator, "ZZZZ");
+    try std.testing.expectError(error.InvalidHex, result);
 }

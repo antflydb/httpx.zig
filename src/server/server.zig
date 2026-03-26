@@ -2198,3 +2198,94 @@ test "stop cancels connections immediately" {
     try std.testing.expect(!server.running);
     try std.testing.expect(server.listener == null);
 }
+
+test "containsTraversal rejects double-encoded dot-dot" {
+    // %252e%252e decodes to %2e%2e (first decode), then .. (second decode).
+    // containsTraversal checks percent-encoded dots directly.
+    try std.testing.expect(containsTraversal("%2e%2e"));
+    try std.testing.expect(containsTraversal("%2E%2E"));
+    try std.testing.expect(containsTraversal("%2e."));
+    try std.testing.expect(containsTraversal(".%2e"));
+    try std.testing.expect(containsTraversal(".%2E"));
+}
+
+test "containsTraversal rejects percent-encoded slashes" {
+    try std.testing.expect(containsTraversal("foo%2fbar"));
+    try std.testing.expect(containsTraversal("foo%2Fbar"));
+}
+
+test "containsTraversal rejects backslashes" {
+    try std.testing.expect(containsTraversal("foo\\bar"));
+    try std.testing.expect(containsTraversal("..\\etc"));
+}
+
+test "containsTraversal rejects null bytes" {
+    try std.testing.expect(containsTraversal("foo\x00bar"));
+}
+
+test "containsTraversal rejects absolute paths" {
+    try std.testing.expect(containsTraversal("/etc/passwd"));
+}
+
+test "containsTraversal allows safe paths" {
+    try std.testing.expect(!containsTraversal("assets/style.css"));
+    try std.testing.expect(!containsTraversal("images/photo.jpg"));
+    try std.testing.expect(!containsTraversal("file.txt"));
+}
+
+test "SSE rejects CR in id field" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/sse");
+    defer req.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const events = [_]SseEvent{.{ .data = "data", .id = "bad\rid", .event = null, .retry_ms = null }};
+    const result = ctx.sse(&events);
+    try std.testing.expectError(error.InvalidSseField, result);
+}
+
+test "SSE rejects LF in event field" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/sse");
+    defer req.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const events = [_]SseEvent{.{ .data = "data", .id = null, .event = "bad\nevent", .retry_ms = null }};
+    const result = ctx.sse(&events);
+    try std.testing.expectError(error.InvalidSseField, result);
+}
+
+test "setCookie rejects CR/LF in name" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const result = ctx.setCookie("bad\rname", "value", .{});
+    try std.testing.expectError(error.HeaderContainsCrLf, result);
+}
+
+test "setCookie rejects CR/LF in value" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const result = ctx.setCookie("name", "bad\nvalue", .{});
+    try std.testing.expectError(error.HeaderContainsCrLf, result);
+}
+
+test "removeCookie rejects CR/LF in name" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/");
+    defer req.deinit();
+    var ctx = Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    const result = ctx.removeCookie("bad\nname", .{});
+    try std.testing.expectError(error.HeaderContainsCrLf, result);
+}

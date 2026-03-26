@@ -136,8 +136,11 @@ pub const Socket = struct {
         }
 
         pub fn print(self: SocketWriter, comptime fmt: []const u8, args: anytype) !void {
-            var buf: [4096]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory;
+            // 64 KB stack buffer handles all realistic HTTP header/status lines.
+            // If the formatted output somehow exceeds this, bufPrint returns
+            // NoSpaceLeft and we propagate it rather than silently truncating.
+            var buf: [65536]u8 = undefined;
+            const slice = try std.fmt.bufPrint(&buf, fmt, args);
             try self.writeAll(slice);
         }
     };

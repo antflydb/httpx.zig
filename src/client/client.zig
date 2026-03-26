@@ -1093,8 +1093,12 @@ pub const Client = struct {
                 if (n == 0) break;
                 total_read += n;
                 if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
-                const consumed = try parser.feed(buf[0 .. leftover + n]);
-                leftover = (leftover + n) - consumed;
+                const total = leftover + n;
+                const consumed = try parser.feed(buf[0..total]);
+                leftover = total - consumed;
+                if (consumed > 0 and leftover > 0) {
+                    std.mem.copyForwards(u8, buf[0..leftover], buf[consumed..total]);
+                }
             }
 
             parser.finishEof();

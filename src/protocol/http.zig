@@ -136,6 +136,27 @@ pub fn encodeSettingsPayload(settings: Http2ConnectionSettings, allocator: Alloc
     }
 }
 
+/// Stack-buffer variant of encodeSettingsPayload.
+/// buf must be at least 6 * 6 = 36 bytes.
+/// Returns the slice of buf that was written.
+pub fn encodeSettingsPayloadBuf(settings: Http2ConnectionSettings, buf: *[6 * 6]u8) []u8 {
+    const settings_list = [_]struct { id: Http2SettingId, val: u32 }{
+        .{ .id = .header_table_size, .val = settings.header_table_size },
+        .{ .id = .enable_push, .val = if (settings.enable_push) 1 else 0 },
+        .{ .id = .max_concurrent_streams, .val = settings.max_concurrent_streams },
+        .{ .id = .initial_window_size, .val = settings.initial_window_size },
+        .{ .id = .max_frame_size, .val = settings.max_frame_size },
+        .{ .id = .max_header_list_size, .val = settings.max_header_list_size },
+    };
+    var offset: usize = 0;
+    for (settings_list) |s| {
+        std.mem.writeInt(u16, buf[offset..][0..2], @intFromEnum(s.id), .big);
+        std.mem.writeInt(u32, buf[offset..][2..6], s.val, .big);
+        offset += 6;
+    }
+    return buf[0..offset];
+}
+
 pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const u8) !void {
     if (payload.len % 6 != 0) return error.InvalidSettingsPayload;
 

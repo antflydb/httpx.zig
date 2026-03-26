@@ -74,10 +74,7 @@ fn hpackExample(allocator: std.mem.Allocator) !void {
 
     const decoded = try httpx.hpack.decodeHeaders(&decode_ctx, encoded, allocator);
     defer {
-        for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
+        for (decoded) |h| h.deinit(allocator);
         allocator.free(decoded);
     }
 

@@ -409,3 +409,147 @@ test "Headers keep-alive detection" {
     try headers.set("Connection", "keep-alive");
     try std.testing.expect(headers.isKeepAlive(.HTTP_1_0));
 }
+
+test "Headers getAll returns all values" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("Set-Cookie", "a=1");
+    try headers.append("Set-Cookie", "b=2");
+    try headers.append("Set-Cookie", "c=3");
+
+    const values = try headers.getAll("Set-Cookie", allocator);
+    defer allocator.free(values);
+
+    try std.testing.expectEqual(@as(usize, 3), values.len);
+    try std.testing.expectEqualStrings("a=1", values[0]);
+    try std.testing.expectEqualStrings("b=2", values[1]);
+    try std.testing.expectEqualStrings("c=3", values[2]);
+}
+
+test "Headers remove first occurrence" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("X-Test", "first");
+    try headers.append("X-Test", "second");
+    try std.testing.expect(headers.remove("X-Test"));
+    try std.testing.expectEqual(@as(usize, 1), headers.count());
+    try std.testing.expectEqualStrings("second", headers.get("X-Test").?);
+}
+
+test "Headers removeAll removes all occurrences" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("X-Multi", "a");
+    try headers.append("Keep-Me", "yes");
+    try headers.append("X-Multi", "b");
+    try headers.append("X-Multi", "c");
+
+    headers.removeAll("X-Multi");
+    try std.testing.expectEqual(@as(usize, 1), headers.count());
+    try std.testing.expectEqualStrings("yes", headers.get("Keep-Me").?);
+    try std.testing.expect(headers.get("X-Multi") == null);
+}
+
+test "Headers clone creates independent copy" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("Content-Type", "text/html");
+    try headers.append("X-Custom", "value");
+
+    var cloned = try headers.clone(allocator);
+    defer cloned.deinit();
+
+    // Modify original — clone should be unaffected.
+    try headers.set("Content-Type", "application/json");
+    try std.testing.expectEqualStrings("text/html", cloned.get("Content-Type").?);
+    try std.testing.expectEqual(@as(usize, 2), cloned.count());
+}
+
+test "Headers contains" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("Authorization", "Bearer token");
+    try std.testing.expect(headers.contains("authorization"));
+    try std.testing.expect(!headers.contains("X-Missing"));
+}
+
+test "Headers clear removes all entries" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("A", "1");
+    try headers.append("B", "2");
+    headers.clear();
+    try std.testing.expectEqual(@as(usize, 0), headers.count());
+}
+
+test "Headers appendBorrowed does not own memory" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    // Static strings — appendBorrowed should not copy.
+    try headers.appendBorrowed("Host", "example.com");
+    try std.testing.expectEqualStrings("example.com", headers.get("Host").?);
+    try std.testing.expectEqual(@as(usize, 1), headers.count());
+    // Verify the entry is not owned.
+    try std.testing.expect(!headers.entries.items[0].owned);
+}
+
+test "Headers set slow path with multiple duplicates" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.append("X-Dup", "a");
+    try headers.append("X-Dup", "b");
+    try headers.append("X-Dup", "c");
+    try std.testing.expectEqual(@as(usize, 3), headers.count());
+
+    // set should remove all three and add one new entry.
+    try headers.set("X-Dup", "final");
+    try std.testing.expectEqual(@as(usize, 1), headers.count());
+    try std.testing.expectEqualStrings("final", headers.get("X-Dup").?);
+}
+
+test "Headers reject CRLF in append" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try std.testing.expectError(error.HeaderContainsCrLf, headers.append("X-Bad\r", "val"));
+    try std.testing.expectError(error.HeaderContainsCrLf, headers.append("X-Ok", "val\nue"));
+    try std.testing.expectError(error.HeaderContainsCrLf, headers.appendBorrowed("X-Bad\n", "val"));
+}
+
+test "Headers isChunked token matching" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.set("Transfer-Encoding", "gzip, chunked");
+    try std.testing.expect(headers.isChunked());
+
+    try headers.set("Transfer-Encoding", "chunkedx");
+    try std.testing.expect(!headers.isChunked());
+}
+
+test "Headers Connection close detection" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    try headers.set("Connection", "close");
+    try std.testing.expect(!headers.isKeepAlive(.HTTP_1_1));
+}

@@ -103,6 +103,8 @@ pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const common = @import("util/common.zig");
 
+pub const testing_mod = @import("testing.zig");
+
 pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
 
@@ -233,6 +235,10 @@ pub const CookiePair = common.CookiePair;
 
 pub const TlsConfig = tls.TlsConfig;
 pub const TlsSession = tls.TlsSession;
+
+pub const TestServer = testing_mod.TestServer;
+pub const TestRoute = testing_mod.Route;
+pub const TestResponseSpec = testing_mod.ResponseSpec;
 
 pub const VERSION = meta.version;
 pub const DEFAULT_USER_AGENT = meta.default_user_agent;
@@ -434,4 +440,8 @@ test "pool" {
 
 test "concurrency" {
     _ = concurrency;
+}
+
+test "testing" {
+    _ = testing_mod;
 }

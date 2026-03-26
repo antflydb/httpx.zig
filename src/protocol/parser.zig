@@ -77,6 +77,9 @@ pub const Parser = struct {
     header_bytes: usize = 0,
     header_count: usize = 0,
     total_body_bytes: usize = 0,
+    /// When true, the path was allocated via dupe and must be freed on reset/deinit.
+    /// When false, path points into `line_buffer` and is valid until reset.
+    path_owned: bool = false,
     /// When true, the parser marks the message as complete after headers are
     /// parsed and does not consume any body bytes. The caller is responsible
     /// for reading the body using `content_length` / `chunked` metadata.
@@ -105,7 +108,9 @@ pub const Parser = struct {
         self.headers.deinit();
         self.body_buffer.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
-        if (self.path) |p| self.allocator.free(p);
+        if (self.path_owned) {
+            if (self.path) |p| self.allocator.free(p);
+        }
     }
 
     /// Finalizes parsing when the underlying stream has reached EOF.
@@ -180,10 +185,11 @@ pub const Parser = struct {
         self.state = .start;
         self.error_reason = .none;
         self.method = null;
-        if (self.path) |p| {
-            self.allocator.free(p);
-            self.path = null;
+        if (self.path_owned) {
+            if (self.path) |p| self.allocator.free(p);
         }
+        self.path = null;
+        self.path_owned = false;
         self.status_code = null;
         self.headers.clear();
         // Release oversized buffers to prevent permanent memory inflation
@@ -276,10 +282,16 @@ pub const Parser = struct {
             self.error_reason = .malformed_request_line;
             return lr.consumed;
         };
-        self.path = try self.allocator.dupe(u8, path);
-        errdefer {
-            self.allocator.free(self.path.?);
-            self.path = null;
+        // When the request line spanned multiple feed() calls, `path` points
+        // into `line_buffer` which will be reused for header parsing below.
+        // In that case we must dupe. When the line fit in a single data slice,
+        // the path borrows from the caller's buffer and is valid until reset().
+        if (self.line_buffer.items.len > 0) {
+            self.path = try self.allocator.dupe(u8, path);
+            self.path_owned = true;
+        } else {
+            self.path = path;
+            self.path_owned = false;
         }
 
         const version_str = parts.next() orelse {
@@ -870,4 +882,75 @@ test "reject header injection via LF in name" {
 
     const result = parser.feed("GET / HTTP/1.1\r\nX-Ba\nd: value\r\n\r\n");
     try std.testing.expectError(error.InvalidHeader, result);
+}
+
+test "headers_only mode completes after headers" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    parser.headers_only = true;
+
+    const data = "GET /stream HTTP/1.1\r\nContent-Length: 1000\r\n\r\nBODY_DATA";
+    const consumed = try parser.feed(data);
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqual(@as(?u64, 1000), parser.content_length);
+    try std.testing.expectEqualStrings("", parser.getBody());
+    // Unconsumed body bytes remain after the consumed headers.
+    try std.testing.expect(consumed < data.len);
+}
+
+test "headers_only mode with chunked encoding" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    parser.headers_only = true;
+
+    _ = try parser.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expect(parser.chunked);
+    try std.testing.expectEqualStrings("", parser.getBody());
+}
+
+test "reject duplicate Content-Length with different values" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    const result = parser.feed("GET / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n");
+    try std.testing.expectError(error.InvalidHeader, result);
+    try std.testing.expectEqual(ErrorReason.smuggling_detected, parser.getErrorReason());
+}
+
+test "allow duplicate Content-Length with same value" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("GET / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n0123456789");
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqual(@as(?u64, 10), parser.content_length);
+}
+
+test "path borrowing safe when request line spans feeds" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Feed request line in two parts so path comes from line_buffer and gets duped.
+    _ = try parser.feed("GET /my/pa");
+    _ = try parser.feed("th HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("/my/path", parser.path.?);
+    try std.testing.expect(parser.path_owned);
+}
+
+test "path borrowing from data when request line fits in one feed" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed("GET /single HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expectEqualStrings("/single", parser.path.?);
+    try std.testing.expect(!parser.path_owned);
 }

@@ -205,6 +205,81 @@ test "URI parsing path-only with scheme-like query" {
     try std.testing.expectEqualStrings("url=https://other.com", uri.query.?);
 }
 
+test "URI format roundtrip" {
+    const allocator = std.testing.allocator;
+    const uri = try Uri.parse("https://user:pass@example.com:8443/path?q=1#frag");
+    const formatted = try uri.format(allocator);
+    defer allocator.free(formatted);
+    try std.testing.expectEqualStrings("https://user:pass@example.com:8443/path?q=1#frag", formatted);
+}
+
+test "URI authority" {
+    const allocator = std.testing.allocator;
+    const uri = try Uri.parse("https://user@example.com:443/path");
+    const auth = try uri.authority(allocator);
+    defer allocator.free(auth);
+    try std.testing.expectEqualStrings("user@example.com:443", auth);
+}
+
+test "URI requestPath with query" {
+    const allocator = std.testing.allocator;
+    const uri = try Uri.parse("https://example.com/api?key=val");
+    const rp = try uri.requestPath(allocator);
+    defer allocator.free(rp);
+    try std.testing.expectEqualStrings("/api?key=val", rp);
+}
+
+test "URI requestPath without query" {
+    const allocator = std.testing.allocator;
+    const uri = try Uri.parse("https://example.com/api");
+    const rp = try uri.requestPath(allocator);
+    defer allocator.free(rp);
+    try std.testing.expectEqualStrings("/api", rp);
+}
+
+test "URI IPv6 parsing" {
+    const uri = try Uri.parse("https://[::1]:8080/path");
+    try std.testing.expectEqualStrings("::1", uri.host.?);
+    try std.testing.expectEqual(@as(u16, 8080), uri.port.?);
+    try std.testing.expectEqualStrings("/path", uri.path);
+}
+
+test "URI isWebSocket" {
+    const ws = try Uri.parse("ws://example.com/ws");
+    try std.testing.expect(ws.isWebSocket());
+    try std.testing.expect(!ws.isTls());
+
+    const wss = try Uri.parse("wss://example.com/ws");
+    try std.testing.expect(wss.isWebSocket());
+    try std.testing.expect(wss.isTls());
+
+    const http = try Uri.parse("https://example.com/");
+    try std.testing.expect(!http.isWebSocket());
+}
+
+test "URI userinfo parsing" {
+    const uri = try Uri.parse("https://admin:secret@host.com/");
+    try std.testing.expectEqualStrings("admin:secret", uri.userinfo.?);
+    try std.testing.expectEqualStrings("host.com", uri.host.?);
+}
+
+test "URI effectivePort defaults" {
+    const http = try Uri.parse("http://example.com/");
+    try std.testing.expectEqual(@as(u16, 80), http.effectivePort());
+
+    const https = try Uri.parse("https://example.com/");
+    try std.testing.expectEqual(@as(u16, 443), https.effectivePort());
+
+    const ws = try Uri.parse("ws://example.com/");
+    try std.testing.expectEqual(@as(u16, 80), ws.effectivePort());
+
+    const wss = try Uri.parse("wss://example.com/");
+    try std.testing.expectEqual(@as(u16, 443), wss.effectivePort());
+
+    const ftp = try Uri.parse("ftp://example.com/");
+    try std.testing.expectEqual(@as(u16, 21), ftp.effectivePort());
+}
+
 test "Percent encoding" {
     const allocator = std.testing.allocator;
 

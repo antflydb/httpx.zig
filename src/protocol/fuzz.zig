@@ -98,10 +98,7 @@ test "fuzz HPACK header decode" {
             defer ctx.deinit();
 
             const headers = hpack.decodeHeaders(&ctx, buf[0..len], allocator) catch return;
-            for (headers) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
-            }
+            for (headers) |h| h.deinit(allocator);
             allocator.free(headers);
         }
     }.f, .{});

@@ -252,6 +252,36 @@ pub const DynamicTable = struct {
         self.base = 0;
     }
 
+    /// Searches the dynamic table for a full name+value match.
+    /// Returns the 0-based dynamic table index of the first (newest) match, or null.
+    /// Name comparison is case-insensitive; the table stores lowercase names.
+    pub fn findNameValue(self: *const Self, name: []const u8, value: []const u8) ?usize {
+        const live = self.len();
+        var i: usize = 0;
+        while (i < live) : (i += 1) {
+            const entry = self.entries.items[self.base + live - 1 - i];
+            if (std.ascii.eqlIgnoreCase(entry.name, name) and mem.eql(u8, entry.value, value)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Searches the dynamic table for a name-only match.
+    /// Returns the 0-based dynamic table index of the first (newest) match, or null.
+    /// Name comparison is case-insensitive; the table stores lowercase names.
+    pub fn findName(self: *const Self, name: []const u8) ?usize {
+        const live = self.len();
+        var i: usize = 0;
+        while (i < live) : (i += 1) {
+            const entry = self.entries.items[self.base + live - 1 - i];
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
     /// Gets an entry by index (0-based within dynamic table).
     /// Index 0 = newest entry (last appended), higher indices = older entries.
     pub fn get(self: *const Self, index: usize) ?StaticTable.Entry {
@@ -676,9 +706,16 @@ pub fn encodeHeaders(
     for (headers) |header| {
         // Try to find in static table first
         if (StaticTable.findNameValue(header.name, header.value)) |index| {
-            // Indexed header field (fully matched)
+            // Indexed header field (fully matched — static table)
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(index, 7, &buf);
+            buf[0] |= 0x80; // Set indexed bit
+            try out.appendSlice(allocator, buf[0..n]);
+        } else if (ctx.dynamic_table.findNameValue(header.name, header.value)) |dyn_i| {
+            // Indexed header field (fully matched — dynamic table)
+            const hpack_index = StaticTable.entries.len + 1 + dyn_i;
+            var buf: [10]u8 = undefined;
+            const n = try encodeInteger(hpack_index, 7, &buf);
             buf[0] |= 0x80; // Set indexed bit
             try out.appendSlice(allocator, buf[0..n]);
         } else if (StaticTable.findName(header.name)) |name_index| {
@@ -699,6 +736,28 @@ pub fn encodeHeaders(
             };
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(name_index, 6, &buf);
+            buf[0] |= 0x40; // Incremental indexing
+            try out.appendSlice(allocator, buf[0..n]);
+            try encodeString(header.value, true, allocator, &out);
+            try ctx.dynamic_table.add(idx_lower_name, header.value);
+        } else if (ctx.dynamic_table.findName(header.name)) |dyn_i| {
+            // Literal header with indexed name from dynamic table.
+            // Store the lowercase form in the dynamic table.
+            var idx_lower_buf: [256]u8 = undefined;
+            var idx_lower_heap: ?[]u8 = null;
+            defer if (idx_lower_heap) |h| allocator.free(h);
+            const idx_lower_name = if (header.name.len <= idx_lower_buf.len) blk: {
+                for (header.name, 0..) |c, i| idx_lower_buf[i] = std.ascii.toLower(c);
+                break :blk idx_lower_buf[0..header.name.len];
+            } else blk: {
+                const heap = try allocator.alloc(u8, header.name.len);
+                for (header.name, 0..) |c, i| heap[i] = std.ascii.toLower(c);
+                idx_lower_heap = heap;
+                break :blk heap;
+            };
+            const hpack_index = StaticTable.entries.len + 1 + dyn_i;
+            var buf: [10]u8 = undefined;
+            const n = try encodeInteger(hpack_index, 6, &buf);
             buf[0] |= 0x40; // Incremental indexing
             try out.appendSlice(allocator, buf[0..n]);
             try encodeString(header.value, true, allocator, &out);
@@ -732,6 +791,18 @@ pub fn encodeHeaders(
 pub const DecodedHeader = struct {
     name: []u8,
     value: []u8,
+    /// Whether name is heap-allocated and must be freed by the caller.
+    /// Static table names (index 1–61) point to comptime literals and are not owned.
+    name_owned: bool = true,
+    /// Whether value is heap-allocated and must be freed by the caller.
+    /// Static table values in indexed representations are not owned.
+    value_owned: bool = true,
+
+    /// Free name and/or value if owned. Always safe to call.
+    pub fn deinit(self: DecodedHeader, allocator: Allocator) void {
+        if (self.name_owned) allocator.free(self.name);
+        if (self.value_owned) allocator.free(self.value);
+    }
 };
 
 /// Limits for HPACK header decoding.
@@ -762,10 +833,7 @@ pub fn decodeHeadersWithOptions(
 ) ![]DecodedHeader {
     var headers = std.ArrayListUnmanaged(DecodedHeader).empty;
     errdefer {
-        for (headers.items) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
+        for (headers.items) |h| h.deinit(allocator);
         headers.deinit(allocator);
     }
 
@@ -787,10 +855,21 @@ pub fn decodeHeadersWithOptions(
             const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
             total_decoded_size += entry.name.len + entry.value.len;
             if (total_decoded_size > options.max_decoded_size) return error.HeaderBlockTooLarge;
-            try headers.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
-                .value = try allocator.dupe(u8, entry.value),
-            });
+            if (idx_result.value <= StaticTable.entries.len) {
+                // Static table: comptime literals, no allocation needed.
+                try headers.append(allocator, .{
+                    .name = @constCast(entry.name),
+                    .value = @constCast(entry.value),
+                    .name_owned = false,
+                    .value_owned = false,
+                });
+            } else {
+                // Dynamic table: entries can be evicted, must copy.
+                try headers.append(allocator, .{
+                    .name = try allocator.dupe(u8, entry.name),
+                    .value = try allocator.dupe(u8, entry.value),
+                });
+            }
         } else if (first & 0x40 != 0) {
             // Literal with incremental indexing
             saw_non_update = true;
@@ -798,27 +877,34 @@ pub fn decodeHeadersWithOptions(
             offset += idx_result.len;
 
             var name: []u8 = undefined;
+            var name_owned: bool = true;
             if (idx_result.value > 0) {
                 const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
-                name = try allocator.dupe(u8, entry.name);
+                if (idx_result.value <= StaticTable.entries.len) {
+                    // Static table: comptime literal, no allocation needed.
+                    name = @constCast(entry.name);
+                    name_owned = false;
+                } else {
+                    name = try allocator.dupe(u8, entry.name);
+                }
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
                 offset += name_result.len;
                 name = name_result.value;
             }
-            errdefer allocator.free(name);
+            errdefer if (name_owned) allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
             total_decoded_size += name.len + value_result.value.len;
             if (total_decoded_size > options.max_decoded_size) {
-                // name is freed by errdefer; only free value here.
+                // name is freed by errdefer (if owned); only free value here.
                 allocator.free(value_result.value);
                 return error.HeaderBlockTooLarge;
             }
             try ctx.dynamic_table.add(name, value_result.value);
-            try headers.append(allocator, .{ .name = name, .value = value_result.value });
+            try headers.append(allocator, .{ .name = name, .value = value_result.value, .name_owned = name_owned });
         } else if (first & 0x20 != 0) {
             // Dynamic table size update (RFC 7541 §4.2).
             // MUST occur at the beginning of a header block, before any header representations.
@@ -836,26 +922,33 @@ pub fn decodeHeadersWithOptions(
             offset += idx_result.len;
 
             var name: []u8 = undefined;
+            var name_owned: bool = true;
             if (idx_result.value > 0) {
                 const entry = ctx.getByIndex(@intCast(idx_result.value)) orelse return error.InvalidIndex;
-                name = try allocator.dupe(u8, entry.name);
+                if (idx_result.value <= StaticTable.entries.len) {
+                    // Static table: comptime literal, no allocation needed.
+                    name = @constCast(entry.name);
+                    name_owned = false;
+                } else {
+                    name = try allocator.dupe(u8, entry.name);
+                }
             } else {
                 const name_result = try decodeString(data[offset..], allocator);
                 offset += name_result.len;
                 name = name_result.value;
             }
-            errdefer allocator.free(name);
+            errdefer if (name_owned) allocator.free(name);
 
             const value_result = try decodeString(data[offset..], allocator);
             offset += value_result.len;
 
             total_decoded_size += name.len + value_result.value.len;
             if (total_decoded_size > options.max_decoded_size) {
-                // name is freed by errdefer; only free value here.
+                // name is freed by errdefer (if owned); only free value here.
                 allocator.free(value_result.value);
                 return error.HeaderBlockTooLarge;
             }
-            try headers.append(allocator, .{ .name = name, .value = value_result.value });
+            try headers.append(allocator, .{ .name = name, .value = value_result.value, .name_owned = name_owned });
         }
     }
 
@@ -1009,8 +1102,7 @@ test "RFC 7541 C.2.1 - Literal Header Field with Indexing" {
     const decoded = try decodeHeaders(&ctx, &wire, allocator);
     defer {
         for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(decoded);
     }
@@ -1040,8 +1132,7 @@ test "RFC 7541 C.2.2 - Literal Header Field without Indexing" {
     const decoded = try decodeHeaders(&ctx, &wire, allocator);
     defer {
         for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(decoded);
     }
@@ -1069,8 +1160,7 @@ test "RFC 7541 C.2.3 - Literal Header Field Never Indexed" {
     const decoded = try decodeHeaders(&ctx, &wire, allocator);
     defer {
         for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(decoded);
     }
@@ -1101,8 +1191,7 @@ test "RFC 7541 C.3 - Request examples without Huffman coding" {
         const decoded = try decodeHeaders(&ctx, &wire, allocator);
         defer {
             for (decoded) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
+                h.deinit(allocator);
             }
             allocator.free(decoded);
         }
@@ -1133,8 +1222,7 @@ test "RFC 7541 C.3 - Request examples without Huffman coding" {
         const decoded = try decodeHeaders(&ctx, &wire, allocator);
         defer {
             for (decoded) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
+                h.deinit(allocator);
             }
             allocator.free(decoded);
         }
@@ -1170,8 +1258,7 @@ test "RFC 7541 C.3 - Request examples without Huffman coding" {
         const decoded = try decodeHeaders(&ctx, &wire, allocator);
         defer {
             for (decoded) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
+                h.deinit(allocator);
             }
             allocator.free(decoded);
         }
@@ -1385,8 +1472,7 @@ test "HPACK limits allow valid blocks within bounds" {
     });
     defer {
         for (headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(headers);
     }
@@ -1448,8 +1534,7 @@ test "HPACK accepts dynamic table size update within max_table_size" {
     });
     defer {
         for (headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(headers);
     }
@@ -1519,8 +1604,7 @@ test "HPACK encoder size update round-trips through decoder" {
     });
     defer {
         for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(decoded);
     }
@@ -1556,8 +1640,7 @@ test "encodeHeaders lowercases header names longer than 256 bytes" {
     const decoded = try decodeHeaders(&decode_ctx, encoded, allocator);
     defer {
         for (decoded) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
+            h.deinit(allocator);
         }
         allocator.free(decoded);
     }
