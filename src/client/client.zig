@@ -16,7 +16,9 @@
 //! frames are pumped inline (one request at a time).
 
 const std = @import("std");
-const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const array_list_writer_mod = @import("../util/array_list_writer.zig");
+const arrayListWriter = array_list_writer_mod.arrayListWriter;
+const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
@@ -412,7 +414,9 @@ pub const Client = struct {
     /// Sends request and reads response over a plain TCP socket.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
-        try req.serialize(socket.writer());
+        const bytes = try serializeToSlice(self.allocator, req);
+        defer self.allocator.free(bytes);
+        try socket.sendAll(bytes);
         var res = try self.readResponse(socket, req.method);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
@@ -423,8 +427,10 @@ pub const Client = struct {
     /// Sends request and reads response over an established TLS session.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
+        const bytes = try serializeToSlice(self.allocator, req);
+        defer self.allocator.free(bytes);
         const w = try session.getWriter();
-        try req.serialize(w);
+        try w.writeAll(bytes);
         const r = try session.getReader();
         var res = try self.readResponse(r, req.method);
         if (keep_alive_out) |out| {

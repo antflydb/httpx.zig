@@ -388,14 +388,7 @@ test "Headers serialize handles values exceeding 4096 bytes" {
     // Serialize to an in-memory buffer to verify correctness.
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
-    const writer = struct {
-        list: *std.ArrayListUnmanaged(u8),
-        alloc: Allocator,
-
-        pub fn writeAll(self: @This(), data: []const u8) !void {
-            try self.list.appendSlice(self.alloc, data);
-        }
-    }{ .list = &out, .alloc = allocator };
+    const writer = array_list_writer_mod.arrayListWriter(&out, allocator);
 
     try headers.serialize(writer);
 

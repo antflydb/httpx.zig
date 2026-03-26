@@ -24,7 +24,9 @@
 //! direct TLS support.
 
 const std = @import("std");
-const arrayListWriter = @import("../util/array_list_writer.zig").arrayListWriter;
+const array_list_writer_mod = @import("../util/array_list_writer.zig");
+const arrayListWriter = array_list_writer_mod.arrayListWriter;
+const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
@@ -876,7 +878,7 @@ pub const Server = struct {
             try ensureContentLengthHeader(&response);
             try ensureDateHeader(self.io, &response);
 
-            try sendBuffered(&sock, &response);
+            try sendBuffered(self.allocator, &sock, &response);
 
             if (!keep_alive) return;
 
@@ -1505,12 +1507,15 @@ pub const Server = struct {
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
 
-        try sendBuffered(socket, &resp);
+        try sendBuffered(self.allocator, socket, &resp);
     }
 
-    /// Serializes a response through a buffered writer to reduce syscalls.
-    fn sendBuffered(socket: *Socket, resp: *Response) !void {
-        try resp.serialize(socket.writer());
+    /// Serializes a response to memory, then sends in a single writeAll call
+    /// to avoid per-header syscalls through the unbuffered SocketWriter.
+    fn sendBuffered(allocator: Allocator, socket: *Socket, resp: *Response) !void {
+        const bytes = try serializeToSlice(allocator, resp);
+        defer allocator.free(bytes);
+        try socket.sendAll(bytes);
     }
 
     /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field
