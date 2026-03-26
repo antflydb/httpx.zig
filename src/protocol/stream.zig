@@ -64,11 +64,6 @@ pub const Stream = struct {
     /// Local receive window (how much peer can send to us).
     recv_window: i32 = 65535,
 
-    /// Buffered data waiting to be sent (when send_window is insufficient).
-    send_buffer: std.ArrayListUnmanaged(u8) = .empty,
-    /// Buffered received data.
-    recv_buffer: std.ArrayListUnmanaged(u8) = .empty,
-
     /// Whether we've sent END_STREAM.
     end_stream_sent: bool = false,
     /// Whether we've received END_STREAM.
@@ -127,8 +122,6 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
-        self.send_buffer.deinit(allocator);
-        self.recv_buffer.deinit(allocator);
         self.data_buf.deinit(allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);

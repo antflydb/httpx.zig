@@ -648,7 +648,7 @@ pub const Client = struct {
                 error.ConnectionClosed => return,
                 else => {
                     // Send GOAWAY so the server knows we're closing.
-                    if (!entry.h2.goaway_sent) entry.h2.sendGoaway(writer, .protocol_error) catch {};
+                    entry.h2.sendGoaway(writer, .protocol_error) catch {};
                     last_err = err;
                     return;
                 },

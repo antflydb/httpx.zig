@@ -524,6 +524,7 @@ pub const H2Connection = struct {
 
     /// Sends a GOAWAY frame advertising the last stream ID we processed (RFC 7540 §6.8).
     pub fn sendGoaway(self: *Self, writer: anytype, error_code: Http2ErrorCode) !void {
+        if (self.goaway_sent) return;
         const payload = try stream_mod.buildGoawayPayload(self.last_processed_stream_id, error_code, null, self.allocator);
         defer self.allocator.free(payload);
         try self.writeFrame(writer, .goaway, 0, 0, payload);
@@ -1032,6 +1033,16 @@ pub const H2Connection = struct {
                 // Accumulate WINDOW_UPDATE *after* successful delivery.
                 if (sf.header.frame_type == .data and sf.payload.len > 0) {
                     try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
+                }
+                // RFC 7540 §5.1: If deliverToMailbox flagged a stream error (e.g.
+                // DATA on half-closed-remote), send RST_STREAM so the peer stops.
+                // This runs after accumulateWindowUpdate so flow control stays balanced.
+                if (sf.header.frame_type == .data) {
+                    if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
+                        if (stream.stream_error != null) {
+                            self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                        }
+                    }
                 }
                 // Flush window credit on stream completion or reset.
                 if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
@@ -3008,4 +3019,77 @@ test "CONTINUATION OOM resets state so connection can recover" {
     }
     // If we never hit OOM, something is wrong with the test setup.
     return error.TestExpectedOom;
+}
+
+test "sendGoaway is idempotent — second call is a no-op" {
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // First call should write a GOAWAY frame.
+    try conn.sendGoaway(writer, .no_error);
+    try std.testing.expect(conn.goaway_sent);
+    const first_len = wire.items.len;
+    try std.testing.expect(first_len > 0);
+
+    // Second call should be a no-op.
+    try conn.sendGoaway(writer, .protocol_error);
+    try std.testing.expectEqual(first_len, wire.items.len);
+}
+
+test "processOneFrameLocked sends RST_STREAM on stream_error after DATA delivery" {
+    // Verifies the fix: processOneFrameLocked now has the same stream_error
+    // RST guard as processOneFrame, sending RST_STREAM when deliverToMailbox
+    // flags a stream error (e.g. DATA on half-closed-remote).
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Create stream 1 in half_closed_remote (peer already sent END_STREAM).
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .half_closed_remote;
+
+    // Build a DATA frame for stream 1 (violates half-closed-remote).
+    const data_payload = "illegal";
+    var frame_buf = std.ArrayListUnmanaged(u8).empty;
+    defer frame_buf.deinit(allocator);
+    const hdr = Http2FrameHeader{
+        .length = data_payload.len,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 1,
+    };
+    try frame_buf.appendSlice(allocator, &hdr.serialize());
+    try frame_buf.appendSlice(allocator, data_payload);
+
+    var reader = TestReader{ .data = frame_buf.items };
+    _ = try server.processOneFrameLocked(&reader, writer);
+
+    // deliverToMailbox should have set stream_error.
+    try std.testing.expect(stream.stream_error != null);
+
+    // processOneFrameLocked should have sent RST_STREAM in the wire output.
+    // Find a RST_STREAM frame (type=0x3) in the wire bytes.
+    var found_rst = false;
+    var pos: usize = 0;
+    while (pos + 9 <= wire.items.len) {
+        const flen = std.mem.readInt(u24, wire.items[pos..][0..3], .big);
+        const ftype = wire.items[pos + 3];
+        if (ftype == 0x3) { // RST_STREAM
+            found_rst = true;
+            break;
+        }
+        pos += 9 + flen;
+    }
+    try std.testing.expect(found_rst);
 }

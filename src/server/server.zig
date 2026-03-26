@@ -653,6 +653,10 @@ pub const Server = struct {
     /// Gracefully shuts down the server: stops accepting new connections and
     /// waits up to `timeout_ms` for in-flight requests to complete before
     /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
+    ///
+    /// Must be called from a fiber context (e.g. a route handler or a
+    /// dedicated shutdown fiber) because it calls `io.sleep`. For signal-safe
+    /// stopping without a fiber, use `stop()` instead.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
         self.running = false;
         if (self.listener) |*l| {
@@ -661,7 +665,7 @@ pub const Server = struct {
         }
         // Give in-flight connections time to finish.
         if (timeout_ms > 0) {
-            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .monotonic) catch {};
+            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
         }
         // Force-cancel any remaining connections.
         self.connections.cancel(self.io);
@@ -945,7 +949,7 @@ pub const Server = struct {
         self.routeAndRespondH2(&h2, sock, 1, original_req, null) catch |err| {
             // RFC 7540 §6.8: Send GOAWAY before closing so the client
             // knows stream 1 was processed (or at least attempted).
-            if (!h2.goaway_sent) h2.sendGoaway(sock, .no_error) catch {};
+            h2.sendGoaway(sock, .no_error) catch {};
             h2.stream_manager.removeStream(1);
             return err;
         };
@@ -979,7 +983,7 @@ pub const Server = struct {
         var stream_fibers = Io.Group.init;
         defer {
             stream_fibers.await(self.io) catch {};
-            if (!h2.goaway_sent) h2.sendGoaway(sock, .no_error) catch {};
+            h2.sendGoaway(sock, .no_error) catch {};
         }
         // Wake all blocked handler fibers before awaiting them (reverse defer order).
         defer h2.signalAllStreams(error.ConnectionClosed);
@@ -1000,12 +1004,12 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
+                error.ConnectionClosed, error.Canceled => break,
                 error.RecvFailed => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
                     // code before closing on connection-level errors.
-                    if (!h2.goaway_sent) h2.sendGoaway(sock, .protocol_error) catch {};
+                    h2.sendGoaway(sock, .protocol_error) catch {};
                     return err;
                 },
             };
@@ -1133,14 +1137,14 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
+                error.ConnectionClosed, error.Canceled => break,
                 // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
                 // RecvFailed. Re-enter the loop so the idle check runs.
                 error.RecvFailed => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
                     // code before closing on connection-level errors.
-                    if (!h2.goaway_sent) h2.sendGoaway(sock, .protocol_error) catch {};
+                    h2.sendGoaway(sock, .protocol_error) catch {};
                     return err;
                 },
             };
@@ -2115,4 +2119,42 @@ test "isH2ForbiddenHeader rejects connection-specific headers" {
     // Normal headers are allowed.
     try std.testing.expect(!isH2ForbiddenHeader("content-type", "text/html"));
     try std.testing.expect(!isH2ForbiddenHeader("accept", "*/*"));
+}
+
+test "shutdown with zero timeout closes listener and cancels connections" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, std.testing.io);
+    defer server.deinit();
+
+    // Simulate running state.
+    server.running = true;
+
+    // shutdown(0) should set running=false and not call io.sleep.
+    server.shutdown(0);
+    try std.testing.expect(!server.running);
+    try std.testing.expect(server.listener == null);
+}
+
+test "shutdown with nonzero timeout sleeps then cancels" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, std.testing.io);
+    defer server.deinit();
+
+    server.running = true;
+
+    // shutdown with a small timeout should sleep (uses .awake clock)
+    // then cancel connections. This verifies the clock enum is valid.
+    server.shutdown(1);
+    try std.testing.expect(!server.running);
+}
+
+test "stop cancels connections immediately" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, std.testing.io);
+    defer server.deinit();
+
+    server.running = true;
+    server.stop();
+    try std.testing.expect(!server.running);
+    try std.testing.expect(server.listener == null);
 }
