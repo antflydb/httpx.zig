@@ -9,14 +9,12 @@ fn apiHandler(_: *httpx.Context) anyerror!httpx.Response {
     unreachable;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Middleware Example ===\n\n", .{});
 
-    var server = httpx.Server.init(allocator, std.io.default);
+    var server = httpx.Server.init(allocator, init.io);
     defer server.deinit();
 
     try server.use(httpx.logger());

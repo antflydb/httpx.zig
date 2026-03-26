@@ -21,16 +21,13 @@ fn logResponse(response: *httpx.Response, context: ?*anyopaque) anyerror!void {
     });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Request/Response Interceptors Example ===\n\n", .{});
 
-    var client = httpx.Client.initWithConfig(allocator, std.io.default, .{
+    var client = httpx.Client.initWithConfig(allocator, init.io, .{
         .user_agent = "httpx.zig-interceptor-demo/1.0",
-        .follow_redirects = true,
     });
     defer client.deinit();
 

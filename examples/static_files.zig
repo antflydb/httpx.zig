@@ -11,11 +11,8 @@ const httpx = @import("httpx");
 const site_root = "examples/multi_page_site/site";
 const assets_root = "examples/multi_page_site/site/assets";
 
-fn demoPort(allocator: std.mem.Allocator) !u16 {
-    var env_map = try std.process.getEnvMap(allocator);
-    defer env_map.deinit();
-
-    if (env_map.get("HTTPX_DEMO_PORT")) |value| {
+fn demoPort(environ_map: *std.process.Environ.Map) u16 {
+    if (environ_map.get("HTTPX_DEMO_PORT")) |value| {
         return std.fmt.parseInt(u16, value, 10) catch 8080;
     }
     return 8080;
@@ -32,12 +29,9 @@ fn contentTypeForPath(path: []const u8) []const u8 {
 }
 
 fn serveFileWithType(ctx: *httpx.Context, path: []const u8) anyerror!httpx.Response {
-    const f = std.fs.cwd().openFile(path, .{}) catch return ctx.status(404).text("Not Found");
-    defer f.close();
-
-    const stat = try f.stat();
-    const body = try ctx.allocator.alloc(u8, @intCast(stat.size));
-    _ = try f.readAll(body);
+    const body = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.allocator, std.Io.Limit.limited(1024 * 1024)) catch {
+        return ctx.status(404).text("Not Found");
+    };
 
     var resp = httpx.Response.init(ctx.allocator, 200);
     try resp.headers.set("Content-Type", contentTypeForPath(path));
@@ -153,16 +147,14 @@ fn redirectHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.redirect("/", 302);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Static File Server Example ===\n\n", .{});
 
-    const port = try demoPort(allocator);
+    const port = demoPort(init.environ_map);
 
-    var server = httpx.Server.initWithConfig(allocator, std.io.default, .{
+    var server = httpx.Server.initWithConfig(allocator, init.io, .{
         .host = "127.0.0.1",
         .port = port,
         .keep_alive = false,

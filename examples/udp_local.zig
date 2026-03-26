@@ -6,18 +6,17 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("=== UDP Local Send/Recv Example ===\n\n", .{});
 
-    var recv_sock = try httpx.UdpSocket.create();
+    const bind_addr = httpx.socket.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+
+    var recv_sock = try httpx.UdpSocket.bind(bind_addr, init.io);
     defer recv_sock.close();
 
-    try recv_sock.setReuseAddr(true);
-    try recv_sock.bind(try std.net.Address.parseIp("127.0.0.1", 0));
+    const recv_addr = recv_sock.socket.address;
 
-    const recv_addr = try recv_sock.getLocalAddress();
-
-    var send_sock = try httpx.UdpSocket.create();
+    var send_sock = try httpx.UdpSocket.bind(bind_addr, init.io);
     defer send_sock.close();
 
     const msg = "hello over udp";

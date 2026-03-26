@@ -5,14 +5,12 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Simple GET Request Example ===\n\n", .{});
 
-    var client = httpx.Client.init(allocator, std.io.default);
+    var client = httpx.Client.init(allocator, init.io);
     defer client.deinit();
 
     std.debug.print("Creating GET request to httpbin.org...\n", .{});

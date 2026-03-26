@@ -6,14 +6,12 @@ const std = @import("std");
 const httpx = @import("httpx");
 const common = httpx.common;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Connection Pool Example ===\n\n", .{});
 
-    var pool = httpx.pool.ConnectionPool.initWithConfig(allocator, std.io.default, .{
+    var pool = httpx.pool.ConnectionPool.initWithConfig(allocator, init.io, .{
         .max_connections = 20,
         .max_per_host = 5,
         .idle_timeout_ms = 60_000,
@@ -33,7 +31,7 @@ pub fn main() !void {
     std.debug.print("  Idle connections: {d}\n", .{pool.idleCount()});
 
     std.debug.print("\nConnection health checking:\n", .{});
-    const now = common.milliTimestamp();
+    const now = common.milliTimestamp(init.io);
     const conn = httpx.pool.Connection{
         .socket = undefined,
         .host = "api.example.com",

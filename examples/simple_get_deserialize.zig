@@ -20,14 +20,12 @@ const HttpbinResponse = struct {
     };
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Simple GET Request + JSON Deserialization ===\n\n", .{});
 
-    var client = httpx.Client.init(allocator, std.io.default);
+    var client = httpx.Client.init(allocator, init.io);
     defer client.deinit();
 
     std.debug.print("Making GET request to https://httpbin.org/get...\n", .{});

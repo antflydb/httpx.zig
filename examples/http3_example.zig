@@ -14,9 +14,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     std.debug.print("\n=== httpx.zig HTTP/3 Example ===\n\n", .{});
 
@@ -94,7 +92,7 @@ fn qpackExample(allocator: std.mem.Allocator) !void {
     }
 
     // Demonstrate encoder stream instructions
-    var encoder_stream = std.ArrayListUnmanaged(u8){};
+    var encoder_stream = std.ArrayListUnmanaged(u8).empty;
     defer encoder_stream.deinit(allocator);
 
     try httpx.qpack.encodeSetCapacity(4096, &encoder_stream, allocator);

@@ -5,32 +5,23 @@
 const std = @import("std");
 const httpx = @import("httpx");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    std.debug.print("=== Simplified API Demo ===\n\n", .{});
 
-    std.debug.print("=== Simplified API Aliases Demo ===\n\n", .{});
-
-    // Top-level fetch alias (creates and deinitializes a temporary client).
-    var resp_a = try httpx.fetch(allocator, std.io.default, "https://httpbin.org/get");
-    defer resp_a.deinit();
-    std.debug.print("fetch status: {d}\n", .{resp_a.status.code});
-
-    // Top-level send alias with explicit method and options.
-    var resp_b = try httpx.send(allocator, std.io.default, .GET, "https://httpbin.org/headers", .{});
-    defer resp_b.deinit();
-    std.debug.print("send status: {d}\n", .{resp_b.status.code});
-
-    // Client aliases.
-    var client: httpx.HttpClient = httpx.HttpClient.init(allocator, std.io.default);
+    var client = httpx.Client.init(allocator, init.io);
     defer client.deinit();
 
-    var resp_c = try client.fetch("https://httpbin.org/anything", .{});
-    defer resp_c.deinit();
-    std.debug.print("client.fetch status: {d}\n", .{resp_c.status.code});
+    // Demonstrate various HTTP methods
+    var resp_get = try client.request(.GET, "https://httpbin.org/get", .{});
+    defer resp_get.deinit();
+    std.debug.print("GET status: {d}\n", .{resp_get.status.code});
 
-    var resp_d = try client.options("https://httpbin.org/get", .{});
-    defer resp_d.deinit();
-    std.debug.print("client.options status: {d}\n", .{resp_d.status.code});
+    var resp_post = try client.request(.POST, "https://httpbin.org/post", .{});
+    defer resp_post.deinit();
+    std.debug.print("POST status: {d}\n", .{resp_post.status.code});
+
+    var resp_options = try client.request(.OPTIONS, "https://httpbin.org/get", .{});
+    defer resp_options.deinit();
+    std.debug.print("OPTIONS status: {d}\n", .{resp_options.status.code});
 }

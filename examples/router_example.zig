@@ -10,9 +10,7 @@ fn indexHandler(_: *httpx.Context) anyerror!httpx.Response {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     std.debug.print("=== Router Example ===\n\n", .{});
 
@@ -40,7 +38,9 @@ pub fn main() !void {
 
     std.debug.print("\nRoute Matching Tests:\n", .{});
 
-    if (router.find(.GET, "/users/42")) |result| {
+    var params_buf: [16]httpx.router.RouteParam = undefined;
+
+    if (router.find(.GET, "/users/42", &params_buf)) |result| {
         std.debug.print("  GET /users/42 -> matched!\n", .{});
         std.debug.print("    Parameters: {d}\n", .{result.params.len});
         for (result.params) |p| {
@@ -48,7 +48,7 @@ pub fn main() !void {
         }
     }
 
-    if (router.find(.GET, "/users/123/posts/456")) |result| {
+    if (router.find(.GET, "/users/123/posts/456", &params_buf)) |result| {
         std.debug.print("  GET /users/123/posts/456 -> matched!\n", .{});
         std.debug.print("    Parameters: {d}\n", .{result.params.len});
         for (result.params) |p| {
@@ -56,11 +56,11 @@ pub fn main() !void {
         }
     }
 
-    if (router.find(.DELETE, "/users/99")) |_| {
+    if (router.find(.DELETE, "/users/99", &params_buf)) |_| {
         std.debug.print("  DELETE /users/99 -> matched!\n", .{});
     }
 
-    if (router.find(.PATCH, "/users/1")) |_| {
+    if (router.find(.PATCH, "/users/1", &params_buf)) |_| {
         std.debug.print("  PATCH /users/1 -> matched!\n", .{});
     } else {
         std.debug.print("  PATCH /users/1 -> not found (expected)\n", .{});

@@ -23,14 +23,12 @@ fn userHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.text(msg);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== Simple HTTP Server Example ===\n\n", .{});
 
-    var server = httpx.Server.initWithConfig(allocator, std.io.default, .{
+    var server = httpx.Server.initWithConfig(allocator, init.io, .{
         .host = "127.0.0.1",
         .port = 8080,
         .max_connections = 1000,
