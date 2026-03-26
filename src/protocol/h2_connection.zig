@@ -214,6 +214,13 @@ pub const H2Connection = struct {
     // Frame I/O
     // ---------------------------------------------------------------
 
+    /// Resets CONTINUATION reassembly state after an error.
+    /// payload is freed by the caller's errdefer, not here.
+    fn resetContinuation(self: *Self) void {
+        self.continuation_stream_id = null;
+        self.continuation_buf.clearRetainingCapacity();
+    }
+
     /// Reads one HTTP/2 frame. Handles CONTINUATION reassembly.
     /// Returns the complete frame; caller owns the payload memory.
     pub fn readFrame(self: *Self, reader: anytype) !Frame {
@@ -237,15 +244,12 @@ pub const H2Connection = struct {
                 }
                 // Cap reassembly to prevent CONTINUATION bombs.
                 if (self.continuation_buf.items.len + payload.len > max_continuation_size) {
-                    // payload freed by errdefer above. Reset reassembly state.
-                    self.continuation_stream_id = null;
-                    self.continuation_buf.clearRetainingCapacity();
+                    // payload freed by errdefer above.
+                    self.resetContinuation();
                     return error.HeaderBlockTooLarge;
                 }
                 self.continuation_buf.appendSlice(self.allocator, payload) catch |err| {
-                    self.continuation_stream_id = null;
-                    self.continuation_buf.clearRetainingCapacity();
-                    self.allocator.free(payload);
+                    self.resetContinuation();
                     return err;
                 };
                 self.allocator.free(payload);
@@ -275,8 +279,7 @@ pub const H2Connection = struct {
                 self.continuation_flags = hdr.flags;
                 self.continuation_buf.clearRetainingCapacity();
                 self.continuation_buf.appendSlice(self.allocator, payload) catch |err| {
-                    self.continuation_stream_id = null;
-                    self.allocator.free(payload);
+                    self.resetContinuation();
                     return err;
                 };
                 self.allocator.free(payload);
@@ -2926,10 +2929,11 @@ test "applyInitialWindowSizeChange skips closed streams" {
     try std.testing.expectEqual(@as(i32, 500), s3.send_window);
 }
 
-test "processOneFrameLocked propagates reader errors (not swallowed)" {
-    // Verifies that errors like Canceled from the reader are propagated
-    // through processOneFrameLocked to the caller, so the server receive
-    // loop can distinguish them from ConnectionClosed.
+test "processOneFrameLocked propagates reader errors distinctly" {
+    // Verifies that errors from the reader are propagated through
+    // processOneFrameLocked to the caller (not swallowed). The server
+    // receive loop relies on distinguishing Canceled, RecvFailed, and
+    // ConnectionClosed to choose the correct response (GOAWAY vs retry).
     const allocator = std.testing.allocator;
 
     var wire = std.ArrayListUnmanaged(u8).empty;
@@ -2939,38 +2943,17 @@ test "processOneFrameLocked propagates reader errors (not swallowed)" {
     var conn = H2Connection.initServer(allocator, std.testing.io);
     defer conn.deinit();
 
-    // ErrorReader returns Canceled on the first read attempt.
-    var reader = ErrorReader{ .err = error.Canceled };
-    const result = conn.processOneFrameLocked(&reader, writer);
-    try std.testing.expectError(error.Canceled, result);
-}
+    // Each error should propagate unchanged.
+    const errors = [_]anyerror{ error.Canceled, error.RecvFailed };
+    for (errors) |expected_err| {
+        var reader = ErrorReader{ .err = expected_err };
+        const result = conn.processOneFrameLocked(&reader, writer);
+        try std.testing.expectError(expected_err, result);
+    }
 
-test "readFrame returns ConnectionClosed on EOF reader" {
-    const allocator = std.testing.allocator;
-
-    var conn = H2Connection.initServer(allocator, std.testing.io);
-    defer conn.deinit();
-
-    // TestReader with empty data returns 0 (EOF) → ConnectionClosed.
-    var reader = TestReader{ .data = &.{} };
-    try std.testing.expectError(error.ConnectionClosed, conn.readFrame(&reader));
-}
-
-test "processOneFrameLocked propagates RecvFailed distinctly" {
-    // Verifies RecvFailed is propagated separately from ConnectionClosed,
-    // allowing the server loop to distinguish timeout from disconnect.
-    const allocator = std.testing.allocator;
-
-    var wire = std.ArrayListUnmanaged(u8).empty;
-    defer wire.deinit(allocator);
-    const writer = testWriter(&wire, allocator);
-
-    var conn = H2Connection.initServer(allocator, std.testing.io);
-    defer conn.deinit();
-
-    var reader = ErrorReader{ .err = error.RecvFailed };
-    const result = conn.processOneFrameLocked(&reader, writer);
-    try std.testing.expectError(error.RecvFailed, result);
+    // EOF (read returns 0) maps to ConnectionClosed.
+    var eof_reader = TestReader{ .data = &.{} };
+    try std.testing.expectError(error.ConnectionClosed, conn.readFrame(&eof_reader));
 }
 
 test "Frame.deinit frees zero-length payload" {
