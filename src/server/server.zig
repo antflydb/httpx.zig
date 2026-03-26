@@ -444,6 +444,17 @@ pub const Context = struct {
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.writeData(self.sock, self.stream_id, &.{}, true);
         }
+
+        /// Sends trailing HEADERS with END_STREAM (RFC 7540 §8.1).
+        /// Used for gRPC status trailers, content digests, etc.
+        /// Closes the writer — no further writes are allowed.
+        pub fn sendTrailers(self: *H2StreamWriter, trailers: []const hpack.HeaderEntry) !void {
+            if (self.closed) return error.StreamClosed;
+            self.closed = true;
+            self.h2.write_mutex.lockUncancelable(self.io);
+            defer self.h2.write_mutex.unlock(self.io);
+            try self.h2.sendHeaders(self.sock, self.stream_id, trailers, true);
+        }
     };
 
     /// Sends HEADERS (without END_STREAM) and returns a writer for incremental
@@ -989,7 +1000,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
+                error.ConnectionClosed, error.Canceled => break,
                 error.RecvFailed => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
@@ -1122,7 +1133,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
+                error.ConnectionClosed, error.Canceled => break,
                 // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
                 // RecvFailed. Re-enter the loop so the idle check runs.
                 error.RecvFailed => continue,

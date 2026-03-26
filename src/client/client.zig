@@ -193,7 +193,7 @@ pub const Client = struct {
             e.recv_group.await(self.io) catch {};
             e.ping_group.await(self.io) catch {};
             e.h2.deinit();
-            if (e.is_tls) e.session.deinit();
+            e.session.deinit();
             self.allocator.destroy(e);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -491,6 +491,7 @@ pub const Client = struct {
         } else {
             // Initialize a dummy session (deinit is safe on un-handshaked session).
             entry.session = TlsSession.init(TlsConfig.init(self.allocator), self.io);
+            errdefer entry.session.deinit();
         }
 
         entry.h2 = H2Connection.initClient(self.allocator, self.io);
@@ -574,7 +575,7 @@ pub const Client = struct {
             entry.socket.close();
         }
         entry.h2.deinit();
-        if (entry.is_tls) entry.session.deinit();
+        entry.session.deinit();
         self.allocator.destroy(entry);
     }
 
@@ -585,7 +586,7 @@ pub const Client = struct {
         e.recv_group.await(self.io) catch {};
         e.ping_group.await(self.io) catch {};
         e.h2.deinit();
-        if (e.is_tls) e.session.deinit();
+        e.session.deinit();
         self.allocator.destroy(e);
         self.allocator.free(removed.key);
     }

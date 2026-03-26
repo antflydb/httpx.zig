@@ -73,6 +73,14 @@ pub const H2Connection = struct {
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
     max_stream_data_size: usize = 0,
 
+    /// Timeout for writeDataBlocking to wait for flow-control window space.
+    /// Prevents indefinite blocking when a peer stops sending WINDOW_UPDATE.
+    /// Default 30s. Set to `.none` for no timeout (original behavior).
+    send_window_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(30_000),
+        .clock = .awake,
+    } },
+
     /// Server's own limit on how many concurrent streams the peer can open.
     /// Initialized from local_settings and NOT overwritten by peer SETTINGS.
     local_max_concurrent_streams: u32 = 100,
@@ -370,7 +378,10 @@ pub const H2Connection = struct {
                     const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
                     const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
                     if (sw2 == 0 or cw2 == 0) {
-                        self.send_window_event.waitUncancelable(self.io);
+                        self.send_window_event.waitTimeout(self.io, self.send_window_timeout) catch |err| switch (err) {
+                            error.Timeout => return error.Timeout,
+                            error.Canceled => return error.Canceled,
+                        };
                     }
                 }
                 continue;
