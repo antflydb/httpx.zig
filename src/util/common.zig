@@ -7,7 +7,7 @@ const containsCrLf = @import("../core/headers.zig").containsCrLf;
 const Io = std.Io;
 
 /// Monotonic millisecond timestamp for connection health and deadline tracking.
-/// Uses std.Io.Clock.monotonic for pure-Zig, cross-platform time.
+/// Uses std.Io.Clock.awake — the fiber-cooperative monotonic clock.
 pub fn milliTimestamp(io: Io) i64 {
     const now = Io.Clock.awake.now(io);
     return @intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms));

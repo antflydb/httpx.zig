@@ -293,7 +293,10 @@ pub const Headers = struct {
     /// CRLF injection is prevented at append/set time, so serialize is safe.
     pub fn serialize(self: *const Self, writer: anytype) !void {
         for (self.entries.items) |entry| {
-            try writer.print("{s}: {s}\r\n", .{ entry.name, entry.value });
+            try writer.writeAll(entry.name);
+            try writer.writeAll(": ");
+            try writer.writeAll(entry.value);
+            try writer.writeAll("\r\n");
         }
     }
 
@@ -368,6 +371,38 @@ test "Headers Content-Length parsing" {
 
     try headers.set("Content-Length", "12345");
     try std.testing.expectEqual(@as(u64, 12345), headers.getContentLength().?);
+}
+
+test "Headers serialize handles values exceeding 4096 bytes" {
+    const allocator = std.testing.allocator;
+    var headers = Headers.init(allocator);
+    defer headers.deinit();
+
+    // Create a header value larger than the old 4096-byte print buffer.
+    const large_value = try allocator.alloc(u8, 8192);
+    defer allocator.free(large_value);
+    @memset(large_value, 'x');
+
+    try headers.set("X-Large", large_value);
+
+    // Serialize to an in-memory buffer to verify correctness.
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    const writer = struct {
+        list: *std.ArrayListUnmanaged(u8),
+        alloc: Allocator,
+
+        pub fn writeAll(self: @This(), data: []const u8) !void {
+            try self.list.appendSlice(self.alloc, data);
+        }
+    }{ .list = &out, .alloc = allocator };
+
+    try headers.serialize(writer);
+
+    // Should contain the full header line.
+    try std.testing.expect(out.items.len > 8192);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "X-Large: "));
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "\r\n"));
 }
 
 test "Headers keep-alive detection" {

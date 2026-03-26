@@ -164,11 +164,16 @@ pub const Request = struct {
         const path = self.uri.path;
         const version_str = self.version.toString();
 
-        try writer.print("{s} {s}", .{ method_str, path });
+        try writer.writeAll(method_str);
+        try writer.writeAll(" ");
+        try writer.writeAll(path);
         if (self.uri.query) |q| {
-            try writer.print("?{s}", .{q});
+            try writer.writeAll("?");
+            try writer.writeAll(q);
         }
-        try writer.print(" {s}\r\n", .{version_str});
+        try writer.writeAll(" ");
+        try writer.writeAll(version_str);
+        try writer.writeAll("\r\n");
 
         try self.headers.serialize(writer);
         try writer.writeAll("\r\n");
