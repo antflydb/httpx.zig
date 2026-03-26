@@ -350,8 +350,13 @@ pub const Context = struct {
         h2_stream: *Stream,
         io: Io,
         data_event: *Io.Event,
+        /// Read timeout for body data. Defaults to the server's request_timeout_ms.
+        /// Prevents handler fibers from blocking indefinitely when a peer stops
+        /// sending DATA frames without closing the stream.
+        read_timeout: Io.Timeout = .none,
 
         /// Reads available body data into `buf`. Returns 0 on EOF.
+        /// Returns error.Timeout if no data arrives within read_timeout.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
                 const avail = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
@@ -368,14 +373,17 @@ pub const Context = struct {
                 if (self.h2_stream.completed) return 0;
                 if (self.h2_stream.stream_error) |err| return err;
 
-                // Reset event, re-check (race guard), then wait.
+                // Reset event, re-check (race guard), then wait with timeout.
                 self.data_event.reset();
                 const avail2 = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
                 if (avail2 > 0) continue;
                 if (self.h2_stream.completed) return 0;
                 if (self.h2_stream.stream_error) |err| return err;
 
-                self.data_event.waitUncancelable(self.io);
+                self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
+                    error.Timeout => return error.Timeout,
+                    error.Canceled => return error.Canceled,
+                };
             }
         }
 
@@ -920,7 +928,13 @@ pub const Server = struct {
         // 5. Handle the original HTTP/1.1 request as stream 1.
         _ = try h2.stream_manager.getOrCreateStream(1);
         original_req.version = .HTTP_2;
-        try self.routeAndRespondH2(&h2, sock, 1, original_req, null);
+        self.routeAndRespondH2(&h2, sock, 1, original_req, null) catch |err| {
+            // RFC 7540 §6.8: Send GOAWAY before closing so the client
+            // knows stream 1 was processed (or at least attempted).
+            if (!h2.goaway_sent) h2.sendGoaway(sock, .no_error) catch {};
+            h2.stream_manager.removeStream(1);
+            return err;
+        };
         h2.stream_manager.removeStream(1);
         // Stream 1 was fully processed; record it so GOAWAY advertises the
         // correct last_stream_id and clients don't retry it (RFC 7540 §6.8).
@@ -937,7 +951,9 @@ pub const Server = struct {
         // Read client's SETTINGS frame.
         var settings_frame = try h2.readFrame(&h2c_reader);
         defer settings_frame.deinit(self.allocator);
+        // RFC 7540 §3.5: First client frame MUST be a non-ACK SETTINGS.
         if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        if (settings_frame.header.flags & H2Connection.FLAG_ACK != 0) return error.ProtocolError;
         try h2.handleSettings(&settings_frame, sock);
 
         // Set socket recv timeout for idle detection (same as handleH2Connection).
@@ -980,8 +996,8 @@ pub const Server = struct {
                 },
             };
 
-            last_activity = milliTimestamp(self.io);
             const sid = maybe_sid orelse continue;
+            last_activity = milliTimestamp(self.io);
             const stream = h2.stream_manager.getStream(sid) orelse continue;
 
             if (!stream.got_headers) continue;
@@ -1062,7 +1078,9 @@ pub const Server = struct {
         // Now read and ACK the client's SETTINGS frame (follows the preface).
         var settings_frame = try h2.readFrame(&h2_reader);
         defer settings_frame.deinit(self.allocator);
+        // RFC 7540 §3.5: First client frame MUST be a non-ACK SETTINGS.
         if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        if (settings_frame.header.flags & H2Connection.FLAG_ACK != 0) return error.ProtocolError;
         try h2.handleSettings(&settings_frame, sock);
 
         // Per-stream handler fibers. Awaited before h2 is deinitialized.
@@ -1113,8 +1131,12 @@ pub const Server = struct {
                 },
             };
 
-            last_activity = milliTimestamp(self.io);
             const sid = maybe_sid orelse continue;
+            // Only update idle timer on stream-level frames. Connection-level
+            // frames (PING, SETTINGS ACK, WINDOW_UPDATE on stream 0) must not
+            // reset the timer — otherwise a client can hold a connection open
+            // indefinitely by sending periodic PINGs without opening streams.
+            last_activity = milliTimestamp(self.io);
             const stream = h2.stream_manager.getStream(sid) orelse continue;
 
             // Dispatch as soon as HEADERS arrive. Use data_event as the
@@ -1306,6 +1328,13 @@ pub const Server = struct {
                 .h2_stream = stream,
                 .io = self.io,
                 .data_event = data_event,
+                .read_timeout = if (self.config.request_timeout_ms > 0)
+                    .{ .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(@intCast(self.config.request_timeout_ms)),
+                        .clock = .awake,
+                    } }
+                else
+                    .none,
             };
         }
 

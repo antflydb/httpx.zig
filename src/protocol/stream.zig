@@ -333,15 +333,18 @@ pub const StreamManager = struct {
         }
 
         // Track highest peer-initiated stream ID for monotonicity enforcement.
+        // Use maxInt(u31) as sentinel when the ID space is exhausted so that
+        // deliverToMailbox's `sid < last_seen` check rejects any subsequent
+        // attempt to reuse or exceed the last valid stream ID (RFC 7540 §5.1.1).
         if (is_client_stream and !self.is_client) {
             // Server receiving client stream — advance tracker past this ID.
             if (id >= self.next_client_stream_id) {
-                self.next_client_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else id;
+                self.next_client_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else std.math.maxInt(u31);
             }
         } else if (!is_client_stream and self.is_client) {
             // Client receiving server stream — advance tracker past this ID.
             if (id >= self.next_server_stream_id) {
-                self.next_server_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else id;
+                self.next_server_stream_id = if (id <= std.math.maxInt(u31) - 2) id + 2 else std.math.maxInt(u31);
             }
         }
 
