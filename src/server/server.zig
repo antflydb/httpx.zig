@@ -498,6 +498,7 @@ pub const Server = struct {
         if (cfg.max_connections == 0) cfg.max_connections = 1000;
         if (cfg.request_timeout_ms == 0) cfg.request_timeout_ms = 30_000;
         if (cfg.keep_alive_timeout_ms == 0) cfg.keep_alive_timeout_ms = 60_000;
+        if (cfg.h2_max_concurrent_streams == 0) cfg.h2_max_concurrent_streams = 100;
 
         return .{
             .allocator = allocator,
@@ -825,9 +826,11 @@ pub const Server = struct {
 
                 if (req.method == .OPTIONS and allow_count > 0) {
                     response = Response.init(self.allocator, 204);
+                    errdefer response.deinit();
                     try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
                 } else if (allow_count > 0) {
                     response = Response.init(self.allocator, 405);
+                    errdefer response.deinit();
                     try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
                 } else if (self.global_handler) |global_handler| {
                     response = self.executeMiddleware(&ctx, global_handler) catch |err| {
@@ -1385,9 +1388,11 @@ pub const Server = struct {
             const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
             if (req.method == .OPTIONS and allow_count > 0) {
                 response = Response.init(self.allocator, 204);
+                errdefer response.deinit();
                 try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
             } else if (allow_count > 0) {
                 response = Response.init(self.allocator, 405);
+                errdefer response.deinit();
                 try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
             } else if (self.global_handler) |global_handler| {
                 response = self.executeMiddleware(&ctx, global_handler) catch {

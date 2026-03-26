@@ -74,10 +74,9 @@ pub const Stream = struct {
     /// Whether we've received END_STREAM.
     end_stream_received: bool = false,
 
-    /// Request headers (decoded).
+    /// Request headers (decoded). On client connections, this also holds
+    /// response headers (the receive loop stores all decoded HEADERS here).
     request_headers: ?[]hpack.DecodedHeader = null,
-    /// Response headers (decoded).
-    response_headers: ?[]hpack.DecodedHeader = null,
     /// Trailing headers (RFC 7540 §8.1), decoded from a second HEADERS frame
     /// received after DATA. Stored separately to avoid overwriting request_headers.
     trailer_headers: ?[]hpack.DecodedHeader = null,
@@ -135,7 +134,6 @@ pub const Stream = struct {
         self.data_buf.deinit(allocator);
         if (self.headers_payload) |hp| allocator.free(hp);
         freeDecodedHeaders(allocator, self.request_headers);
-        freeDecodedHeaders(allocator, self.response_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
     }
 

@@ -472,7 +472,9 @@ pub const Client = struct {
 
         const addr = try Address.resolve(self.io, host, port);
         entry.socket = try Socket.connect(addr, self.io);
-        errdefer entry.socket.close();
+        // Guard socket close only until fibers take ownership (recv_running).
+        // After fibers start, the errdefer at line ~521 handles shutdown.
+        errdefer if (!entry.recv_running) entry.socket.close();
         entry.socket.setNoDelay(true) catch {};
         entry.socket.setKeepAlive(true) catch {};
 
@@ -667,11 +669,12 @@ pub const Client = struct {
             if (since_last < @as(i64, @intCast(idle_ms))) continue;
 
             // No frames received — send a PING to probe liveness.
-            entry.h2.ping_ack_event.reset();
-
             {
                 entry.h2.write_mutex.lockUncancelable(entry.io);
                 defer entry.h2.write_mutex.unlock(entry.io);
+                // Reset inside mutex so a stale ACK from a prior cycle
+                // (processed between reset and send) can't satisfy this wait.
+                entry.h2.ping_ack_event.reset();
                 if (entry.is_tls) {
                     if (entry.session.getWriter()) |w|
                         entry.h2.sendPing(w, .{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 }) catch {}

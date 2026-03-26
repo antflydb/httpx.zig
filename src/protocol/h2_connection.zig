@@ -382,7 +382,12 @@ pub const H2Connection = struct {
 
             const is_last = (offset + chunk_size >= data.len);
             const flags: u8 = if (is_last and end_stream) FLAG_END_STREAM else 0;
-            try self.writeFrame(writer, .data, flags, stream_id, data[offset..][0..chunk_size]);
+            self.writeFrame(writer, .data, flags, stream_id, data[offset..][0..chunk_size]) catch |err| {
+                // Restore send windows — data was never transmitted.
+                stream.updateSendWindow(chunk_i32) catch {};
+                self.stream_manager.updateConnectionSendWindow(chunk_i32) catch {};
+                return err;
+            };
             offset += chunk_size;
         }
 
@@ -612,6 +617,11 @@ pub const H2Connection = struct {
                 return null;
             },
             .goaway => {
+                // RFC 7540 §6.8: GOAWAY MUST be on stream 0.
+                if (frame.header.stream_id != 0) {
+                    try self.sendGoaway(writer, .protocol_error);
+                    return error.ProtocolError;
+                }
                 try self.handleGoaway(frame);
                 return null;
             },
@@ -770,8 +780,17 @@ pub const H2Connection = struct {
                 if (dec.priority) |p| stream.priority = p;
 
                 if (stream.got_headers) {
-                    // RFC 7540 §8.1: Trailing HEADERS after DATA frames.
-                    // Store separately to avoid overwriting the initial headers.
+                    // RFC 7540 §8.1: Trailing HEADERS MUST include END_STREAM.
+                    if (frame.header.flags & FLAG_END_STREAM == 0) {
+                        stream.stream_error = error.ProtocolError;
+                        stream.completed = true;
+                        stream_mod.freeDecodedHeaders(self.allocator, dec.headers);
+                        if (stream.data_event) |ev| ev.set(self.io);
+                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        return;
+                    }
+                    // Store trailing headers separately to avoid overwriting
+                    // the initial request/response headers.
                     stream_mod.freeDecodedHeaders(self.allocator, stream.trailer_headers);
                     stream.trailer_headers = dec.headers;
                 } else {
@@ -934,6 +953,16 @@ pub const H2Connection = struct {
             // (ClosedStream) after accumulateWindowUpdate has already flushed.
             if (sf.header.frame_type == .data and sf.payload.len > 0) {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
+            }
+            // RFC 7540 §5.1: If deliverToMailbox flagged a stream error (e.g.
+            // DATA on half-closed-remote), send RST_STREAM so the peer stops.
+            // This runs after accumulateWindowUpdate so flow control stays balanced.
+            if (sf.header.frame_type == .data) {
+                if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
+                    if (stream.stream_error != null) {
+                        self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
+                    }
+                }
             }
             // Flush window credit on stream completion or reset.
             if (sf.header.frame_type == .data and sf.header.flags & FLAG_END_STREAM != 0) {
