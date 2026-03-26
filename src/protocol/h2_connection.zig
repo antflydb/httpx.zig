@@ -718,6 +718,9 @@ pub const H2Connection = struct {
         const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_encode_ctx, h2_headers, self.allocator);
         defer self.allocator.free(encoded);
         try self.writeHeaders(writer, stream_id, encoded, end_stream);
+        if (end_stream) {
+            if (self.stream_manager.getStream(stream_id)) |s| s.sendEndStream();
+        }
     }
 
     /// Decodes HPACK headers from a HEADERS frame payload.
