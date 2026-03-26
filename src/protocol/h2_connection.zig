@@ -820,9 +820,7 @@ pub const H2Connection = struct {
                     stream_mod.freeDecodedHeaders(self.allocator, stream.trailer_headers);
                     stream.trailer_headers = dec.headers;
                 } else {
-                    // Initial HEADERS — store raw payload and decoded headers.
-                    if (stream.headers_payload) |old| self.allocator.free(old);
-                    stream.headers_payload = try self.allocator.dupe(u8, frame.payload);
+                    // Initial HEADERS — store decoded headers.
                     stream.headers_flags = frame.header.flags;
 
                     stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
@@ -1704,21 +1702,13 @@ test "mailbox-based request-response round-trip" {
     const s1 = server.stream_manager.getStream(1).?;
     try std.testing.expect(s1.got_headers);
     try std.testing.expect(s1.completed);
-    try std.testing.expect(s1.headers_payload != null);
     try std.testing.expectEqualStrings("request body", s1.data_buf.items);
 
-    // Decode headers from mailbox.
-    const dec = try server.decodeFrameHeaders(s1.headers_payload.?, s1.headers_flags);
-    defer {
-        for (dec.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        allocator.free(dec.headers);
-    }
-    try std.testing.expectEqualStrings(":method", dec.headers[0].name);
-    try std.testing.expectEqualStrings("POST", dec.headers[0].value);
-    try std.testing.expectEqualStrings("/api/data", dec.headers[1].value);
+    // Headers were already decoded in deliverToMailbox.
+    const req_hdrs = s1.request_headers.?;
+    try std.testing.expectEqualStrings(":method", req_hdrs[0].name);
+    try std.testing.expectEqualStrings("POST", req_hdrs[0].value);
+    try std.testing.expectEqualStrings("/api/data", req_hdrs[1].value);
 
     // --- Server sends response, client reads via awaitStreamComplete ---
     var status_buf: [3]u8 = undefined;
@@ -1738,17 +1728,10 @@ test "mailbox-based request-response round-trip" {
     try std.testing.expect(cs1.got_headers);
     try std.testing.expectEqualStrings("response body", cs1.data_buf.items);
 
-    // Decode response headers from mailbox.
-    const rdec = try client.decodeFrameHeaders(cs1.headers_payload.?, cs1.headers_flags);
-    defer {
-        for (rdec.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        allocator.free(rdec.headers);
-    }
-    try std.testing.expectEqualStrings(":status", rdec.headers[0].name);
-    try std.testing.expectEqualStrings("201", rdec.headers[0].value);
+    // Response headers were already decoded in deliverToMailbox.
+    const resp_hdrs = cs1.request_headers.?;
+    try std.testing.expectEqualStrings(":status", resp_hdrs[0].name);
+    try std.testing.expectEqualStrings("201", resp_hdrs[0].value);
 }
 
 test "deliverToMailbox incremental DATA without END_STREAM" {
@@ -2052,19 +2035,10 @@ test "h2 round-trip over TCP loopback" {
     try std.testing.expect(resp_stream.completed);
     try std.testing.expectEqualStrings("hello", resp_stream.data_buf.items);
 
-    // Decode response headers to verify status.
-    const resp_dec = try client_h2.decodeFrameHeaders(
-        resp_stream.headers_payload.?, resp_stream.headers_flags,
-    );
-    defer {
-        for (resp_dec.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        allocator.free(resp_dec.headers);
-    }
-    try std.testing.expectEqualStrings(":status", resp_dec.headers[0].name);
-    try std.testing.expectEqualStrings("200", resp_dec.headers[0].value);
+    // Response headers were already decoded in deliverToMailbox.
+    const resp_hdrs = resp_stream.request_headers.?;
+    try std.testing.expectEqualStrings(":status", resp_hdrs[0].name);
+    try std.testing.expectEqualStrings("200", resp_hdrs[0].value);
 }
 
 test "batched WINDOW_UPDATE: small DATA frames don't trigger immediate updates" {

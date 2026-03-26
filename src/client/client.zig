@@ -638,14 +638,20 @@ pub const Client = struct {
         // Mark broken BEFORE signaling streams so that retrying request fibers
         // (woken by signalAllStreams) see entry.broken=true and don't reuse
         // this dead connection.
-        defer entry.h2.signalAllStreams(error.ConnectionClosed);
+        var last_err: anyerror = error.ConnectionClosed;
+        defer entry.h2.signalAllStreams(last_err);
         defer {
             entry.broken = true;
         }
         while (!entry.h2.goaway_received) {
             _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
-                else => return,
+                else => {
+                    // Send GOAWAY so the server knows we're closing.
+                    if (!entry.h2.goaway_sent) entry.h2.sendGoaway(writer, .protocol_error) catch {};
+                    last_err = err;
+                    return;
+                },
             };
             entry.last_frame_ts = common.milliTimestamp(entry.io);
         }

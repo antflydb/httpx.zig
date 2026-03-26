@@ -84,8 +84,6 @@ pub const Stream = struct {
     // -- Per-stream mailbox for multiplexed I/O --
     // The receive loop writes here; request fibers read.
 
-    /// Raw HEADERS frame payload (HPACK-encoded), set by the receive loop.
-    headers_payload: ?[]u8 = null,
     /// Flags from the HEADERS frame (contains END_STREAM, etc).
     headers_flags: u8 = 0,
     /// Accumulated DATA frame payloads for this stream.
@@ -132,7 +130,6 @@ pub const Stream = struct {
         self.send_buffer.deinit(allocator);
         self.recv_buffer.deinit(allocator);
         self.data_buf.deinit(allocator);
-        if (self.headers_payload) |hp| allocator.free(hp);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
     }
