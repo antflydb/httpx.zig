@@ -2969,3 +2969,69 @@ test "Frame.deinit frees zero-length payload" {
     // Should not leak — GPA would detect if free is skipped.
     frame.deinit(allocator);
 }
+
+test "CONTINUATION OOM resets state so connection can recover" {
+    // Regression: OOM in continuation_buf.appendSlice left stale
+    // continuation_stream_id and buffer, corrupting subsequent frames.
+    // Also verifies no double-free (errdefer handles payload free).
+    const allocator = std.testing.allocator;
+
+    // Build a HEADERS frame without END_HEADERS to trigger continuation mode.
+    const headers_payload = [_]u8{0x82}; // :method GET (static index 2)
+    var c2s = std.ArrayListUnmanaged(u8).empty;
+    defer c2s.deinit(allocator);
+
+    const hdr1 = Http2FrameHeader{
+        .length = headers_payload.len,
+        .frame_type = .headers,
+        .flags = 0, // no END_HEADERS — triggers continuation mode
+        .stream_id = 1,
+    };
+    try c2s.appendSlice(allocator, &hdr1.serialize());
+    try c2s.appendSlice(allocator, &headers_payload);
+
+    // CONTINUATION frame with a small payload (OOM will be on appendSlice).
+    const cont_payload = [_]u8{ 0x84, 0x86 }; // two indexed headers
+    const cont_hdr = Http2FrameHeader{
+        .length = cont_payload.len,
+        .frame_type = .continuation,
+        .flags = H2Connection.FLAG_END_HEADERS,
+        .stream_id = 1,
+    };
+    try c2s.appendSlice(allocator, &cont_hdr.serialize());
+    try c2s.appendSlice(allocator, &cont_payload);
+
+    // Use a FailingAllocator that allows initial setup but fails on a
+    // later allocation (the continuation_buf.appendSlice).
+    // Count: H2Connection.initServer does some allocs for HPACK tables, etc.
+    // We need to find the right fail_index by trial — try from 0 upwards.
+    var fail_index: usize = 0;
+    while (fail_index < 100) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const fa = failing.allocator();
+
+        var server = H2Connection.initServer(fa, std.testing.io);
+        defer server.deinit();
+
+        var reader = TestReader{ .data = c2s.items };
+        const result = server.readFrame(&reader);
+
+        if (result) |f| {
+            // Success — this fail_index didn't hit the right alloc. Clean up.
+            var frame = f;
+            frame.deinit(fa);
+            continue;
+        } else |err| {
+            if (err == error.OutOfMemory) {
+                // Hit OOM — verify state was cleaned up.
+                try std.testing.expect(server.continuation_stream_id == null);
+                try std.testing.expectEqual(@as(usize, 0), server.continuation_buf.items.len);
+                return; // Test passed.
+            }
+            // Other errors during init are fine, keep trying.
+            continue;
+        }
+    }
+    // If we never hit OOM, something is wrong with the test setup.
+    return error.TestExpectedOom;
+}

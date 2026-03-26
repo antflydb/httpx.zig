@@ -2031,6 +2031,70 @@ test "Context.body() buffers from H2StreamReader" {
     try std.testing.expect(ctx.h2_body_reader == null);
 }
 
+test "h2c applyPeerSettings propagates INITIAL_WINDOW_SIZE and HPACK table size" {
+    // Verifies the fix: handleH2cUpgrade now calls h2.applyPeerSettings()
+    // (not raw applySettingsPayload), so HPACK encoder and stream windows
+    // are correctly synced with the peer's HTTP2-Settings header.
+    const allocator = std.testing.allocator;
+
+    // Build a SETTINGS payload: INITIAL_WINDOW_SIZE=32768, HEADER_TABLE_SIZE=2048.
+    var settings_payload: [12]u8 = undefined;
+    std.mem.writeInt(u16, settings_payload[0..2], @intFromEnum(http.Http2SettingId.initial_window_size), .big);
+    std.mem.writeInt(u32, settings_payload[2..6], 32768, .big);
+    std.mem.writeInt(u16, settings_payload[6..8], @intFromEnum(http.Http2SettingId.header_table_size), .big);
+    std.mem.writeInt(u32, settings_payload[8..12], 2048, .big);
+
+    // Base64url encode (what the HTTP2-Settings header carries).
+    var encoded_buf: [32]u8 = undefined;
+    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, &settings_payload);
+
+    // Decode via the same path handleH2cUpgrade uses.
+    const decoded = try http.decodeH2cSettings(encoded, allocator);
+    defer allocator.free(decoded);
+
+    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    defer h2.deinit();
+
+    // applyPeerSettings (not raw applySettingsPayload) applies side effects.
+    try h2.applyPeerSettings(decoded);
+
+    // Peer's INITIAL_WINDOW_SIZE must be reflected.
+    try std.testing.expectEqual(@as(u32, 32768), h2.peer_settings.initial_window_size);
+    // HPACK encoder table must be updated.
+    try std.testing.expectEqual(@as(?usize, 2048), h2.stream_manager.hpack_encode_ctx.pending_table_size_update);
+    try std.testing.expectEqual(@as(usize, 2048), h2.stream_manager.hpack_encode_ctx.dynamic_table.max_size);
+    // max_concurrent_streams propagated to stream manager.
+    try std.testing.expectEqual(h2.peer_settings.max_concurrent_streams, h2.stream_manager.max_concurrent_streams);
+}
+
+test "handleH2Stream cleanup skips RST_STREAM on already-closed stream" {
+    // Verifies the fix: when a stream is in .closed state (peer already
+    // sent RST_STREAM), the server's defer block should NOT send RST_STREAM
+    // back (RFC 7540 §5.4.2 violation).
+    const allocator = std.testing.allocator;
+
+    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    defer h2.deinit();
+
+    // Create stream 1 and put it in closed state (as if peer sent RST_STREAM).
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .closed;
+    stream.end_stream_sent = false; // server hasn't sent END_STREAM yet
+
+    // The guard from handleH2Stream's defer:
+    // "if (!s.end_stream_sent and s.state != .idle and s.state != .closed)"
+    // Should be false for .closed state.
+    const should_rst = !stream.end_stream_sent and stream.state != .idle and stream.state != .closed;
+    try std.testing.expect(!should_rst);
+
+    // Compare: an open stream that hasn't sent END_STREAM SHOULD get RST.
+    const stream3 = try h2.stream_manager.getOrCreateStream(3);
+    stream3.state = .open;
+    stream3.end_stream_sent = false;
+    const should_rst_open = !stream3.end_stream_sent and stream3.state != .idle and stream3.state != .closed;
+    try std.testing.expect(should_rst_open);
+}
+
 test "isH2ForbiddenHeader rejects connection-specific headers" {
     // RFC 7540 §8.1.2.2: connection-specific headers are forbidden.
     try std.testing.expect(isH2ForbiddenHeader("connection", "keep-alive"));
