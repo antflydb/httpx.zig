@@ -943,7 +943,23 @@ pub const Server = struct {
             try h2.stream_manager.updateConnectionRecvWindow(@intCast(delta));
         }
 
-        // 5. Handle the original HTTP/1.1 request as stream 1.
+        // 5. Read client h2 preface + SETTINGS before handling stream 1.
+        // RFC 7540 §3.2: The client sends its connection preface immediately
+        // after the 101 response. We must process it before sending any
+        // stream-level frames so flow control settings are applied correctly.
+        var h2c_reader = H2SocketReader{ .socket = sock, .initial = initial_h2_data, .initial_pos = 0 };
+
+        try h2.readClientPreface(&h2c_reader);
+
+        // Read client's SETTINGS frame.
+        var settings_frame = try h2.readFrame(&h2c_reader);
+        defer settings_frame.deinit(self.allocator);
+        // RFC 7540 §3.5: First client frame MUST be a non-ACK SETTINGS.
+        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
+        if (settings_frame.header.flags & H2Connection.FLAG_ACK != 0) return error.ProtocolError;
+        try h2.handleSettings(&settings_frame, sock);
+
+        // 6. Handle the original HTTP/1.1 request as stream 1.
         _ = try h2.stream_manager.getOrCreateStream(1);
         original_req.version = .HTTP_2;
         self.routeAndRespondH2(&h2, sock, 1, original_req, null) catch |err| {
@@ -958,21 +974,7 @@ pub const Server = struct {
         // correct last_stream_id and clients don't retry it (RFC 7540 §6.8).
         h2.last_processed_stream_id = 1;
 
-        // 6. Enter the normal H2 receive loop for subsequent requests.
-        // Use H2SocketReader to replay any bytes pipelined after the upgrade
-        // request (client may have sent the H2 preface in the same TCP segment).
-        var h2c_reader = H2SocketReader{ .socket = sock, .initial = initial_h2_data, .initial_pos = 0 };
-
-        // The client will next send the h2 preface (24 bytes) + SETTINGS.
-        try h2.readClientPreface(&h2c_reader);
-
-        // Read client's SETTINGS frame.
-        var settings_frame = try h2.readFrame(&h2c_reader);
-        defer settings_frame.deinit(self.allocator);
-        // RFC 7540 §3.5: First client frame MUST be a non-ACK SETTINGS.
-        if (settings_frame.header.frame_type != .settings) return error.ProtocolError;
-        if (settings_frame.header.flags & H2Connection.FLAG_ACK != 0) return error.ProtocolError;
-        try h2.handleSettings(&settings_frame, sock);
+        // 7. Enter the normal H2 receive loop for subsequent requests.
 
         // Set socket recv timeout for idle detection (same as handleH2Connection).
         if (self.config.h2_idle_timeout_ms > 0) {
@@ -1004,7 +1006,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed, error.Canceled => break,
+                error.ConnectionClosed => break,
                 error.RecvFailed => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
@@ -1137,7 +1139,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed, error.Canceled => break,
+                error.ConnectionClosed => break,
                 // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
                 // RecvFailed. Re-enter the loop so the idle check runs.
                 error.RecvFailed => continue,
@@ -1316,7 +1318,13 @@ pub const Server = struct {
             return;
         };
         const is_connect = mem.eql(u8, m_str, "CONNECT");
-        if (!is_connect and path == null) {
+        if (is_connect) {
+            // RFC 7540 §8.3: CONNECT MUST have :authority, MUST NOT have :path or :scheme.
+            if (authority == null or path != null or scheme != null) {
+                try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
+                return;
+            }
+        } else if (path == null) {
             try self.sendH2ErrorLocked(h2, sock, stream_id, 400);
             return;
         }

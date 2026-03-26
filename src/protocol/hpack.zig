@@ -686,10 +686,17 @@ pub fn encodeHeaders(
             // the static table (already lowercase), but store the lowercase form
             // in the dynamic table so future references are also lowercase.
             var idx_lower_buf: [256]u8 = undefined;
+            var idx_lower_heap: ?[]u8 = null;
+            defer if (idx_lower_heap) |h| allocator.free(h);
             const idx_lower_name = if (header.name.len <= idx_lower_buf.len) blk: {
                 for (header.name, 0..) |c, i| idx_lower_buf[i] = std.ascii.toLower(c);
                 break :blk idx_lower_buf[0..header.name.len];
-            } else header.name;
+            } else blk: {
+                const heap = try allocator.alloc(u8, header.name.len);
+                for (header.name, 0..) |c, i| heap[i] = std.ascii.toLower(c);
+                idx_lower_heap = heap;
+                break :blk heap;
+            };
             var buf: [10]u8 = undefined;
             const n = try encodeInteger(name_index, 6, &buf);
             buf[0] |= 0x40; // Incremental indexing
@@ -700,10 +707,17 @@ pub fn encodeHeaders(
             // Literal header with literal name.
             // RFC 7540 §8.1.2: header field names MUST be lowercase in HTTP/2.
             var lower_buf: [256]u8 = undefined;
+            var lower_heap: ?[]u8 = null;
+            defer if (lower_heap) |h| allocator.free(h);
             const lower_name = if (header.name.len <= lower_buf.len) blk: {
                 for (header.name, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
                 break :blk lower_buf[0..header.name.len];
-            } else header.name;
+            } else blk: {
+                const heap = try allocator.alloc(u8, header.name.len);
+                for (header.name, 0..) |c, i| heap[i] = std.ascii.toLower(c);
+                lower_heap = heap;
+                break :blk heap;
+            };
             try out.append(allocator, 0x40); // Incremental indexing, index=0
             try encodeString(lower_name, true, allocator, &out);
             try encodeString(header.value, true, allocator, &out);
@@ -1515,4 +1529,43 @@ test "HPACK encoder size update round-trips through decoder" {
     try std.testing.expectEqualStrings(":status", decoded[0].name);
     try std.testing.expectEqualStrings("200", decoded[0].value);
     try std.testing.expectEqual(@as(usize, 2048), decoder_ctx.dynamic_table.max_size);
+}
+
+test "encodeHeaders lowercases header names longer than 256 bytes" {
+    // Regression: names exceeding the 256-byte stack buffer were encoded
+    // in their original case, violating RFC 7540 §8.1.2.
+    const allocator = std.testing.allocator;
+
+    var encode_ctx = HpackContext.init(allocator);
+    defer encode_ctx.deinit();
+
+    // Create a header name longer than 256 bytes with uppercase chars.
+    var long_name: [300]u8 = undefined;
+    @memset(&long_name, 'X'); // all uppercase
+    long_name[0] = 'x'; // first char lowercase to verify the rest gets lowered
+    const headers = [_]HeaderEntry{
+        .{ .name = &long_name, .value = "test-value" },
+    };
+
+    const encoded = try encodeHeaders(&encode_ctx, &headers, allocator);
+    defer allocator.free(encoded);
+
+    // Decode and verify the name is all lowercase.
+    var decode_ctx = HpackContext.init(allocator);
+    defer decode_ctx.deinit();
+    const decoded = try decodeHeaders(&decode_ctx, encoded, allocator);
+    defer {
+        for (decoded) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    // Every character should be lowercase.
+    for (decoded[0].name) |c| {
+        try std.testing.expect(c == 'x');
+    }
+    try std.testing.expectEqual(@as(usize, 300), decoded[0].name.len);
 }
