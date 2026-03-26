@@ -187,9 +187,11 @@ pub const Client = struct {
             // returns ConnectionClosed, allowing the fiber to exit cleanly.
             // This also causes the ping timer's waitTimeout to fail.
             e.socket.close();
-            // Wait for both fibers to finish before tearing down.
-            e.ping_group.await(self.io) catch {};
+            // Await recv_group first: the receive loop sets entry.broken=true
+            // on exit, which causes the ping fiber's while(!broken) loop to
+            // terminate without waiting for a full ping timeout cycle.
             e.recv_group.await(self.io) catch {};
+            e.ping_group.await(self.io) catch {};
             e.h2.deinit();
             if (e.is_tls) e.session.deinit();
             self.allocator.destroy(e);
@@ -351,7 +353,17 @@ pub const Client = struct {
             const is_tls = req.uri.isTls();
             const entry = try self.getOrCreateH2Conn(host, port, is_tls);
             const result = self.executeH2OnPooled(entry, req) catch |err| {
-                entry.broken = true;
+                // Only mark the connection broken for transport/framing errors.
+                // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
+                // StreamDataOverflow) don't indicate a bad connection — other streams
+                // may still be healthy.
+                switch (err) {
+                    error.MaxConcurrentStreamsExceeded,
+                    error.ContentLengthMismatch,
+                    error.StreamDataOverflow,
+                    => {},
+                    else => entry.broken = true,
+                }
                 return err;
             };
             // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
@@ -434,31 +446,27 @@ pub const Client = struct {
     /// Gets or creates a pooled HTTP/2 connection for the given host:port.
     /// The connection preface and SETTINGS exchange happen once on creation;
     /// subsequent requests reuse the same TCP/TLS + H2Connection state.
+    ///
+    /// The mutex is held only for map lookups and insertion — not across
+    /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
+    /// If two fibers race to create the same host:port, the loser discards
+    /// its connection and uses the winner's.
     fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
-        self.h2_mutex.lockUncancelable(self.io);
-        defer self.h2_mutex.unlock(self.io);
-
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
 
-        // Return existing healthy connection.
-        if (self.h2_conns.get(key)) |entry| {
-            if (!entry.broken and !entry.h2.goaway_received) return entry;
-            if (entry.h2.goaway_received) entry.broken = true;
-            // Remove and destroy broken entry.
-            if (self.h2_conns.fetchRemove(key)) |removed| {
-                const e = removed.value;
-                e.socket.close();
-                e.ping_group.await(self.io) catch {};
-                e.recv_group.await(self.io) catch {};
-                e.h2.deinit();
-                if (e.is_tls) e.session.deinit();
-                self.allocator.destroy(e);
-                self.allocator.free(removed.key);
+        // --- Phase 1: Check map under lock ---
+        {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+
+            if (self.h2_conns.get(key)) |entry| {
+                if (!entry.broken and !entry.h2.goaway_received) return entry;
+                if (entry.h2.goaway_received) entry.broken = true;
             }
         }
 
-        // Create a new connection.
+        // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
         errdefer self.allocator.destroy(entry);
 
@@ -502,30 +510,82 @@ pub const Client = struct {
             try self.exchangeH2Settings(&entry.h2, &entry.socket, &entry.socket);
         }
 
-        // Spawn a background receive-loop fiber so multiple request fibers
-        // can share this connection via stream multiplexing.
+        // Spawn background fibers before taking the lock for insertion.
         if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
             entry.recv_running = true;
-            // Spawn PING health-check fiber alongside the receive loop.
             if (self.config.h2_read_idle_timeout_ms > 0) {
                 entry.ping_group.concurrent(self.io, h2PingTimerFiber, .{entry}) catch {};
             }
-        } else |_| {
-            // No fiber support — fall back to inline frame pumping per request.
-        }
+        } else |_| {}
 
-        // If subsequent operations fail, ensure spawned fibers are stopped
-        // before freeing the entry to prevent use-after-free.
         errdefer if (entry.recv_running) {
             entry.socket.close();
-            entry.ping_group.await(self.io) catch {};
             entry.recv_group.await(self.io) catch {};
+            entry.ping_group.await(self.io) catch {};
         };
 
-        const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
-        errdefer self.allocator.free(owned_key);
-        try self.h2_conns.put(self.allocator, owned_key, entry);
+        // --- Phase 3: Re-check and insert under lock ---
+        // Collect entries to tear down outside the lock (await yields the
+        // fiber, so we must not hold h2_mutex during teardown).
+        var race_winner: ?*H2PoolEntry = null;
+        var stale_removed: ?std.StringHashMapUnmanaged(*H2PoolEntry).KV = null;
+        // Use defer so stale entry is cleaned up even if allocPrint/put fail.
+        defer if (stale_removed) |removed| self.destroyH2EntryKeyed(removed);
+
+        {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+
+            // Another fiber may have raced us and inserted a connection.
+            if (self.h2_conns.get(key)) |existing| {
+                if (!existing.broken and !existing.h2.goaway_received) {
+                    race_winner = existing;
+                }
+            }
+
+            if (race_winner == null) {
+                // Remove stale/broken entry if present.
+                stale_removed = self.h2_conns.fetchRemove(key);
+
+                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
+                errdefer self.allocator.free(owned_key);
+                try self.h2_conns.put(self.allocator, owned_key, entry);
+            }
+        }
+
+        if (race_winner) |existing| {
+            // Loser: tear down our connection, use the winner's.
+            self.destroyH2Entry(entry);
+            return existing;
+        }
+
         return entry;
+    }
+
+    /// Tears down an H2PoolEntry that was never inserted into h2_conns.
+    fn destroyH2Entry(self: *Self, entry: *H2PoolEntry) void {
+        if (entry.recv_running) {
+            entry.socket.close();
+            entry.recv_group.await(self.io) catch {};
+            entry.ping_group.await(self.io) catch {};
+        } else {
+            entry.socket.close();
+        }
+        entry.h2.deinit();
+        if (entry.is_tls) entry.session.deinit();
+        self.allocator.destroy(entry);
+    }
+
+    /// Tears down an H2PoolEntry that was removed from h2_conns via fetchRemove.
+    fn destroyH2EntryKeyed(self: *Self, removed: std.StringHashMapUnmanaged(*H2PoolEntry).KV) void {
+        const e = removed.value;
+        e.socket.close();
+        e.recv_group.await(self.io) catch {};
+        e.ping_group.await(self.io) catch {};
+        e.h2.deinit();
+        if (e.is_tls) e.session.deinit();
+        self.allocator.destroy(e);
+        self.allocator.free(removed.key);
     }
 
     /// Reads frames until the server's initial SETTINGS has been received and ACKed.
@@ -860,8 +920,8 @@ pub const Client = struct {
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
     pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
         const host = req.uri.host orelse return error.InvalidUri;
-        const is_tls = if (req.uri.scheme) |s| mem.eql(u8, s, "https") else false;
-        const port = req.uri.port orelse if (is_tls) @as(u16, 443) else @as(u16, 80);
+        const is_tls = req.uri.isTls();
+        const port = req.uri.effectivePort();
         const entry = try self.getOrCreateH2Conn(host, port, is_tls);
         if (!entry.recv_running) return error.MultiplexingRequired;
 

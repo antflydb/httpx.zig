@@ -252,8 +252,11 @@ pub const StreamManager = struct {
     max_closed_stream_id: u31 = 0,
 
 
-    /// HPACK encoder/decoder context.
-    hpack_ctx: hpack.HpackContext,
+    /// Separate HPACK contexts for encoder and decoder (RFC 7541 §2.2).
+    /// Each endpoint maintains two independent dynamic tables: one for
+    /// encoding outbound headers and one for decoding inbound headers.
+    hpack_encode_ctx: hpack.HpackContext,
+    hpack_decode_ctx: hpack.HpackContext,
 
     const Self = @This();
 
@@ -261,7 +264,8 @@ pub const StreamManager = struct {
         return .{
             .allocator = allocator,
             .is_client = is_client,
-            .hpack_ctx = hpack.HpackContext.init(allocator),
+            .hpack_encode_ctx = hpack.HpackContext.init(allocator),
+            .hpack_decode_ctx = hpack.HpackContext.init(allocator),
         };
     }
 
@@ -272,7 +276,8 @@ pub const StreamManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.streams.deinit(self.allocator);
-        self.hpack_ctx.deinit();
+        self.hpack_encode_ctx.deinit();
+        self.hpack_decode_ctx.deinit();
     }
 
     /// Creates a new stream with the next available ID.
@@ -419,7 +424,7 @@ pub fn buildHeadersFramePayload(
     }
 
     // HPACK-encoded headers
-    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_ctx, headers, allocator);
+    const encoded_headers = try hpack.encodeHeaders(&stream_manager.hpack_encode_ctx, headers, allocator);
     defer allocator.free(encoded_headers);
     try out.appendSlice(allocator, encoded_headers);
 
@@ -476,7 +481,7 @@ pub fn parseHeadersFramePayloadWithOptions(
     const header_block_len = payload.len - offset - pad_length;
 
     const headers = try hpack.decodeHeadersWithOptions(
-        &stream_manager.hpack_ctx,
+        &stream_manager.hpack_decode_ctx,
         payload[offset .. offset + header_block_len],
         allocator,
         hpack_options,

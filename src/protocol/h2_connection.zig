@@ -82,9 +82,13 @@ pub const H2Connection = struct {
     continuation_buf: std.ArrayListUnmanaged(u8) = .empty,
     continuation_flags: u8 = 0,
 
-    /// Signaled when a PING ACK is received, allowing a health-check fiber
-    /// to verify liveness of the connection.
+    /// Signaled when a PING ACK is received with the expected opaque data,
+    /// allowing a health-check fiber to verify liveness of the connection.
     ping_ack_event: Io.Event = .unset,
+    /// Opaque data from the last sent PING. handlePing only signals
+    /// ping_ack_event when the ACK payload matches, preventing stale or
+    /// server-initiated PING ACKs from falsely satisfying the health check.
+    ping_expected_data: [8]u8 = .{0} ** 8,
 
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
     /// Defaults to half the initial window size. Adjusted when peer SETTINGS
@@ -186,7 +190,7 @@ pub const H2Connection = struct {
         // RFC 7541 §4.2: When peer changes HEADER_TABLE_SIZE, our encoder must
         // emit a size update at the start of the next header block.
         if (old_table_size != self.peer_settings.header_table_size) {
-            self.stream_manager.hpack_ctx.setTableSize(self.peer_settings.header_table_size);
+            self.stream_manager.hpack_encode_ctx.setTableSize(self.peer_settings.header_table_size);
         }
         // peer_settings.max_concurrent_streams limits how many streams *we*
         // can initiate. Propagate to stream_manager so createStream enforces it.
@@ -413,14 +417,21 @@ pub const H2Connection = struct {
         if (frame.header.stream_id != 0) return error.ProtocolError;
         if (frame.payload.len != 8) return error.FrameSizeError;
         if (frame.header.flags & FLAG_ACK != 0) {
-            self.ping_ack_event.set(self.io);
+            // RFC 7540 §6.7: PING ACK must echo the exact opaque data.
+            // Only signal the health-check event if the payload matches
+            // what we sent, ignoring stale or server-initiated ACKs.
+            if (std.mem.eql(u8, frame.payload[0..8], &self.ping_expected_data)) {
+                self.ping_ack_event.set(self.io);
+            }
             return;
         }
         try self.writeFrame(writer, .ping, FLAG_ACK, 0, frame.payload);
     }
 
     /// Sends a PING frame. Caller must hold write_mutex.
+    /// Stores `opaque_data` so handlePing can validate the ACK payload.
     pub fn sendPing(self: *Self, writer: anytype, opaque_data: [8]u8) !void {
+        self.ping_expected_data = opaque_data;
         try self.writeFrame(writer, .ping, 0, 0, &opaque_data);
     }
 
@@ -442,10 +453,21 @@ pub const H2Connection = struct {
             return err;
         };
         if (frame.header.stream_id == 0) {
+            // RFC 7540 §6.9.1: Connection-level overflow is a connection error;
+            // FlowControlError propagates so caller can send GOAWAY and tear down.
             try self.stream_manager.updateConnectionSendWindow(@intCast(increment));
         } else {
             const s = self.stream_manager.getStream(frame.header.stream_id) orelse return;
-            try s.updateSendWindow(@intCast(increment));
+            s.updateSendWindow(@intCast(increment)) catch {
+                // RFC 7540 §6.9.1: Stream-level flow control overflow is a
+                // stream error, not a connection error. Signal the stream
+                // and continue processing other streams.
+                s.stream_error = error.FlowControlError;
+                s.completed = true;
+                if (s.data_event) |ev| ev.set(self.io);
+                if (s.completion_sem) |sem| sem.post(self.io);
+                return;
+            };
         }
         // Wake any fiber blocked in writeDataBlocking waiting for window space.
         self.send_window_event.set(self.io);
@@ -616,6 +638,13 @@ pub const H2Connection = struct {
                 }
                 return frame.*;
             },
+            .continuation => {
+                // RFC 7540 §6.10: CONTINUATION received outside a HEADERS
+                // sequence (continuation_stream_id == null in readFrame) is
+                // a connection error (PROTOCOL_ERROR).
+                try self.sendGoaway(writer, .protocol_error);
+                return error.ProtocolError;
+            },
             else => null, // Unknown frame types MUST be ignored (RFC 7540 §4.1).
         };
     }
@@ -665,7 +694,7 @@ pub const H2Connection = struct {
 
     /// Encodes headers via HPACK and sends as HEADERS frame(s).
     pub fn sendHeaders(self: *Self, writer: anytype, stream_id: u31, h2_headers: []const hpack.HeaderEntry, end_stream: bool) !void {
-        const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_ctx, h2_headers, self.allocator);
+        const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_encode_ctx, h2_headers, self.allocator);
         defer self.allocator.free(encoded);
         try self.writeHeaders(writer, stream_id, encoded, end_stream);
     }
@@ -697,7 +726,7 @@ pub const H2Connection = struct {
     /// Delivers a stream-level frame to the target stream's mailbox.
     /// Copies payload data so the original frame can be freed afterward.
     /// HPACK decoding happens here (in the receive loop) to avoid concurrent
-    /// decode races on the shared hpack_ctx (RFC 7540 §4.3).
+    /// decode races on the shared hpack_decode_ctx (RFC 7540 §4.3).
     pub fn deliverToMailbox(self: *Self, frame: *const Frame) !void {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
@@ -733,8 +762,8 @@ pub const H2Connection = struct {
         switch (frame.header.frame_type) {
             .headers => {
                 // Decode HPACK immediately in the receive loop. This is the
-                // only safe place since hpack_ctx is connection-scoped and
-                // stateful — concurrent decodes corrupt the dynamic table.
+                // only safe place since hpack_decode_ctx is connection-scoped
+                // and stateful — concurrent decodes corrupt the dynamic table.
                 const dec = self.decodeFrameHeaders(frame.payload, frame.header.flags) catch |err| {
                     return err;
                 };
@@ -828,7 +857,9 @@ pub const H2Connection = struct {
                     return;
                 }
                 if (self.max_stream_data_size > 0) {
-                    const new_size = stream.data_buf.items.len + data_payload.len;
+                    // Use total_data_received, not data_buf.items.len — compactDataBuf()
+                    // shrinks the buffer, so buffer length alone is bypassable.
+                    const new_size = stream.total_data_received + data_payload.len;
                     if (new_size > self.max_stream_data_size) {
                         stream.stream_error = error.StreamDataOverflow;
                         stream.completed = true;
@@ -937,7 +968,7 @@ pub const H2Connection = struct {
             const maybe = try self.dispatchFrame(&frame, writer);
             if (maybe) |sf| {
                 // deliverToMailbox decodes HPACK + copies payload under lock,
-                // ensuring the shared hpack_ctx is not accessed concurrently.
+                // ensuring the shared hpack_decode_ctx is not accessed concurrently.
                 self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                     error.ClosedStream => {
                         self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
@@ -2477,7 +2508,7 @@ test "applyPeerSettings signals HPACK encoder table size update" {
     defer conn.deinit();
 
     // Initially no pending update.
-    try std.testing.expect(conn.stream_manager.hpack_ctx.pending_table_size_update == null);
+    try std.testing.expect(conn.stream_manager.hpack_encode_ctx.pending_table_size_update == null);
 
     // Peer sends SETTINGS with HEADER_TABLE_SIZE = 2048.
     var payload: [6]u8 = undefined;
@@ -2486,8 +2517,8 @@ test "applyPeerSettings signals HPACK encoder table size update" {
     try conn.applyPeerSettings(&payload);
 
     // Encoder should have a pending table size update.
-    try std.testing.expectEqual(@as(?usize, 2048), conn.stream_manager.hpack_ctx.pending_table_size_update);
-    try std.testing.expectEqual(@as(usize, 2048), conn.stream_manager.hpack_ctx.dynamic_table.max_size);
+    try std.testing.expectEqual(@as(?usize, 2048), conn.stream_manager.hpack_encode_ctx.pending_table_size_update);
+    try std.testing.expectEqual(@as(usize, 2048), conn.stream_manager.hpack_encode_ctx.dynamic_table.max_size);
 }
 
 test "handleWindowUpdate signals send_window_event" {
@@ -2709,7 +2740,7 @@ test "trailer HEADERS stored separately from initial headers" {
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
     };
-    const init_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &init_headers, allocator);
+    const init_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_encode_ctx, &init_headers, allocator);
     defer allocator.free(init_encoded);
 
     // Deliver initial HEADERS.
@@ -2734,7 +2765,7 @@ test "trailer HEADERS stored separately from initial headers" {
     const trailer_hdrs = [_]hpack.HeaderEntry{
         .{ .name = "grpc-status", .value = "0" },
     };
-    const trailer_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &trailer_hdrs, allocator);
+    const trailer_encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_encode_ctx, &trailer_hdrs, allocator);
     defer allocator.free(trailer_encoded);
 
     // Deliver trailing HEADERS with END_STREAM.
@@ -2802,7 +2833,7 @@ test "SETTINGS_MAX_HEADER_LIST_SIZE enforced in HPACK decode" {
     const headers = [_]hpack.HeaderEntry{
         .{ .name = "x-long-header", .value = "this-value-is-quite-long-indeed" },
     };
-    const encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_ctx, &headers, allocator);
+    const encoded = try hpack.encodeHeaders(&server.stream_manager.hpack_encode_ctx, &headers, allocator);
     defer allocator.free(encoded);
 
     // Decoding should fail because total decoded size > 32 bytes.

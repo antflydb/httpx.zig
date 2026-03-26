@@ -972,7 +972,12 @@ pub const Server = struct {
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
                 error.ConnectionClosed => break,
                 error.RecvFailed => continue,
-                else => return err,
+                else => {
+                    // RFC 7540 §5.4.1: Send GOAWAY with the correct error
+                    // code before closing on connection-level errors.
+                    if (!h2.goaway_sent) h2.sendGoaway(sock, .protocol_error) catch {};
+                    return err;
+                },
             };
 
             last_activity = milliTimestamp(self.io);
@@ -986,6 +991,8 @@ pub const Server = struct {
                 continue;
             }
 
+            // Use > (not >=) because deliverToMailbox already added this
+            // stream to the map, so activeStreamCount() includes it.
             if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
@@ -1098,7 +1105,12 @@ pub const Server = struct {
                 // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
                 // RecvFailed. Re-enter the loop so the idle check runs.
                 error.RecvFailed => continue,
-                else => return err,
+                else => {
+                    // RFC 7540 §5.4.1: Send GOAWAY with the correct error
+                    // code before closing on connection-level errors.
+                    if (!h2.goaway_sent) h2.sendGoaway(sock, .protocol_error) catch {};
+                    return err;
+                },
             };
 
             last_activity = milliTimestamp(self.io);
@@ -1121,6 +1133,8 @@ pub const Server = struct {
             // RFC 7540 §5.1.2: refuse streams beyond max_concurrent_streams.
             // Check before incrementing h2_request_count so refused streams
             // don't drain the h2_max_requests budget.
+            // Use > (not >=) because deliverToMailbox already added this
+            // stream to the map, so activeStreamCount() includes it.
             if (h2.stream_manager.activeStreamCount() > h2.local_max_concurrent_streams) {
                 h2.write_mutex.lockUncancelable(h2.io);
                 h2.sendRstStream(sock, sid, .refused_stream) catch {};
