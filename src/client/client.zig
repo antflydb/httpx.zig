@@ -468,6 +468,7 @@ pub const Client = struct {
 
         // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
+        entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
         const addr = try Address.resolve(self.io, host, port);
@@ -491,8 +492,10 @@ pub const Client = struct {
         } else {
             // Initialize a dummy session (deinit is safe on un-handshaked session).
             entry.session = TlsSession.init(TlsConfig.init(self.allocator), self.io);
-            errdefer entry.session.deinit();
         }
+        // Session errdefer at function scope — the block-scoped errdefs above
+        // only cover the TLS handshake. This one covers everything after.
+        errdefer entry.session.deinit();
 
         entry.h2 = H2Connection.initClient(self.allocator, self.io);
         entry.h2.max_stream_data_size = self.config.max_response_size;

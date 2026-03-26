@@ -927,7 +927,7 @@ pub const Server = struct {
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
         defer h2.deinit();
-        try http.applySettingsPayload(&h2.peer_settings, settings_payload);
+        try h2.applyPeerSettings(settings_payload);
 
         // 4. Send server SETTINGS.
         try h2.sendSettings(sock);
@@ -1000,7 +1000,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed, error.Canceled => break,
+                error.ConnectionClosed => break,
                 error.RecvFailed => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
@@ -1133,7 +1133,7 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed, error.Canceled => break,
+                error.ConnectionClosed => break,
                 // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
                 // RecvFailed. Re-enter the loop so the idle check runs.
                 error.RecvFailed => continue,
@@ -1229,7 +1229,7 @@ pub const Server = struct {
                 if (h2.stream_manager.getStream(stream_id)) |s| {
                     // If HEADERS was sent but END_STREAM was not, the peer has a
                     // half-open stream. Send RST_STREAM so it doesn't wait forever.
-                    if (!s.end_stream_sent and s.state != .idle) {
+                    if (!s.end_stream_sent and s.state != .idle and s.state != .closed) {
                         h2.sendRstStream(sock, stream_id, .internal_error) catch {};
                     }
                     s.data_event = null;

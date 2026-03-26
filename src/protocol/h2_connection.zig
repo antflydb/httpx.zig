@@ -36,7 +36,7 @@ pub const Frame = struct {
     payload: []u8,
 
     pub fn deinit(self: *Frame, allocator: Allocator) void {
-        if (self.payload.len > 0) allocator.free(self.payload);
+        allocator.free(self.payload);
     }
 };
 
@@ -242,7 +242,12 @@ pub const H2Connection = struct {
                     self.continuation_buf.clearRetainingCapacity();
                     return error.HeaderBlockTooLarge;
                 }
-                try self.continuation_buf.appendSlice(self.allocator, payload);
+                self.continuation_buf.appendSlice(self.allocator, payload) catch |err| {
+                    self.continuation_stream_id = null;
+                    self.continuation_buf.clearRetainingCapacity();
+                    self.allocator.free(payload);
+                    return err;
+                };
                 self.allocator.free(payload);
 
                 if (hdr.flags & FLAG_END_HEADERS != 0) {
@@ -269,7 +274,11 @@ pub const H2Connection = struct {
                 self.continuation_stream_id = hdr.stream_id;
                 self.continuation_flags = hdr.flags;
                 self.continuation_buf.clearRetainingCapacity();
-                try self.continuation_buf.appendSlice(self.allocator, payload);
+                self.continuation_buf.appendSlice(self.allocator, payload) catch |err| {
+                    self.continuation_stream_id = null;
+                    self.allocator.free(payload);
+                    return err;
+                };
                 self.allocator.free(payload);
                 continue;
             }
@@ -1148,6 +1157,16 @@ const TestWriter = struct {
 fn testWriter(list: *std.ArrayListUnmanaged(u8), allocator: Allocator) TestWriter {
     return .{ .list = list, .allocator = allocator };
 }
+
+/// Duck-typed reader that returns a configurable error on the first read.
+/// Used to test error propagation paths in readFrame/processOneFrameLocked.
+const ErrorReader = struct {
+    err: anyerror,
+
+    pub fn read(self: *ErrorReader, _: []u8) !usize {
+        return self.err;
+    }
+};
 
 /// Duck-typed reader backed by a slice cursor.
 const TestReader = struct {
@@ -2905,4 +2924,65 @@ test "applyInitialWindowSizeChange skips closed streams" {
     try std.testing.expectEqual(@as(i32, 1000 + 4465), s1.send_window);
     // Closed stream should be unchanged (canSend() = false).
     try std.testing.expectEqual(@as(i32, 500), s3.send_window);
+}
+
+test "processOneFrameLocked propagates reader errors (not swallowed)" {
+    // Verifies that errors like Canceled from the reader are propagated
+    // through processOneFrameLocked to the caller, so the server receive
+    // loop can distinguish them from ConnectionClosed.
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // ErrorReader returns Canceled on the first read attempt.
+    var reader = ErrorReader{ .err = error.Canceled };
+    const result = conn.processOneFrameLocked(&reader, writer);
+    try std.testing.expectError(error.Canceled, result);
+}
+
+test "readFrame returns ConnectionClosed on EOF reader" {
+    const allocator = std.testing.allocator;
+
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    // TestReader with empty data returns 0 (EOF) → ConnectionClosed.
+    var reader = TestReader{ .data = &.{} };
+    try std.testing.expectError(error.ConnectionClosed, conn.readFrame(&reader));
+}
+
+test "processOneFrameLocked propagates RecvFailed distinctly" {
+    // Verifies RecvFailed is propagated separately from ConnectionClosed,
+    // allowing the server loop to distinguish timeout from disconnect.
+    const allocator = std.testing.allocator;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const writer = testWriter(&wire, allocator);
+
+    var conn = H2Connection.initServer(allocator, std.testing.io);
+    defer conn.deinit();
+
+    var reader = ErrorReader{ .err = error.RecvFailed };
+    const result = conn.processOneFrameLocked(&reader, writer);
+    try std.testing.expectError(error.RecvFailed, result);
+}
+
+test "Frame.deinit frees zero-length payload" {
+    // Regression: Frame.deinit previously skipped free for len==0 payloads,
+    // leaking allocator metadata (e.g. GPA tracking).
+    const allocator = std.testing.allocator;
+
+    const payload = try allocator.alloc(u8, 0);
+    var frame = Frame{
+        .header = .{ .length = 0, .frame_type = .data, .flags = 0, .stream_id = 0 },
+        .payload = payload,
+    };
+    // Should not leak — GPA would detect if free is skipped.
+    frame.deinit(allocator);
 }
