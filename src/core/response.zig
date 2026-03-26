@@ -317,6 +317,22 @@ test "Response serialization" {
     try std.testing.expect(mem.startsWith(u8, serialized, "HTTP/1.1 200 OK\r\n"));
 }
 
+test "Response serialization includes headers and body" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator, 200);
+    defer response.deinit();
+
+    try response.headers.set("Content-Type", "text/plain");
+    response.body = "Hello, world!";
+
+    const serialized = try response.toSlice(allocator);
+    defer allocator.free(serialized);
+
+    try std.testing.expect(mem.startsWith(u8, serialized, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(mem.indexOf(u8, serialized, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(mem.endsWith(u8, serialized, "\r\n\r\nHello, world!"));
+}
+
 test "Response redirect constructor" {
     const allocator = std.testing.allocator;
     var response = try Response.redirect(allocator, 302, "https://example.com/new");

@@ -313,6 +313,25 @@ test "Request serialization" {
     try std.testing.expect(mem.startsWith(u8, serialized, "GET /api HTTP/1.1\r\n"));
 }
 
+test "Request serialization includes headers and body" {
+    const allocator = std.testing.allocator;
+    var request = try Request.init(allocator, .POST, "/api/data");
+    defer request.deinit();
+
+    try request.headers.set("Content-Type", "application/json");
+    request.body = "{\"key\":\"value\"}";
+
+    const serialized = try request.toSlice(allocator);
+    defer allocator.free(serialized);
+
+    // Request line.
+    try std.testing.expect(mem.startsWith(u8, serialized, "POST /api/data HTTP/1.1\r\n"));
+    // Header present.
+    try std.testing.expect(mem.indexOf(u8, serialized, "Content-Type: application/json\r\n") != null);
+    // Body after blank line.
+    try std.testing.expect(mem.endsWith(u8, serialized, "\r\n\r\n{\"key\":\"value\"}"));
+}
+
 test "Request addQueryParam" {
     const allocator = std.testing.allocator;
     var request = try Request.init(allocator, .GET, "https://example.com/search");
