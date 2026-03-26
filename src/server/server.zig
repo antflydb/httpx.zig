@@ -712,16 +712,43 @@ pub const Server = struct {
         var first_request = true;
         var request_count: u32 = 0;
         var first_recv_done = true; // We already did the first recv.
+        var buffer: [8192]u8 = undefined;
+        var leftover: usize = 0;
         while (self.running) {
-
-            var buffer: [8192]u8 = undefined;
-            var leftover: usize = 0;
             parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
             // trickles bytes just fast enough to avoid per-recv timeouts.
             const active_timeout = if (first_request) self.config.request_timeout_ms else self.config.keep_alive_timeout_ms;
             const deadline_ms: i64 = if (active_timeout > 0) milliTimestamp(self.io) + @as(i64, @intCast(active_timeout)) else 0;
+
+            // Feed any leftover bytes from the previous request (pipelining)
+            // before reading from the socket.
+            if (leftover > 0) {
+                const consumed = parser.feed(buffer[0..leftover]) catch |err| switch (err) {
+                    error.BodyTooLarge => {
+                        try self.sendError(&sock, 413);
+                        return;
+                    },
+                    error.HeaderTooLarge, error.TooManyHeaders => {
+                        try self.sendError(&sock, 431);
+                        return;
+                    },
+                    error.InvalidHeader, error.InvalidChunkEncoding => {
+                        try self.sendError(&sock, 400);
+                        return;
+                    },
+                    else => return err,
+                };
+                if (consumed < leftover) {
+                    std.mem.copyForwards(u8, buffer[0 .. leftover - consumed], buffer[consumed..leftover]);
+                }
+                leftover -= consumed;
+                if (parser.isError()) {
+                    try self.sendError(&sock, 400);
+                    return;
+                }
+            }
 
             while (!parser.isComplete()) {
                 if (deadline_ms > 0 and milliTimestamp(self.io) >= deadline_ms) {
