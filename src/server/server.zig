@@ -113,6 +113,12 @@ pub const Context = struct {
     data: ?std.StringHashMap(DataEntry) = null,
     max_file_size: usize = types.default_max_body_size,
 
+    // H1 streaming field (set by the server, null for HTTP/2).
+    h1_sock: ?*Socket = null,
+    /// Set to true when a streaming response has been sent via `streamResponse()`.
+    /// When true, the connection loop skips the normal response serialization.
+    h1_stream_sent: bool = false,
+
     // H2 streaming fields (set by the server for H2 streams, null for HTTP/1.1).
     h2: ?*H2Connection = null,
     h2_sock: ?*Socket = null,
@@ -479,6 +485,128 @@ pub const Context = struct {
         self.h2_stream_sent = true;
         return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io };
     }
+
+    /// Unified streaming response writer for both HTTP/1.1 and HTTP/2.
+    /// Each `write()` sends data immediately to the client:
+    /// - HTTP/1.1: chunked transfer encoding frames
+    /// - HTTP/2: DATA frames (via H2StreamWriter)
+    /// The handler must call `close()` when done to send the terminating
+    /// chunk (HTTP/1.1) or END_STREAM (HTTP/2).
+    pub const StreamWriter = struct {
+        h1_sock: ?*Socket,
+        h2_writer: ?H2StreamWriter,
+        closed: bool = false,
+
+        /// Sends a chunk of data to the client.
+        pub fn write(self: *StreamWriter, data: []const u8) !void {
+            if (self.closed) return error.StreamClosed;
+            if (data.len == 0) return;
+
+            if (self.h2_writer) |*w| {
+                try w.write(data);
+            } else if (self.h1_sock) |sock| {
+                // Write one HTTP/1.1 chunked frame: hex-size CRLF data CRLF
+                var size_buf: [18]u8 = undefined; // max "FFFFFFFFFFFFFFFF\r\n"
+                const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{data.len}) catch unreachable;
+                try sock.sendAll(size_str);
+                try sock.sendAll(data);
+                try sock.sendAll("\r\n");
+            } else return error.StreamClosed;
+        }
+
+        /// Sends the terminating chunk / END_STREAM.
+        pub fn close(self: *StreamWriter) !void {
+            if (self.closed) return;
+            self.closed = true;
+
+            if (self.h2_writer) |*w| {
+                try w.close();
+            } else if (self.h1_sock) |sock| {
+                // Terminating chunk: "0\r\n\r\n"
+                try sock.sendAll("0\r\n\r\n");
+            }
+        }
+
+        /// Convenience: write a complete SSE event (formats `event:`, `data:`, trailing newline).
+        pub fn writeEvent(self: *StreamWriter, event_name: ?[]const u8, data: []const u8) !void {
+            // Build the SSE text in a stack buffer to send as one chunk.
+            var buf: [8192]u8 = undefined;
+            var pos: usize = 0;
+
+            if (event_name) |name| {
+                const prefix = "event: ";
+                if (pos + prefix.len + name.len + 1 > buf.len) return error.EventTooLarge;
+                @memcpy(buf[pos..][0..prefix.len], prefix);
+                pos += prefix.len;
+                @memcpy(buf[pos..][0..name.len], name);
+                pos += name.len;
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // Write data lines
+            var lines = mem.splitScalar(u8, data, '\n');
+            while (lines.next()) |line| {
+                const prefix = "data: ";
+                if (pos + prefix.len + line.len + 1 > buf.len) return error.EventTooLarge;
+                @memcpy(buf[pos..][0..prefix.len], prefix);
+                pos += prefix.len;
+                @memcpy(buf[pos..][0..line.len], line);
+                pos += line.len;
+                buf[pos] = '\n';
+                pos += 1;
+            }
+
+            // Trailing blank line to terminate the event
+            if (pos + 1 > buf.len) return error.EventTooLarge;
+            buf[pos] = '\n';
+            pos += 1;
+
+            try self.write(buf[0..pos]);
+        }
+    };
+
+    /// Sends response headers and returns a `StreamWriter` for incremental body data.
+    /// Works for both HTTP/1.1 (chunked transfer encoding) and HTTP/2 (DATA frames).
+    /// The handler must call `writer.close()` when done.
+    ///
+    /// Usage:
+    /// ```
+    /// var writer = try ctx.streamResponse(200);
+    /// try writer.writeEvent(null, "{\"token\": \"hello\"}");
+    /// try writer.writeEvent(null, "[DONE]");
+    /// try writer.close();
+    /// return ctx.response.build(); // return value is ignored for streams
+    /// ```
+    pub fn streamResponse(self: *Self, status_code: u16) !StreamWriter {
+        if (self.h2 != null) {
+            // HTTP/2 path — delegate to existing streamH2
+            const h2w = try self.streamH2(status_code, &.{
+                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+                .{ .name = "cache-control", .value = "no-cache" },
+            });
+            return .{ .h1_sock = null, .h2_writer = h2w };
+        }
+
+        // HTTP/1.1 path — send headers with Transfer-Encoding: chunked
+        const sock = self.h1_sock orelse return error.NoSocket;
+
+        // Build and send headers-only response
+        var resp = Response.init(self.allocator, status_code);
+        defer resp.deinit();
+        try resp.headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        try resp.headers.set(HeaderName.CACHE_CONTROL, "no-cache");
+        try resp.headers.set(HeaderName.CONNECTION, "keep-alive");
+        try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
+
+        // Serialize headers only (no body)
+        const header_bytes = try serializeToSlice(self.allocator, &resp);
+        defer self.allocator.free(header_bytes);
+        try sock.sendAll(header_bytes);
+
+        self.h1_stream_sent = true;
+        return .{ .h1_sock = sock, .h2_writer = null };
+    }
 };
 
 /// Handler function type.
@@ -834,6 +962,7 @@ pub const Server = struct {
 
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
+            ctx.h1_sock = &sock;
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
@@ -887,6 +1016,11 @@ pub const Server = struct {
             }
 
             defer response.deinit();
+
+            // If the handler used streamResponse(), the response was already
+            // sent directly on the socket. Close the connection (streaming
+            // responses are not keep-alive compatible).
+            if (ctx.h1_stream_sent) return;
 
             if (suppress_body) {
                 if (response.body_owned) {

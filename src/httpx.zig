@@ -213,6 +213,7 @@ pub const Handler = server_mod.Handler;
 pub const CookieOptions = server_mod.CookieOptions;
 pub const SameSite = server_mod.SameSite;
 pub const SseEvent = server_mod.SseEvent;
+pub const StreamWriter = server_mod.Context.StreamWriter;
 pub const PreRouteHook = server_mod.PreRouteHook;
 
 pub const Router = router.Router;
