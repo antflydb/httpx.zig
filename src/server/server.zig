@@ -1018,9 +1018,30 @@ pub const Server = struct {
             defer response.deinit();
 
             // If the handler used streamResponse(), the response was already
-            // sent directly on the socket. Close the connection (streaming
-            // responses are not keep-alive compatible).
-            if (ctx.h1_stream_sent) return;
+            // sent directly on the socket (chunked transfer encoding).
+            // The handler should have called writer.close() which sends the
+            // terminating "0\r\n\r\n" chunk, leaving the connection in a
+            // clean state for the next request.
+            if (ctx.h1_stream_sent) {
+                ctx.h1_stream_sent = false;
+                // Check if the client wants keep-alive
+                const stream_keep_alive = self.config.keep_alive and
+                    req.headers.isKeepAlive(req.version);
+                if (!stream_keep_alive) return;
+
+                request_count += 1;
+                if (request_count >= self.config.max_requests_per_connection) return;
+
+                if (first_request) {
+                    first_request = false;
+                    if (self.config.keep_alive_timeout_ms != self.config.request_timeout_ms and
+                        self.config.keep_alive_timeout_ms > 0)
+                    {
+                        try sock.setRecvTimeout(self.config.keep_alive_timeout_ms);
+                    }
+                }
+                continue;
+            }
 
             if (suppress_body) {
                 if (response.body_owned) {
