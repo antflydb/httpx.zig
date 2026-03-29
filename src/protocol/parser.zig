@@ -282,17 +282,11 @@ pub const Parser = struct {
             self.error_reason = .malformed_request_line;
             return lr.consumed;
         };
-        // When the request line spanned multiple feed() calls, `path` points
-        // into `line_buffer` which will be reused for header parsing below.
-        // In that case we must dupe. When the line fit in a single data slice,
-        // the path borrows from the caller's buffer and is valid until reset().
-        if (self.line_buffer.items.len > 0) {
-            self.path = try self.allocator.dupe(u8, path);
-            self.path_owned = true;
-        } else {
-            self.path = path;
-            self.path_owned = false;
-        }
+        // Always dupe the path. The caller's buffer may be reused for
+        // subsequent recv() calls during body parsing, which would corrupt
+        // a borrowed path slice.
+        self.path = try self.allocator.dupe(u8, path);
+        self.path_owned = true;
 
         const version_str = parts.next() orelse {
             self.state = .err;
