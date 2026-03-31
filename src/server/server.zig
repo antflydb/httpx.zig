@@ -474,7 +474,10 @@ pub const Context = struct {
 
         var status_buf: [3]u8 = undefined;
         const h2_headers = try H2Connection.buildResponseHeaders(
-            status_code, extra_headers, &status_buf, self.allocator,
+            status_code,
+            extra_headers,
+            &status_buf,
+            self.allocator,
         );
         defer self.allocator.free(h2_headers);
 
@@ -753,6 +756,7 @@ pub const Server = struct {
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.io);
+                if (!self.running or self.listener == null) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
