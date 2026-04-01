@@ -159,7 +159,8 @@ const TlsSessionIoReader = struct {
         const p = parent(r);
         for (bufs) |buf| {
             if (buf.len == 0) continue;
-            const n = p.inner.read(buf[0..@min(buf.len, p.max_read)]) catch |err| {
+            const inner = p.inner.getReader() catch return error.ReadFailed;
+            const n = inner.readSliceShort(buf[0..@min(buf.len, p.max_read)]) catch |err| {
                 if (err == error.EndOfStream) return error.EndOfStream;
                 return error.ReadFailed;
             };
@@ -276,6 +277,10 @@ pub const Client = struct {
             for (hdrs) |h| {
                 try req.headers.set(h[0], h[1]);
             }
+        }
+
+        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+            try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
         if (reqOpts.body) |body| {
@@ -1175,7 +1180,8 @@ pub const Client = struct {
         } else if (Source == *TlsSession) {
             const max_read = 256;
             const ready = @min(buf.len, max_read);
-            return source.read(buf[0..ready]);
+            const inner = try source.getReader();
+            return inner.readSliceShort(buf[0..ready]);
         } else {
             @compileError("recvFrom: unsupported source type " ++ @typeName(Source));
         }
@@ -1188,7 +1194,7 @@ pub const Client = struct {
             socket_reader.* = SocketIoReader.init(source, io_buf);
             return &socket_reader.reader_iface;
         } else if (Source == *TlsSession) {
-            tls_reader.* = TlsSessionIoReader.init(source, 256, io_buf);
+            tls_reader.* = TlsSessionIoReader.init(source, io_buf.len, io_buf);
             return &tls_reader.reader_iface;
         } else {
             @compileError("sourceToIoReader: unsupported source type " ++ @typeName(Source));
@@ -1279,6 +1285,40 @@ pub const Client = struct {
         // --- Read from the chain into a single output buffer ---
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(self.allocator);
+
+        if (chunked_tls_body) |body| {
+            const decoded = try decodeChunkedBody(self.allocator, body, self.config.max_response_size);
+            defer self.allocator.free(decoded);
+
+            if (container) |ctr| {
+                var compressed_reader: Io.Reader = .fixed(decoded);
+                var decompress_window: [flate.max_window_len]u8 = undefined;
+                var decompressor = flate.Decompress.init(&compressed_reader, ctr, &decompress_window);
+                var read_buf: [16 * 1024]u8 = undefined;
+
+                while (true) {
+                    const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        return error.DecompressionFailed;
+                    };
+                    if (n == 0) break;
+                    if (result.items.len + n > self.config.max_response_size) return error.ResponseTooLarge;
+                    try result.appendSlice(self.allocator, read_buf[0..n]);
+                }
+            } else {
+                try result.appendSlice(self.allocator, decoded);
+            }
+
+            if (result.items.len > 0) {
+                res.body = try result.toOwnedSlice(self.allocator);
+                res.body_owned = true;
+            }
+            if (container != null) {
+                _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+                _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
+            }
+            return res;
+        }
 
         // Pre-allocate hint: use content_length if known (and not compressed).
         if (container == null) {
@@ -1393,6 +1433,36 @@ pub const Client = struct {
 
             if (data.len < pos + chunk_len + 2) return null;
             if (!std.mem.eql(u8, data[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) return null;
+            pos += chunk_len + 2;
+        }
+    }
+
+    fn decodeChunkedBody(allocator: Allocator, data: []const u8, max_size: usize) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(allocator);
+
+        var pos: usize = 0;
+        while (true) {
+            const line_rel = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.InvalidResponse;
+            const line = data[pos .. pos + line_rel];
+            pos += line_rel + 2;
+
+            const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+            const hex = std.mem.trim(u8, line[0..hex_end], " \t");
+            const chunk_len = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidResponse;
+
+            if (chunk_len == 0) {
+                while (true) {
+                    const trailer_rel = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.InvalidResponse;
+                    pos += trailer_rel + 2;
+                    if (trailer_rel == 0) return out.toOwnedSlice(allocator);
+                }
+            }
+
+            if (data.len < pos + chunk_len + 2) return error.InvalidResponse;
+            if (!std.mem.eql(u8, data[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) return error.InvalidResponse;
+            if (out.items.len + chunk_len > max_size) return error.ResponseTooLarge;
+            try out.appendSlice(allocator, data[pos .. pos + chunk_len]);
             pos += chunk_len + 2;
         }
     }
@@ -1798,6 +1868,20 @@ test "findChunkedMessageEnd returns null for incomplete body" {
     try std.testing.expectEqual(@as(?usize, null), Client.findChunkedMessageEnd("5\r\nhello\r\n0\r\n"));
 }
 
+test "decodeChunkedBody decodes payload" {
+    const allocator = std.testing.allocator;
+    const decoded = try Client.decodeChunkedBody(allocator, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", 64);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello world", decoded);
+}
+
+test "decodeChunkedBody handles trailers" {
+    const allocator = std.testing.allocator;
+    const decoded = try Client.decodeChunkedBody(allocator, "5\r\nhello\r\n0\r\nX-Test: ok\r\n\r\n", 64);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+}
+
 test "client resolveAddress falls back to hostname lookup" {
     const addr = try resolveAddress(std.testing.io, "localhost", 443);
     switch (addr) {
@@ -2046,7 +2130,7 @@ test "HTTPS client round trip via local TLS server" {
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
+    try waitForTcpReady(io, port, 80);
 
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
@@ -2070,6 +2154,7 @@ test "HTTPS client round trip via local TLS server" {
     defer allocator.free(expected_host);
     try std.testing.expect(std.mem.startsWith(u8, request, "GET / HTTP/1.1\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, expected_host) != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "Connection: close\r\n") != null);
 }
 
 
@@ -2106,7 +2191,7 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
+    try waitForTcpReady(io, port, 80);
 
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
