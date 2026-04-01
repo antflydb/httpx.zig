@@ -34,12 +34,14 @@ const Status = @import("../core/status.zig").Status;
 const socket_mod = @import("../net/socket.zig");
 const Socket = socket_mod.Socket;
 const Address = socket_mod.Address;
+const resolveAddress = socket_mod.resolveAddress;
 const SocketIoReader = socket_mod.SocketIoReader;
 const SocketIoWriter = socket_mod.SocketIoWriter;
 const SliceIoReader = socket_mod.SliceIoReader;
 const PrefixedReader = socket_mod.PrefixedReader;
 const ContentLengthReader = socket_mod.ContentLengthReader;
 const ChunkedBodyReader = socket_mod.ChunkedBodyReader;
+const IoReaderHelpers = socket_mod.IoReaderHelpers;
 const Parser = @import("../protocol/parser.zig").Parser;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
@@ -129,6 +131,45 @@ const H2PoolEntry = struct {
     read_idle_timeout_ms: u64 = 0,
     ping_timeout_ms: u64 = 15_000,
     io: Io = undefined,
+};
+
+const TlsSessionIoReader = struct {
+    inner: *TlsSession,
+    max_read: usize,
+    reader_iface: Io.Reader,
+
+    fn init(inner: *TlsSession, max_read: usize, buffer: []u8) TlsSessionIoReader {
+        return .{
+            .inner = inner,
+            .max_read = max_read,
+            .reader_iface = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn parent(r: *Io.Reader) *TlsSessionIoReader {
+        return @fieldParentPtr("reader_iface", r);
+    }
+
+    fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        for (bufs) |buf| {
+            if (buf.len == 0) continue;
+            const n = p.inner.read(buf[0..@min(buf.len, p.max_read)]) catch |err| {
+                if (err == error.EndOfStream) return error.EndOfStream;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
+        return 0;
+    }
+
+    const vtable = IoReaderHelpers.makeVTable(readVec);
 };
 
 /// HTTP Client.
@@ -386,7 +427,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            const addr = try Address.resolve(self.io, host, port);
+            const addr = try resolveAddress(self.io, host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
@@ -404,7 +445,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        const addr = try Address.resolve(self.io, host, port);
+        const addr = try resolveAddress(self.io, host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
@@ -431,8 +472,8 @@ pub const Client = struct {
         defer self.allocator.free(bytes);
         const w = try session.getWriter();
         try w.writeAll(bytes);
-        const r = try session.getReader();
-        var res = try self.readResponse(r, req.method);
+        try session.flush();
+        var res = try self.readResponse(session, req.method);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -477,7 +518,7 @@ pub const Client = struct {
         entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        const addr = try Address.resolve(self.io, host, port);
+        const addr = try resolveAddress(self.io, host, port);
         entry.socket = try Socket.connect(addr, self.io);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
@@ -1060,7 +1101,7 @@ pub const Client = struct {
     }
 
     /// Unified response reader parameterized on the read source.
-    /// `ReadSource` is either `*Socket` (TCP) or `*std.Io.Reader` (TLS/Io).
+    /// `ReadSource` is either `*Socket` (TCP) or `*TlsSession` (HTTPS).
     ///
     /// Streaming pipeline: parse headers only → build Io.Reader chain
     /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
@@ -1089,7 +1130,13 @@ pub const Client = struct {
                 }
 
                 if (leftover >= buf.len) return error.InvalidResponse;
-                const n = recvFrom(source, buf[leftover..]) catch |err| return err;
+                const n = recvFrom(source, buf[leftover..]) catch |err| {
+                    const Source = @TypeOf(source);
+                    if (Source == *TlsSession and err == error.ReadFailed) {
+                        continue;
+                    }
+                    return err;
+                };
                 if (n == 0) break;
                 total_read += n;
                 if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
@@ -1120,30 +1167,29 @@ pub const Client = struct {
         return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method);
     }
 
-    /// Read bytes from either a Socket or an Io.Reader into `buf`.
+    /// Read bytes from either a Socket or a TlsSession into `buf`.
     fn recvFrom(source: anytype, buf: []u8) !usize {
         const Source = @TypeOf(source);
         if (Source == *Socket) {
             return source.recv(buf);
-        } else if (Source == *std.Io.Reader) {
-            var iov = [_][]u8{buf};
-            return source.readVec(&iov) catch |err| switch (err) {
-                error.EndOfStream => @as(usize, 0),
-                else => err,
-            };
+        } else if (Source == *TlsSession) {
+            const max_read = 256;
+            const ready = @min(buf.len, max_read);
+            return source.read(buf[0..ready]);
         } else {
             @compileError("recvFrom: unsupported source type " ++ @typeName(Source));
         }
     }
 
-    /// Wraps `source` (Socket or Io.Reader) into a uniform `Io.Reader` for the reader chain.
-    fn sourceToIoReader(source: anytype, socket_reader: *SocketIoReader, io_buf: []u8) *Io.Reader {
+    /// Wraps `source` (Socket or TlsSession) into a uniform `Io.Reader` for the reader chain.
+    fn sourceToIoReader(source: anytype, socket_reader: *SocketIoReader, tls_reader: *TlsSessionIoReader, io_buf: []u8) *Io.Reader {
         const Source = @TypeOf(source);
         if (Source == *Socket) {
             socket_reader.* = SocketIoReader.init(source, io_buf);
             return &socket_reader.reader_iface;
-        } else if (Source == *std.Io.Reader) {
-            return source;
+        } else if (Source == *TlsSession) {
+            tls_reader.* = TlsSessionIoReader.init(source, 256, io_buf);
+            return &tls_reader.reader_iface;
         } else {
             @compileError("sourceToIoReader: unsupported source type " ++ @typeName(Source));
         }
@@ -1155,6 +1201,7 @@ pub const Client = struct {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
+        const Source = @TypeOf(source);
 
         // Move headers ownership from parser to response.
         res.headers.deinit();
@@ -1179,14 +1226,35 @@ pub const Client = struct {
         // --- Build the Io.Reader chain (all stack-allocated) ---
 
         // Layer 0: Wrap the raw source (Socket or TLS Io.Reader) into an Io.Reader.
+        const chunked_tls_body = if (Source == *TlsSession and parser.chunked)
+            try self.readChunkedTlsBody(source, leftover)
+        else
+            null;
+        defer if (chunked_tls_body) |body| self.allocator.free(body);
+
         var source_io_buf: [8192]u8 = undefined;
         var socket_reader: SocketIoReader = undefined;
-        const raw_reader = sourceToIoReader(source, &socket_reader, &source_io_buf);
+        var tls_reader: TlsSessionIoReader = undefined;
+        var raw_reader: *Io.Reader = undefined;
+        if (chunked_tls_body == null) {
+            raw_reader = sourceToIoReader(source, &socket_reader, &tls_reader, &source_io_buf);
+        }
+
+        var chunked_tls_source_buf: [8192]u8 = undefined;
+        var chunked_tls_source: SliceIoReader = undefined;
+        if (chunked_tls_body) |body| {
+            chunked_tls_source = SliceIoReader.init(body, &chunked_tls_source_buf);
+        }
 
         // Layer 1: Prepend any leftover bytes from header parsing.
         var prefix_buf: [8192]u8 = undefined;
-        var prefixed = PrefixedReader.init(leftover, raw_reader, &prefix_buf);
-        const body_source: *Io.Reader = if (leftover.len > 0) &prefixed.reader_iface else raw_reader;
+        var prefixed = if (chunked_tls_body == null) PrefixedReader.init(leftover, raw_reader, &prefix_buf) else undefined;
+        const body_source: *Io.Reader = if (chunked_tls_body != null)
+            &chunked_tls_source.reader_iface
+        else if (leftover.len > 0)
+            &prefixed.reader_iface
+        else
+            raw_reader;
 
         // Layer 2: Apply transfer framing (Content-Length limit or chunked decode).
         var cl_buf: [8192]u8 = undefined;
@@ -1206,14 +1274,7 @@ pub const Client = struct {
             break :blk body_source;
         };
 
-        // Layer 3: Optional decompression.
-        var decompress_window: [flate.max_window_len]u8 = undefined;
-        var decompressor: flate.Decompress = undefined;
-
-        const final_reader: *Io.Reader = if (container) |ctr| blk: {
-            decompressor = flate.Decompress.init(framed_reader, ctr, &decompress_window);
-            break :blk &decompressor.reader;
-        } else framed_reader;
+        const close_delimited_body = !parser.chunked and parser.content_length == null;
 
         // --- Read from the chain into a single output buffer ---
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -1230,15 +1291,46 @@ pub const Client = struct {
 
         const max_size = self.config.max_response_size;
         var read_buf: [16 * 1024]u8 = undefined;
-        while (true) {
-            var iov = [_][]u8{read_buf[0..]};
-            const n = final_reader.vtable.readVec(final_reader, &iov) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return if (container != null) error.DecompressionFailed else error.InvalidResponse,
-            };
-            if (n == 0) break;
-            if (result.items.len + n > max_size) return error.ResponseTooLarge;
-            try result.appendSlice(self.allocator, read_buf[0..n]);
+
+        if (container) |ctr| {
+            var compressed = std.ArrayListUnmanaged(u8).empty;
+            defer compressed.deinit(self.allocator);
+
+            while (true) {
+                const n = framed_reader.readSliceShort(&read_buf) catch |err| {
+                    if (err == error.EndOfStream) break;
+                    if (err == error.ReadFailed and close_delimited_body) break;
+                    return error.InvalidResponse;
+                };
+                if (n == 0) break;
+                if (compressed.items.len + n > max_size) return error.ResponseTooLarge;
+                try compressed.appendSlice(self.allocator, read_buf[0..n]);
+            }
+
+            var compressed_reader: Io.Reader = .fixed(compressed.items);
+            var decompress_window: [flate.max_window_len]u8 = undefined;
+            var decompressor = flate.Decompress.init(&compressed_reader, ctr, &decompress_window);
+
+            while (true) {
+                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                    if (err == error.EndOfStream) break;
+                    return error.DecompressionFailed;
+                };
+                if (n == 0) break;
+                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                try result.appendSlice(self.allocator, read_buf[0..n]);
+            }
+        } else {
+            while (true) {
+                const n = framed_reader.readSliceShort(&read_buf) catch |err| {
+                    if (err == error.EndOfStream) break;
+                    if (err == error.ReadFailed and close_delimited_body) break;
+                    return error.InvalidResponse;
+                };
+                if (n == 0) break;
+                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                try result.appendSlice(self.allocator, read_buf[0..n]);
+            }
         }
 
         if (result.items.len > 0) {
@@ -1253,6 +1345,56 @@ pub const Client = struct {
         }
 
         return res;
+    }
+
+    fn readChunkedTlsBody(self: *Self, source: *TlsSession, leftover: []const u8) !?[]u8 {
+        var framed = std.ArrayListUnmanaged(u8).empty;
+        defer framed.deinit(self.allocator);
+
+        if (leftover.len > 0) {
+            try framed.appendSlice(self.allocator, leftover);
+            if (framed.items.len > self.config.max_response_size) return error.ResponseTooLarge;
+        }
+
+        while (true) {
+            if (findChunkedMessageEnd(framed.items)) |end| {
+                return try self.allocator.dupe(u8, framed.items[0..end]);
+            }
+
+            var read_buf: [2048]u8 = undefined;
+            const n = recvFrom(source, &read_buf) catch |err| {
+                if (err == error.ReadFailed) continue;
+                return error.InvalidResponse;
+            };
+            if (n == 0) return error.InvalidResponse;
+            if (framed.items.len + n > self.config.max_response_size) return error.ResponseTooLarge;
+            try framed.appendSlice(self.allocator, read_buf[0..n]);
+        }
+    }
+
+    fn findChunkedMessageEnd(data: []const u8) ?usize {
+        var pos: usize = 0;
+        while (true) {
+            const line_rel = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return null;
+            const line = data[pos .. pos + line_rel];
+            pos += line_rel + 2;
+
+            const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+            const hex = std.mem.trim(u8, line[0..hex_end], " \t");
+            const chunk_len = std.fmt.parseInt(usize, hex, 16) catch return null;
+
+            if (chunk_len == 0) {
+                while (true) {
+                    const trailer_rel = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return null;
+                    if (trailer_rel == 0) return pos + 2;
+                    pos += trailer_rel + 2;
+                }
+            }
+
+            if (data.len < pos + chunk_len + 2) return null;
+            if (!std.mem.eql(u8, data[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) return null;
+            pos += chunk_len + 2;
+        }
     }
 
     fn resolveRedirectUrl(self: *Self, base: Uri, location: []const u8) ![]u8 {
@@ -1642,6 +1784,28 @@ test "SliceIoReader reads slice data" {
     try std.testing.expectError(error.EndOfStream, reader.reader_iface.readVec(&iov2));
 }
 
+test "findChunkedMessageEnd finds terminal chunk" {
+    const body = "5\r\nhello\r\n0\r\n\r\nextra";
+    try std.testing.expectEqual(@as(?usize, 15), Client.findChunkedMessageEnd(body));
+}
+
+test "findChunkedMessageEnd handles trailers" {
+    const body = "5\r\nhello\r\n0\r\nX-Test: ok\r\n\r\n";
+    try std.testing.expectEqual(@as(?usize, body.len), Client.findChunkedMessageEnd(body));
+}
+
+test "findChunkedMessageEnd returns null for incomplete body" {
+    try std.testing.expectEqual(@as(?usize, null), Client.findChunkedMessageEnd("5\r\nhello\r\n0\r\n"));
+}
+
+test "client resolveAddress falls back to hostname lookup" {
+    const addr = try resolveAddress(std.testing.io, "localhost", 443);
+    switch (addr) {
+        .ip4 => |ip4| try std.testing.expectEqual(@as(u16, 443), ip4.port),
+        .ip6 => |ip6| try std.testing.expectEqual(@as(u16, 443), ip6.port),
+    }
+}
+
 test "H2StreamReader reads pre-buffered data and returns EOF" {
     const allocator = std.testing.allocator;
 
@@ -1691,6 +1855,274 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     // Verify stream was removed.
     try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
+}
+
+const test_tls_cert_pem =
+    "-----BEGIN CERTIFICATE-----\n" ++
+    "MIIDCTCCAfGgAwIBAgIUGjCWCIDqTRw/vKwQVR5QhFvTtqswDQYJKoZIhvcNAQEL\n" ++
+    "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMTA1MzAzNFoXDTI2MDQw\n" ++
+    "MjA1MzAzNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n" ++
+    "AAOCAQ8AMIIBCgKCAQEAlcbhuVCGNinrY/u0i9CraIMPPbUUuidxw6oDcxU2dBmf\n" ++
+    "5dZgbMWIOM6ugs2bg0dVLld/epE3AKbK1O2wzmPtziyE+i+aUze1EddHgOm91bDc\n" ++
+    "jRE/Poy74X0Nh9kpqdG5JTgqrGU8HFWgVAZJ72cQTTHQrLG4V4cZUaklga2b3EWx\n" ++
+    "AtKuhn25aG3c5NO9gdZRJCs9YZ/q7WKX1xI0uwnJXrS54/e7uLgE2HnQZADXujCd\n" ++
+    "62fTUaa6NJBjqpYcrmsRT5RU0ZymJQB6megB8GiyAWAtvb0qP9LIyYDo0krW4Q6y\n" ++
+    "d4hKFktK6x2yMhsYb71085OiH5I1lvcPMimG3kEdQQIDAQABo1MwUTAdBgNVHQ4E\n" ++
+    "FgQU1ju/opd9LtCdJJgvwJIFyrUGCxwwHwYDVR0jBBgwFoAU1ju/opd9LtCdJJgv\n" ++
+    "wJIFyrUGCxwwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAeNEq\n" ++
+    "DCRtgQY3DXmIv4DBb6hef/5pULMwmb0Rsv5cQfExE0TLYT+m5jTPUbl34kyvFDew\n" ++
+    "IAL+6IQf1Wug8ohRPZPxtNFhf8LT+Z2DjfmX1+rMNRNKGeENbj7kDhOE0U7On+iH\n" ++
+    "mFtDm068CNlMtUO39BF8dYNFZLyTNPZagmoS+InUSVNwVKGop4TKeN1oHkiMBf9u\n" ++
+    "ZSLs84DHU59GbIgSJWBi5MihRgbpauZs/VhvfciLU9KlcwLY1XgbImFggSJdcyqm\n" ++
+    "7PlORVQMy2bnuImpzdGywVdMjH9ka7wuEuoXQOSAhMJvycfuY4jls7+abBrhlV/l\n" ++
+    "36+7YT0LzE5Z9pLwyA==\n" ++
+    "-----END CERTIFICATE-----\n";
+
+const test_tls_key_pem =
+    "-----BEGIN PRIVATE KEY-----\n" ++
+    "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCVxuG5UIY2Ketj\n" ++
+    "+7SL0Ktogw89tRS6J3HDqgNzFTZ0GZ/l1mBsxYg4zq6CzZuDR1UuV396kTcApsrU\n" ++
+    "7bDOY+3OLIT6L5pTN7UR10eA6b3VsNyNET8+jLvhfQ2H2Smp0bklOCqsZTwcVaBU\n" ++
+    "BknvZxBNMdCssbhXhxlRqSWBrZvcRbEC0q6Gfblobdzk072B1lEkKz1hn+rtYpfX\n" ++
+    "EjS7CcletLnj97u4uATYedBkANe6MJ3rZ9NRpro0kGOqlhyuaxFPlFTRnKYlAHqZ\n" ++
+    "6AHwaLIBYC29vSo/0sjJgOjSStbhDrJ3iEoWS0rrHbIyGxhvvXTzk6IfkjWW9w8y\n" ++
+    "KYbeQR1BAgMBAAECggEAQsS7uJBwnDG4yUQamt+FohwWzcPtPwU5fmfKjOGOelg4\n" ++
+    "A047gxHV5bkha5c79dx1WSjRX/Lfaa9xKVXipUc/6lLHXv6cle92DUOCkTHiGiJz\n" ++
+    "V4GyR3CWivFj+ETzgUxIdJKi12Jz1w/G3t5E1HAGANutsmaxjndf7prwaOxbWGic\n" ++
+    "RCPwL5T/UTen6KknrMWASJSJFVhrjszvsbz6lea/EF9OrmmKSu8/NaQH+fOF5xix\n" ++
+    "pdRVCzkiFq9ox1R59k30hjMx2VJRRN53ErauMxWzogJVB7vrCxgdw3qxAr35tKTv\n" ++
+    "YRQBeCRDu0nDw05DBo+fMGN8Fe0f3tke7XiKk0sgvwKBgQDL2UMX74KIMjlSFvBE\n" ++
+    "6kgO3AJGwItxHnyUcpkUTpYyxGmZ8ZUAw8SG1CBBgBz9161gytTlyQcw0M779xUe\n" ++
+    "RXDaclhk8x1PDjnrjlX1WltOPc6f/Qafk1XvzHP5UGI65E2rGXRIrpejF/eiecoM\n" ++
+    "SD8TV9FuzBq3R8Te8XbeaCYsLwKBgQC8GEZukAft6x/OAVh6UIIOgzHCbYaklau7\n" ++
+    "7bj9NVQKEJRGABRYA/73J579r/stl3cybrRm0IfmzJk2QcBp/AaKTJF0MyiyMfRq\n" ++
+    "7LqQLtlJQFDYzqH4KAhjCBiUu7OeZV0SF7ds2EesH1EF+tmOHK8SeFbTTIQriy38\n" ++
+    "BfD/jZHBjwKBgGNYH6WTmRbM+zhxa2j6kGGFgSp//bUEOYyTCN1nqzVUmW5n2MkF\n" ++
+    "n0piKNIjIH3pVVqdnwHZZcK5kJYlBUq6ZtRe84tHHBqCAWI1/NhUz7ii0IcR5d9x\n" ++
+    "C2mRR1fSf/zZdKyU/CHLzKS0MoAhQIGZ1/uSScPofoCh3mUUYmzjbu8LAoGAXv+z\n" ++
+    "suuz1YpHSfiMA1reFQ5V92jx8/ZUAlqSb/CbPWoaOTCZFcsO3y13s5FKP0Ccxy/6\n" ++
+    "lWMFAKCdUTXsRJsxgnAhlpqwFy/7znU51NCUldaR/q5+R6OQeNQB9jzG/10aoKSx\n" ++
+    "05t4t4opleeYMZpzIdT9pUKkDooA86Tcj3WlBCkCgYAOJKlKAjp2ZwHQ/ktkX1hK\n" ++
+    "tHbXZMXM40RjrujdimrIJxK87o73jp1s6cIuuHpNCVN15rI30Eb0WGy7ER2J2q2T\n" ++
+    "Bk1Pw3B3fAHZpbU7U8YgKW1KTNU7zpOwZjPCTBh2f4jhwwN0Zk4iltu8D2y2KvsC\n" ++
+    "xm8hZP/ZhT5VKqRD/ot8fw==\n" ++
+    "-----END PRIVATE KEY-----\n";
+
+const python_tls_server_script =
+    "import pathlib\n" ++
+    "import socket\n" ++
+    "import ssl\n" ++
+    "import time\n" ++
+    "import sys\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "cert = sys.argv[2]\n" ++
+    "key = sys.argv[3]\n" ++
+    "request_out = pathlib.Path(sys.argv[4])\n" ++
+    "\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(1)\n" ++
+    "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n" ++
+    "ctx.load_cert_chain(certfile=cert, keyfile=key)\n" ++
+    "while True:\n" ++
+    "    conn, _ = listener.accept()\n" ++
+    "    with conn:\n" ++
+    "        try:\n" ++
+    "            with ctx.wrap_socket(conn, server_side=True) as tls_conn:\n" ++
+    "                data = b''\n" ++
+    "                while b'\\r\\n\\r\\n' not in data:\n" ++
+    "                    chunk = tls_conn.recv(4096)\n" ++
+    "                    if not chunk:\n" ++
+    "                        break\n" ++
+    "                    data += chunk\n" ++
+    "                if not data:\n" ++
+    "                    continue\n" ++
+    "                request_out.write_bytes(data)\n" ++
+    "                tls_conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok')\n" ++
+    "                break\n" ++
+    "        except ssl.SSLError:\n" ++
+    "            continue\n" ++
+    "listener.close()\n";
+
+const python_tls_chunked_gzip_server_script =
+    "import gzip\n" ++
+    "import socket\n" ++
+    "import ssl\n" ++
+    "import time\n" ++
+    "import sys\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "cert = sys.argv[2]\n" ++
+    "key = sys.argv[3]\n" ++
+    "payload = gzip.compress(b'{\"ok\":true}\\n')\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(1)\n" ++
+    "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n" ++
+    "ctx.load_cert_chain(certfile=cert, keyfile=key)\n" ++
+    "while True:\n" ++
+    "    conn, _ = listener.accept()\n" ++
+    "    with conn:\n" ++
+    "        try:\n" ++
+    "            with ctx.wrap_socket(conn, server_side=True) as tls_conn:\n" ++
+    "                data = b''\n" ++
+    "                while b'\\r\\n\\r\\n' not in data:\n" ++
+    "                    chunk = tls_conn.recv(4096)\n" ++
+    "                    if not chunk:\n" ++
+    "                        break\n" ++
+    "                    data += chunk\n" ++
+    "                if not data:\n" ++
+    "                    continue\n" ++
+    "                tls_conn.sendall(\n" ++
+    "                    b'HTTP/1.1 200 OK\\r\\n'\n" ++
+    "                    b'Content-Type: application/json\\r\\n'\n" ++
+    "                    b'Transfer-Encoding: chunked\\r\\n'\n" ++
+    "                    b'Content-Encoding: gzip\\r\\n'\n" ++
+    "                    b'Connection: close\\r\\n\\r\\n'\n" ++
+    "                    + format(len(payload), 'x').encode() + b'\\r\\n' + payload + b'\\r\\n0\\r\\n\\r\\n'\n" ++
+    "                )\n" ++
+    "                time.sleep(5)\n" ++
+    "                break\n" ++
+    "        except ssl.SSLError:\n" ++
+    "            continue\n" ++
+    "listener.close()\n";
+
+fn reserveEphemeralPort(io: Io) !u16 {
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try socket_mod.TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    return listener.getLocalAddress().ip4.port;
+}
+
+fn waitForTcpReady(io: Io, port: u16, max_attempts: usize) !void {
+    const addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        if (Socket.connect(addr, io)) |sock| {
+            var s = sock;
+            s.close();
+            return;
+        } else |_| {
+            io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
+        }
+    }
+    return error.Timeout;
+}
+
+test "HTTPS client round trip via local TLS server" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_server_script });
+
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{
+            "python3",
+            "server.py",
+            port_arg,
+            "cert.pem",
+            "key.pem",
+            "request.bin",
+        },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+
+    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .verify_ssl = false,
+        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+    });
+    defer client.deinit();
+
+    var resp = try client.get(url, .{});
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("ok", resp.body orelse "");
+
+    const request = try tmp.dir.readFileAlloc(io, "request.bin", allocator, .limited(4096));
+    defer allocator.free(request);
+    const expected_host = try std.fmt.allocPrint(allocator, "Host: 127.0.0.1:{d}\r\n", .{port});
+    defer allocator.free(expected_host);
+    try std.testing.expect(std.mem.startsWith(u8, request, "GET / HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, request, expected_host) != null);
+}
+
+
+test "HTTPS client handles chunked gzip body via local TLS server" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_chunked_gzip_server_script });
+
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{
+            "python3",
+            "server.py",
+            port_arg,
+            "cert.pem",
+            "key.pem",
+        },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+
+    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .verify_ssl = false,
+        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+    });
+    defer client.deinit();
+
+    var resp = try client.get(url, .{});
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", resp.body orelse "");
 }
 
 // Tests for decompressBody and responseFromParser were removed — these methods

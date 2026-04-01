@@ -15,8 +15,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const Socket = @import("../net/socket.zig").Socket;
-const Address = @import("../net/socket.zig").Address;
+const socket_mod = @import("../net/socket.zig");
+const Socket = socket_mod.Socket;
+const Address = socket_mod.Address;
+const resolveAddress = socket_mod.resolveAddress;
 const TlsConfig = @import("../tls/tls.zig").TlsConfig;
 const TlsSession = @import("../tls/tls.zig").TlsSession;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
@@ -96,7 +98,7 @@ pub const Connection = struct {
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);
 
-        const addr = try Address.resolve(io, host, port);
+        const addr = try resolveAddress(io, host, port);
         var socket = try Socket.connect(addr, io);
         errdefer socket.close();
         socket.setKeepAlive(true) catch {};
@@ -166,7 +168,7 @@ pub const TlsConnection = struct {
         errdefer allocator.destroy(entry);
 
         // Resolve and connect the TCP socket.
-        const addr = try Address.resolve(io, host, port);
+        const addr = try resolveAddress(io, host, port);
         entry.socket = try Socket.connect(addr, io);
         errdefer entry.socket.close();
 
@@ -558,6 +560,14 @@ test "ConnectionPool initialization" {
     defer pool_inst.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pool_inst.totalCount());
+}
+
+test "pool resolveAddress falls back to hostname lookup" {
+    const addr = try resolveAddress(std.testing.io, "localhost", 8080);
+    switch (addr) {
+        .ip4 => |ip4| try std.testing.expectEqual(@as(u16, 8080), ip4.port),
+        .ip6 => |ip6| try std.testing.expectEqual(@as(u16, 8080), ip6.port),
+    }
 }
 
 test "ConnectionPool config" {

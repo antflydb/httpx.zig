@@ -19,6 +19,41 @@ const is_windows = builtin.os.tag == .windows;
 /// Network address type (std.Io.net.IpAddress).
 pub const Address = net.IpAddress;
 
+const HostName = net.HostName;
+
+/// Resolves a host string to an address, trying IP literal parsing first
+/// and falling back to DNS lookup.
+pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
+    if (Address.resolve(io, host, port)) |addr| return addr else |_| {}
+
+    const host_name = try HostName.init(host);
+    var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+    var lookup_buffer: [32]HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(HostName.LookupResult) = .init(&lookup_buffer);
+    try HostName.lookup(host_name, io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    });
+    while (true) {
+        const result = lookup_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            else => return err,
+        };
+        switch (result) {
+            .address => |address| return address,
+            .canonical_name => {},
+        }
+    }
+    return error.UnknownHostName;
+}
+
+fn firstNonEmptyBuffer(bufs: [][]u8) ?struct { index: usize, buf: []u8 } {
+    for (bufs, 0..) |buf, i| {
+        if (buf.len != 0) return .{ .index = i, .buf = buf };
+    }
+    return null;
+}
+
 /// TCP socket abstraction backed by std.Io.net.
 pub const Socket = struct {
     handle: net.Socket.Handle,
@@ -68,6 +103,13 @@ pub const Socket = struct {
 
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
+        if (buffer.len == 0) return 0;
+        if (!is_windows) {
+            return posix.read(self.handle, buffer) catch |err| switch (err) {
+                error.WouldBlock => return error.Timeout,
+                else => return error.RecvFailed,
+            };
+        }
         var bufs = [_][]u8{buffer};
         return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
     }
@@ -228,10 +270,22 @@ pub const SocketIoReader = struct {
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
-        if (bufs.len == 0) return 0;
-        const buf = bufs[0];
-        const n = p.socket.recv(buf) catch return error.ReadFailed;
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
+        const dest = iovecs_buffer[0..dest_n];
+        if (dest.len == 0 or dest[0].len == 0) return 0;
+        const n = if (is_windows)
+            p.socket.io.vtable.netRead(p.socket.io.userdata, p.socket.handle, dest) catch return error.ReadFailed
+        else
+            posix.read(p.socket.handle, dest[0]) catch |err| switch (err) {
+                error.WouldBlock => return error.ReadFailed,
+                else => return error.ReadFailed,
+            };
         if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            r.end += n - data_size;
+            return data_size;
+        }
         return n;
     }
 
@@ -265,8 +319,8 @@ pub const SliceIoReader = struct {
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
-        if (bufs.len == 0) return 0;
-        const buf = bufs[0];
+        const entry = firstNonEmptyBuffer(bufs) orelse return 0;
+        const buf = entry.buf;
         const remaining = p.data[p.pos..];
         if (remaining.len == 0) return error.EndOfStream;
         const n = @min(buf.len, remaining.len);
@@ -300,14 +354,16 @@ pub const SocketIoWriter = struct {
         return @fieldParentPtr("writer_iface", w);
     }
 
-    fn drain(w: *Io.Writer, bufs: []const []const u8, start_index: usize) Io.Writer.Error!usize {
+    fn drain(w: *Io.Writer, bufs: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const p = parent(w);
-        var i: usize = start_index;
-        while (i < bufs.len and bufs[i].len == 0) : (i += 1) {}
-        if (i >= bufs.len) return 0;
-
-        const n = p.socket.send(bufs[i]) catch return error.WriteFailed;
-        return n;
+        if (bufs.len == 0) {
+            const buffered = w.buffered();
+            if (buffered.len == 0) return 0;
+            p.socket.sendAll(buffered) catch return error.WriteFailed;
+            return w.consumeAll();
+        }
+        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch return error.WriteFailed;
+        return w.consume(n);
     }
 
     fn sendFile(w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
@@ -330,9 +386,30 @@ pub const SocketIoWriter = struct {
         return total;
     }
 
-    fn flush(_: *Io.Writer) Io.Writer.Error!void {}
+    fn flush(w: *Io.Writer) Io.Writer.Error!void {
+        const p = parent(w);
+        while (w.end != 0) {
+            const buffered = w.buffered();
+            p.socket.sendAll(buffered) catch return error.WriteFailed;
+            _ = w.consumeAll();
+        }
+    }
 
-    fn rebase(_: *Io.Writer, _: usize, _: usize) Io.Writer.Error!void {}
+    fn rebase(w: *Io.Writer, preserve: usize, capacity: usize) Io.Writer.Error!void {
+        if (w.buffer.len - w.end >= capacity) return;
+
+        const preserved_len = @min(preserve, w.end);
+        const to_flush = w.end - preserved_len;
+        if (to_flush > 0) {
+            const p = parent(w);
+            p.socket.sendAll(w.buffer[0..to_flush]) catch return error.WriteFailed;
+        }
+        if (preserved_len > 0 and to_flush > 0) {
+            @memmove(w.buffer[0..preserved_len], w.buffer[to_flush..][0..preserved_len]);
+        }
+        w.end = preserved_len;
+        if (w.buffer.len - w.end < capacity) return error.WriteFailed;
+    }
 
     const vtable: Io.Writer.VTable = .{
         .drain = drain,
@@ -370,8 +447,8 @@ pub const PrefixedReader = struct {
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
-        if (bufs.len == 0) return 0;
-        const buf = bufs[0];
+        const entry = firstNonEmptyBuffer(bufs) orelse return 0;
+        const buf = entry.buf;
 
         // Drain prefix first.
         const remaining = p.prefix[p.prefix_pos..];
@@ -418,13 +495,13 @@ pub const ContentLengthReader = struct {
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
         if (p.remaining == 0) return error.EndOfStream;
-        if (bufs.len == 0) return 0;
+        const entry = firstNonEmptyBuffer(bufs) orelse return 0;
 
         // Clamp the caller's buffer to our remaining byte budget.
-        const orig_buf = bufs[0];
+        const orig_buf = bufs[entry.index];
         const clamped_len = @min(orig_buf.len, p.remaining);
-        bufs[0] = orig_buf[0..clamped_len];
-        defer bufs[0] = orig_buf; // restore original slice for caller
+        bufs[entry.index] = orig_buf[0..clamped_len];
+        defer bufs[entry.index] = orig_buf; // restore original slice for caller
 
         const n = p.inner.vtable.readVec(p.inner, bufs) catch |err| return err;
         p.remaining -= n;
@@ -518,7 +595,7 @@ pub const ChunkedBodyReader = struct {
 
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
-        if (bufs.len == 0) return 0;
+        const entry = firstNonEmptyBuffer(bufs) orelse return 0;
 
         while (true) {
             switch (p.state) {
@@ -573,7 +650,7 @@ pub const ChunkedBodyReader = struct {
                     // First drain any read-ahead bytes that belong to this chunk.
                     const ahead_avail = p.aheadAvailable();
                     if (ahead_avail > 0) {
-                        const orig_buf = bufs[0];
+                        const orig_buf = bufs[entry.index];
                         const n = @min(@min(orig_buf.len, p.chunk_remaining), ahead_avail);
                         @memcpy(orig_buf[0..n], p.ahead_buf[p.ahead_start..][0..n]);
                         p.ahead_start += n;
@@ -585,10 +662,10 @@ pub const ChunkedBodyReader = struct {
                     }
 
                     // Read-ahead empty — read directly from inner reader.
-                    const orig_buf = bufs[0];
+                    const orig_buf = bufs[entry.index];
                     const clamped_len = @min(orig_buf.len, p.chunk_remaining);
-                    bufs[0] = orig_buf[0..clamped_len];
-                    defer bufs[0] = orig_buf;
+                    bufs[entry.index] = orig_buf[0..clamped_len];
+                    defer bufs[entry.index] = orig_buf;
 
                     const n = p.inner.vtable.readVec(p.inner, bufs) catch |err| return err;
                     p.chunk_remaining -= n;
@@ -812,4 +889,103 @@ test "UdpSocket send/recv localhost" {
     var buf: [32]u8 = undefined;
     const got = try recv_sock.recvFrom(&buf);
     try std.testing.expectEqualStrings(msg, buf[0..got.n]);
+}
+
+test "SocketIoWriter flush sends buffered bytes" {
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
+    var client = try Socket.connect(bound_addr, io);
+    defer client.close();
+
+    var write_buf: [64]u8 = undefined;
+    var writer = SocketIoWriter.init(&client, &write_buf);
+    try writer.writer_iface.writeAll("hello");
+    try writer.writer_iface.flush();
+
+    var result = try listener.accept();
+    defer result.socket.close();
+
+    var recv_buf: [16]u8 = undefined;
+    const got = try result.socket.recv(&recv_buf);
+    try std.testing.expectEqualStrings("hello", recv_buf[0..got]);
+}
+
+test "Socket recv timeout returns error.Timeout" {
+    if (is_windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+    const bound_addr = listener.getLocalAddress();
+
+    var client = try Socket.connect(bound_addr, io);
+    defer client.close();
+
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+
+    try accepted.socket.setRecvTimeout(50);
+
+    var recv_buf: [8]u8 = undefined;
+    try std.testing.expectError(error.Timeout, accepted.socket.recv(&recv_buf));
+}
+
+test "SliceIoReader skips leading empty buffers" {
+    const data = "hello";
+    var read_buf: [32]u8 = undefined;
+    var reader = SliceIoReader.init(data, &read_buf);
+
+    var empty: [0]u8 = .{};
+    var out: [8]u8 = undefined;
+    var iov = [_][]u8{ empty[0..], out[0..] };
+    const got = try reader.reader_iface.readVec(&iov);
+    try std.testing.expectEqual(@as(usize, data.len), got);
+    try std.testing.expectEqualStrings(data, out[0..got]);
+}
+
+test "PrefixedReader skips leading empty buffers" {
+    var inner_buf: [32]u8 = undefined;
+    var inner = SliceIoReader.init("world", &inner_buf);
+    var prefixed_buf: [32]u8 = undefined;
+    var prefixed = PrefixedReader.init("hello", &inner.reader_iface, &prefixed_buf);
+
+    var empty: [0]u8 = .{};
+    var out: [8]u8 = undefined;
+    var iov = [_][]u8{ empty[0..], out[0..] };
+    const got = try prefixed.reader_iface.readVec(&iov);
+    try std.testing.expectEqual(@as(usize, 5), got);
+    try std.testing.expectEqualStrings("hello", out[0..got]);
+}
+
+test "ContentLengthReader skips leading empty buffers" {
+    var inner_buf: [32]u8 = undefined;
+    var inner = SliceIoReader.init("abcdef", &inner_buf);
+    var cl_buf: [32]u8 = undefined;
+    var limited = ContentLengthReader.init(&inner.reader_iface, 3, &cl_buf);
+
+    var empty: [0]u8 = .{};
+    var out: [8]u8 = undefined;
+    var iov = [_][]u8{ empty[0..], out[0..] };
+    const got = try limited.reader_iface.readVec(&iov);
+    try std.testing.expectEqual(@as(usize, 3), got);
+    try std.testing.expectEqualStrings("abc", out[0..got]);
+}
+
+test "ChunkedBodyReader skips leading empty buffers" {
+    var inner_buf: [64]u8 = undefined;
+    var inner = SliceIoReader.init("5\r\nhello\r\n0\r\n\r\n", &inner_buf);
+    var chunked_buf: [64]u8 = undefined;
+    var chunked = ChunkedBodyReader.init(&inner.reader_iface, &chunked_buf);
+
+    var empty: [0]u8 = .{};
+    var out: [8]u8 = undefined;
+    var iov = [_][]u8{ empty[0..], out[0..] };
+    const got = try chunked.reader_iface.readVec(&iov);
+    try std.testing.expectEqual(@as(usize, 5), got);
+    try std.testing.expectEqualStrings("hello", out[0..got]);
 }

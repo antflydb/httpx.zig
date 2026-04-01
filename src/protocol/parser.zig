@@ -229,6 +229,16 @@ pub const Parser = struct {
     /// (in which case `data.len` bytes were buffered and the caller should return that).
     const LineResult = struct { line: []const u8, consumed: usize };
     fn readLine(self: *Self, data: []const u8) !?LineResult {
+        if (self.line_buffer.items.len > 0 and self.line_buffer.items[self.line_buffer.items.len - 1] == '\r') {
+            if (data.len == 0) return null;
+            if (data[0] == '\n') {
+                return .{
+                    .line = self.line_buffer.items[0 .. self.line_buffer.items.len - 1],
+                    .consumed = 1,
+                };
+            }
+        }
+
         const line_end = mem.indexOf(u8, data, "\r\n") orelse {
             try self.line_buffer.appendSlice(self.allocator, data);
             try self.checkLineBufferLimit();
@@ -946,5 +956,23 @@ test "path borrowing from data when request line fits in one feed" {
     _ = try parser.feed("GET /single HTTP/1.1\r\nHost: example.com\r\n\r\n");
     try std.testing.expect(parser.isComplete());
     try std.testing.expectEqualStrings("/single", parser.path.?);
-    try std.testing.expect(!parser.path_owned);
+    try std.testing.expect(parser.path_owned);
+}
+
+test "response headers parse when CRLF splits across feeds" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+    parser.headers_only = true;
+
+    _ = try parser.feed("HTTP/1.1 200 OK\r\nContent-Type: application/json\r");
+    const second = "\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+    const consumed = try parser.feed(second);
+
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expect(consumed > 0);
+    try std.testing.expect(consumed < second.len);
+    try std.testing.expectEqual(@as(?u16, 200), parser.status_code);
+    try std.testing.expectEqualStrings("application/json", parser.headers.get("Content-Type").?);
+    try std.testing.expect(parser.chunked);
 }

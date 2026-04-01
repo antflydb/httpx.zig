@@ -248,7 +248,9 @@ pub const TlsSession = struct {
             .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
             .ca = if (verify) .{ .bundle = self.ca_bundle.? } else .{ .no_verification = {} },
             .ssl_key_log = null,
-            .allow_truncation_attacks = false,
+            // Many HTTP servers close TLS transports without sending close_notify.
+            // Higher HTTP framing still validates completeness for chunked/content-length bodies.
+            .allow_truncation_attacks = true,
             .write_buffer = self.tls_write_buf.?,
             .read_buffer = self.tls_read_buf.?,
             .entropy = &entropy,
@@ -280,7 +282,17 @@ pub const TlsSession = struct {
     pub fn write(self: *Self, data: []const u8) !usize {
         const c = if (self.client) |*c| c else return error.NotConnected;
         try c.writer.writeAll(data);
+        try c.writer.flush();
+        const net_out = if (self.net_out) |*w| w else return error.NotConnected;
+        try net_out.writer_iface.flush();
         return data.len;
+    }
+
+    pub fn flush(self: *Self) !void {
+        const c = if (self.client) |*c| c else return error.NotConnected;
+        try c.writer.flush();
+        const net_out = if (self.net_out) |*w| w else return error.NotConnected;
+        try net_out.writer_iface.flush();
     }
 
     /// Returns an I/O reader for decrypted TLS payload.
