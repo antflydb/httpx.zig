@@ -95,6 +95,13 @@ pub const RequestOptions = struct {
     follow_redirects: ?bool = null,
 };
 
+pub const WriterProgress = struct {
+    bytes_written: u64,
+    total_bytes: ?u64,
+};
+
+pub const WriterProgressCallback = *const fn (progress: WriterProgress, context: ?*anyopaque) void;
+
 /// Request interceptor function type.
 pub const RequestInterceptor = *const fn (*Request, ?*anyopaque) anyerror!void;
 
@@ -254,6 +261,31 @@ pub const Client = struct {
         return self.requestInternal(method, url, reqOpts, 0);
     }
 
+    /// Makes an HTTP request and streams the response body to `writer`.
+    /// The returned response contains status and headers; the body is not retained.
+    pub fn requestToWriter(
+        self: *Self,
+        method: types.Method,
+        url: []const u8,
+        reqOpts: RequestOptions,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0);
+    }
+
+    pub fn getToWriter(
+        self: *Self,
+        url: []const u8,
+        reqOpts: RequestOptions,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        return self.requestToWriter(.GET, url, reqOpts, writer, progress_cb, progress_ctx);
+    }
+
     fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
         const owned_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
@@ -339,6 +371,99 @@ pub const Client = struct {
         return response;
     }
 
+    fn requestToWriterInternal(
+        self: *Self,
+        method: types.Method,
+        url: []const u8,
+        reqOpts: RequestOptions,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        depth: u32,
+    ) !Response {
+        const owned_url = if (self.config.base_url) |base|
+            try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
+        else
+            null;
+        defer if (owned_url) |u| self.allocator.free(u);
+        const full_url = owned_url orelse url;
+
+        var req = try Request.init(self.allocator, method, full_url);
+        defer req.deinit();
+
+        try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
+
+        if (self.config.default_headers) |hdrs| {
+            for (hdrs) |h| {
+                try req.headers.set(h[0], h[1]);
+            }
+        }
+
+        if (reqOpts.headers) |hdrs| {
+            for (hdrs) |h| {
+                try req.headers.set(h[0], h[1]);
+            }
+        }
+
+        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+            try req.headers.set(HeaderName.CONNECTION, "close");
+        }
+
+        if (reqOpts.body) |body| {
+            try req.setBody(body);
+        }
+
+        if (reqOpts.json) |json_body| {
+            try req.setJson(json_body);
+        }
+
+        if (!req.headers.contains(HeaderName.ACCEPT_ENCODING)) {
+            try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
+        }
+
+        try self.attachCookies(&req);
+
+        for (self.interceptors.items) |interceptor| {
+            if (interceptor.request_fn) |f| {
+                try f(&req, interceptor.context);
+            }
+        }
+
+        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx);
+        errdefer response.deinit();
+
+        try self.storeCookies(&response);
+
+        for (self.interceptors.items) |interceptor| {
+            if (interceptor.response_fn) |f| {
+                try f(&response, interceptor.context);
+            }
+        }
+
+        const should_follow = reqOpts.follow_redirects orelse
+            self.config.redirect_policy.follow_redirects;
+        if (should_follow and response.isRedirect()) {
+            if (depth >= self.config.redirect_policy.max_redirects) {
+                response.deinit();
+                return error.TooManyRedirects;
+            }
+
+            const location = response.headers.get(HeaderName.LOCATION) orelse {
+                response.deinit();
+                return error.InvalidResponse;
+            };
+
+            const next_url = try self.resolveRedirectUrl(req.uri, location);
+            defer self.allocator.free(next_url);
+
+            const next_method = self.config.redirect_policy.getRedirectMethod(response.status.code, req.method);
+            response.deinit();
+            return self.requestToWriterInternal(next_method, next_url, reqOpts, writer, progress_cb, progress_ctx, depth + 1);
+        }
+
+        return response;
+    }
+
     /// Executes the actual HTTP request.
     fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64) !Response {
         const policy = self.config.retry_policy;
@@ -349,6 +474,47 @@ pub const Client = struct {
             var res = self.executeRequestOnce(req, timeout_override_ms) catch |err| {
                 // RFC 7540 §6.8: Streams refused via GOAWAY were never
                 // processed and are always safe to retry on a new connection.
+                const is_goaway_refused = (err == error.GoawayRefused);
+                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
+                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
+                    attempt += 1;
+                    const delay_ms = policy.calculateDelay(attempt);
+                    if (delay_ms > 0) {
+                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                    }
+                    continue;
+                }
+                return err;
+            };
+
+            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
+                res.deinit();
+                attempt += 1;
+                const delay_ms = policy.calculateDelay(attempt);
+                if (delay_ms > 0) {
+                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                }
+                continue;
+            }
+
+            return res;
+        }
+    }
+
+    fn executeRequestToWriter(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        const policy = self.config.retry_policy;
+        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
+
+        var attempt: u32 = 0;
+        while (true) {
+            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, writer, progress_cb, progress_ctx) catch |err| {
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
                 if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
@@ -457,6 +623,69 @@ pub const Client = struct {
         return self.executeOnSocket(&socket, req, null);
     }
 
+    fn executeRequestToWriterOnce(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        const host = req.uri.host orelse return error.InvalidUri;
+        const port = req.uri.effectivePort();
+        const timeout_ms = timeout_override_ms orelse blk: {
+            if (self.config.timeouts.request_ms > 0) break :blk self.config.timeouts.request_ms;
+            break :blk self.config.timeouts.read_ms;
+        };
+        const write_timeout_ms = timeout_override_ms orelse blk: {
+            if (self.config.timeouts.request_ms > 0) break :blk self.config.timeouts.request_ms;
+            break :blk self.config.timeouts.write_ms;
+        };
+
+        if (self.config.http2_enabled or self.config.force_http2) {
+            var res = try self.executeRequestOnce(req, timeout_override_ms);
+            errdefer res.deinit();
+            try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
+            return res;
+        }
+
+        if (req.uri.isTls()) {
+            if (self.config.keep_alive) {
+                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var ok = false;
+                defer {
+                    if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
+                }
+
+                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms);
+                return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
+            }
+
+            const addr = try resolveAddress(self.io, host, port);
+            var socket = try Socket.connect(addr, self.io);
+            defer socket.close();
+            try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+            return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
+        }
+
+        if (self.config.keep_alive) {
+            var conn = try self.pool.getConnection(host, port);
+            var ok = false;
+            defer {
+                if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
+            }
+
+            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms);
+            return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
+        }
+
+        const addr = try resolveAddress(self.io, host, port);
+        var socket = try Socket.connect(addr, self.io);
+        defer socket.close();
+        try applyTimeouts(&socket, timeout_ms, write_timeout_ms);
+        return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
+    }
+
     /// Sends request and reads response over a plain TCP socket.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
@@ -464,6 +693,25 @@ pub const Client = struct {
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
         var res = try self.readResponse(socket, req.method);
+        if (keep_alive_out) |out| {
+            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+        }
+        return res;
+    }
+
+    fn executeOnSocketToWriter(
+        self: *Self,
+        socket: *Socket,
+        req: *Request,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        keep_alive_out: ?*bool,
+    ) !Response {
+        const bytes = try serializeToSlice(self.allocator, req);
+        defer self.allocator.free(bytes);
+        try socket.sendAll(bytes);
+        var res = try self.readResponseToWriter(socket, req.method, writer, progress_cb, progress_ctx);
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -485,6 +733,27 @@ pub const Client = struct {
         return res;
     }
 
+    fn executeOnTlsToWriter(
+        self: *Self,
+        session: *TlsSession,
+        req: *Request,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        keep_alive_out: ?*bool,
+    ) !Response {
+        const bytes = try serializeToSlice(self.allocator, req);
+        defer self.allocator.free(bytes);
+        const w = try session.getWriter();
+        try w.writeAll(bytes);
+        try session.flush();
+        var res = try self.readResponseToWriter(session, req.method, writer, progress_cb, progress_ctx);
+        if (keep_alive_out) |out| {
+            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+        }
+        return res;
+    }
+
     /// Creates a new TLS session on a socket and executes a request.
     fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
         const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
@@ -493,6 +762,23 @@ pub const Client = struct {
         session.attachSocket(socket);
         try session.handshake(host);
         return self.executeOnTls(&session, req, null);
+    }
+
+    fn executeOnNewTlsToWriter(
+        self: *Self,
+        socket: *Socket,
+        host: []const u8,
+        req: *Request,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
+        var session = TlsSession.init(tls_cfg, self.io);
+        defer session.deinit();
+        session.attachSocket(socket);
+        try session.handshake(host);
+        return self.executeOnTlsToWriter(&session, req, writer, progress_cb, progress_ctx, null);
     }
 
     /// Gets or creates a pooled HTTP/2 connection for the given host:port.
@@ -1172,6 +1458,74 @@ pub const Client = struct {
         return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method);
     }
 
+    fn readResponseToWriter(
+        self: *Self,
+        source: anytype,
+        req_method: types.Method,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        var parser = Parser.initResponse(self.allocator);
+        defer parser.deinit();
+        parser.max_body_size = self.config.max_response_size;
+        parser.max_headers = self.config.max_response_headers;
+        parser.headers_only = true;
+
+        var buf: [16 * 1024]u8 = undefined;
+        var total_read: usize = 0;
+        var leftover: usize = 0;
+        var informational_count: u8 = 0;
+
+        while (true) {
+            while (!parser.isComplete()) {
+                if (leftover > 0) {
+                    const consumed = try parser.feed(buf[0..leftover]);
+                    if (consumed < leftover) {
+                        std.mem.copyForwards(u8, buf[0 .. leftover - consumed], buf[consumed..leftover]);
+                    }
+                    leftover -= consumed;
+                    continue;
+                }
+
+                if (leftover >= buf.len) return error.InvalidResponse;
+                const n = recvFrom(source, buf[leftover..]) catch |err| {
+                    const Source = @TypeOf(source);
+                    if (Source == *TlsSession and err == error.ReadFailed) {
+                        continue;
+                    }
+                    return err;
+                };
+                if (n == 0) break;
+                total_read += n;
+                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
+                const total = leftover + n;
+                const consumed = try parser.feed(buf[0..total]);
+                leftover = total - consumed;
+                if (consumed > 0 and leftover > 0) {
+                    std.mem.copyForwards(u8, buf[0..leftover], buf[consumed..total]);
+                }
+            }
+
+            parser.finishEof();
+            if (!parser.isComplete()) return error.InvalidResponse;
+
+            if (parser.status_code) |code| {
+                if (code >= 100 and code < 200) {
+                    informational_count += 1;
+                    if (informational_count > 20) return error.TooManyInformationalResponses;
+                    parser.reset();
+                    parser.headers_only = true;
+                    total_read = 0;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        return self.writeStreamingResponse(&parser, source, buf[0..leftover], req_method, writer, progress_cb, progress_ctx);
+    }
+
     /// Read bytes from either a Socket or a TlsSession into `buf`.
     fn recvFrom(source: anytype, buf: []u8) !usize {
         const Source = @TypeOf(source);
@@ -1233,7 +1587,7 @@ pub const Client = struct {
 
         // Layer 0: Wrap the raw source (Socket or TLS Io.Reader) into an Io.Reader.
         const chunked_tls_body = if (Source == *TlsSession and parser.chunked)
-            try self.readChunkedTlsBody(source, leftover)
+            try self.readChunkedTlsBody(source, leftover, null, null)
         else
             null;
         defer if (chunked_tls_body) |body| self.allocator.free(body);
@@ -1387,13 +1741,185 @@ pub const Client = struct {
         return res;
     }
 
-    fn readChunkedTlsBody(self: *Self, source: *TlsSession, leftover: []const u8) !?[]u8 {
+    fn writeStreamingResponse(
+        self: *Self,
+        parser: *Parser,
+        source: anytype,
+        leftover: []const u8,
+        req_method: types.Method,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        const code = parser.status_code orelse return error.InvalidResponse;
+        var res = Response.init(parser.allocator, code);
+        errdefer res.deinit();
+        const Source = @TypeOf(source);
+        res.headers.deinit();
+        res.headers = parser.headers;
+        parser.headers = Headers.init(parser.allocator);
+
+        const no_body_status = (code >= 100 and code < 200) or code == 204 or code == 304;
+        const has_body = !no_body_status and req_method != .HEAD and
+            (parser.chunked or (parser.content_length orelse 1) > 0);
+        if (!has_body) return res;
+
+        const container: ?flate.Container = if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| blk: {
+            const enc = std.mem.trim(u8, raw_enc, " \t");
+            if (std.ascii.eqlIgnoreCase(enc, "gzip")) break :blk .gzip;
+            if (std.ascii.eqlIgnoreCase(enc, "deflate")) break :blk .raw;
+            break :blk null;
+        } else null;
+
+        const chunked_tls_body = if (Source == *TlsSession and parser.chunked)
+            try self.readChunkedTlsBody(source, leftover, progress_cb, progress_ctx)
+        else
+            null;
+        defer if (chunked_tls_body) |body| self.allocator.free(body);
+
+        var source_io_buf: [8192]u8 = undefined;
+        var socket_reader: SocketIoReader = undefined;
+        var tls_reader: TlsSessionIoReader = undefined;
+        var raw_reader: *Io.Reader = undefined;
+        if (chunked_tls_body == null) {
+            raw_reader = sourceToIoReader(source, &socket_reader, &tls_reader, &source_io_buf);
+        }
+
+        var chunked_tls_source_buf: [8192]u8 = undefined;
+        var chunked_tls_source: SliceIoReader = undefined;
+        if (chunked_tls_body) |body| {
+            chunked_tls_source = SliceIoReader.init(body, &chunked_tls_source_buf);
+        }
+
+        var prefix_buf: [8192]u8 = undefined;
+        var prefixed = if (chunked_tls_body == null) PrefixedReader.init(leftover, raw_reader, &prefix_buf) else undefined;
+        const body_source: *Io.Reader = if (chunked_tls_body != null)
+            &chunked_tls_source.reader_iface
+        else if (leftover.len > 0)
+            &prefixed.reader_iface
+        else
+            raw_reader;
+
+        var cl_buf: [8192]u8 = undefined;
+        var cl_reader: ContentLengthReader = undefined;
+        var chunked_buf: [8192]u8 = undefined;
+        var chunked_reader: ChunkedBodyReader = undefined;
+
+        const framed_reader: *Io.Reader = if (parser.chunked) blk: {
+            chunked_reader = ChunkedBodyReader.init(body_source, &chunked_buf);
+            break :blk &chunked_reader.reader_iface;
+        } else if (parser.content_length) |len| blk: {
+            if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
+            cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
+            break :blk &cl_reader.reader_iface;
+        } else blk: {
+            break :blk body_source;
+        };
+
+        const close_delimited_body = !parser.chunked and parser.content_length == null;
+        const progress_total = if (container == null and !parser.chunked) parser.content_length else null;
+        var written_total: u64 = 0;
+
+        if (chunked_tls_body) |body| {
+            const decoded = try decodeChunkedBody(self.allocator, body, self.config.max_response_size);
+            defer self.allocator.free(decoded);
+
+            if (container) |ctr| {
+                var compressed_reader: Io.Reader = .fixed(decoded);
+                var decompress_window: [flate.max_window_len]u8 = undefined;
+                var decompressor = flate.Decompress.init(&compressed_reader, ctr, &decompress_window);
+                var read_buf: [16 * 1024]u8 = undefined;
+
+                while (true) {
+                    const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        if (err == error.EndOfStream) break;
+                        return error.DecompressionFailed;
+                    };
+                    if (n == 0) break;
+                    if (written_total + n > self.config.max_response_size) return error.ResponseTooLarge;
+                    try writer.writeAll(read_buf[0..n]);
+                    written_total += n;
+                    if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = null }, progress_ctx);
+                }
+            } else {
+                try writer.writeAll(decoded);
+                written_total = decoded.len;
+                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = progress_total }, progress_ctx);
+            }
+
+            if (container != null) {
+                _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+                _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
+            }
+            return res;
+        }
+
+        var read_buf: [16 * 1024]u8 = undefined;
+
+        if (container) |ctr| {
+            var decompress_window: [flate.max_window_len]u8 = undefined;
+            var decompressor = flate.Decompress.init(framed_reader, ctr, &decompress_window);
+
+            while (true) {
+                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                    if (err == error.EndOfStream) break;
+                    if (err == error.ReadFailed and close_delimited_body) break;
+                    return error.DecompressionFailed;
+                };
+                if (n == 0) break;
+                if (written_total + n > self.config.max_response_size) return error.ResponseTooLarge;
+                try writer.writeAll(read_buf[0..n]);
+                written_total += n;
+                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = null }, progress_ctx);
+            }
+        } else {
+            while (true) {
+                const n = framed_reader.readSliceShort(&read_buf) catch |err| {
+                    if (err == error.EndOfStream) break;
+                    if (err == error.ReadFailed and close_delimited_body) break;
+                    return error.InvalidResponse;
+                };
+                if (n == 0) break;
+                try writer.writeAll(read_buf[0..n]);
+                written_total += n;
+                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = progress_total }, progress_ctx);
+            }
+        }
+
+        if (container != null) {
+            _ = res.headers.remove(HeaderName.CONTENT_ENCODING);
+            _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
+        }
+
+        return res;
+    }
+
+    fn writeBufferedBody(res: *Response, writer: anytype, progress_cb: ?WriterProgressCallback, progress_ctx: ?*anyopaque) !void {
+        if (res.body) |body| {
+            try writer.writeAll(body);
+            if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
+            if (res.body_owned) {
+                res.allocator.free(body);
+                res.body_owned = false;
+            }
+            res.body = null;
+        }
+    }
+
+    fn readChunkedTlsBody(
+        self: *Self,
+        source: *TlsSession,
+        leftover: []const u8,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !?[]u8 {
         var framed = std.ArrayListUnmanaged(u8).empty;
         defer framed.deinit(self.allocator);
 
         if (leftover.len > 0) {
             try framed.appendSlice(self.allocator, leftover);
             if (framed.items.len > self.config.max_response_size) return error.ResponseTooLarge;
+            if (progress_cb) |cb| cb(.{ .bytes_written = framed.items.len, .total_bytes = null }, progress_ctx);
         }
 
         while (true) {
@@ -1409,6 +1935,7 @@ pub const Client = struct {
             if (n == 0) return error.InvalidResponse;
             if (framed.items.len + n > self.config.max_response_size) return error.ResponseTooLarge;
             try framed.appendSlice(self.allocator, read_buf[0..n]);
+            if (progress_cb) |cb| cb(.{ .bytes_written = framed.items.len, .total_bytes = null }, progress_ctx);
         }
     }
 
@@ -2206,6 +2733,62 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", resp.body orelse "");
+}
+
+test "HTTPS client streams chunked gzip body to writer via local TLS server" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_chunked_gzip_server_script });
+
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{
+            "python3",
+            "server.py",
+            port_arg,
+            "cert.pem",
+            "key.pem",
+        },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+
+    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .verify_ssl = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+    });
+    defer client.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    var resp = try client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+    try std.testing.expect(resp.body == null);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
 }
 
 // Tests for decompressBody and responseFromParser were removed — these methods
