@@ -2034,7 +2034,6 @@ const python_tls_chunked_gzip_server_script =
     "import gzip\n" ++
     "import socket\n" ++
     "import ssl\n" ++
-    "import time\n" ++
     "import sys\n" ++
     "\n" ++
     "port = int(sys.argv[1])\n" ++
@@ -2066,9 +2065,9 @@ const python_tls_chunked_gzip_server_script =
     "                    b'Transfer-Encoding: chunked\\r\\n'\n" ++
     "                    b'Content-Encoding: gzip\\r\\n'\n" ++
     "                    b'Connection: close\\r\\n\\r\\n'\n" ++
-    "                    + format(len(payload), 'x').encode() + b'\\r\\n' + payload + b'\\r\\n0\\r\\n\\r\\n'\n" ++
     "                )\n" ++
-    "                time.sleep(5)\n" ++
+    "                tls_conn.sendall(format(len(payload), 'x').encode() + b'\\r\\n')\n" ++
+    "                tls_conn.sendall(payload + b'\\r\\n0\\r\\n\\r\\n')\n" ++
     "                break\n" ++
     "        except ssl.SSLError:\n" ++
     "            continue\n" ++
@@ -2081,19 +2080,16 @@ fn reserveEphemeralPort(io: Io) !u16 {
     return listener.getLocalAddress().ip4.port;
 }
 
-fn waitForTcpReady(io: Io, port: u16, max_attempts: usize) !void {
-    const addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+fn getWithRetry(client: *Client, io: Io, url: []const u8, max_attempts: usize) !Response {
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
-        if (Socket.connect(addr, io)) |sock| {
-            var s = sock;
-            s.close();
-            return;
-        } else |_| {
-            io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
-        }
+        return client.get(url, .{}) catch |err| {
+            if (err != error.ConnectionRefused or attempts + 1 >= max_attempts) return err;
+            io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch {};
+            continue;
+        };
     }
-    return error.Timeout;
+    unreachable;
 }
 
 test "HTTPS client round trip via local TLS server" {
@@ -2130,7 +2126,7 @@ test "HTTPS client round trip via local TLS server" {
     };
     defer child.kill(io);
 
-    try waitForTcpReady(io, port, 80);
+    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
 
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
@@ -2138,11 +2134,12 @@ test "HTTPS client round trip via local TLS server" {
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
         .verify_ssl = false,
+        .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
     defer client.deinit();
 
-    var resp = try client.get(url, .{});
+    var resp = try getWithRetry(&client, io, url, 50);
     defer resp.deinit();
 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
@@ -2191,7 +2188,7 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
     };
     defer child.kill(io);
 
-    try waitForTcpReady(io, port, 80);
+    io.sleep(Io.Duration.fromMilliseconds(1000), .awake) catch {};
 
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
@@ -2199,11 +2196,12 @@ test "HTTPS client handles chunked gzip body via local TLS server" {
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
         .verify_ssl = false,
+        .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
     defer client.deinit();
 
-    var resp = try client.get(url, .{});
+    var resp = try getWithRetry(&client, io, url, 50);
     defer resp.deinit();
 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
